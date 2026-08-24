@@ -605,21 +605,6 @@ jobs:
           fi
           node scripts/build-bundled-desktop.mjs --tag="$HERMES_BUNDLE_TAG" --variant="${{ matrix.variant }}"
 
-      # makeappx reports manifest problems as a bare 0x80080204 with no
-      # detail, and the manifest lives in a per-run stage dir — unreadable
-      # after the runner is gone. On failure, print the generated
-      # AppxManifest.xml (and the spliced extensions fragment) so the log
-      # carries the exact XML makeappx rejected.
-      - name: Dump MSIX manifest on failure
-        if: failure() && startsWith(matrix.target.label, 'win32-')
-        shell: bash
-        run: |
-          shopt -s nullglob
-          for f in apps/desktop/release/__msix-*/AppxManifest.xml apps/desktop/build/msix-copilot-key-extensions.xml; do
-            echo "===== $f ====="
-            cat "$f" || true
-          done
-
       # Every native binary in the unpacked app must match the target
       # arch. Wrong-arch binaries run FINE on the runners (Windows-on-ARM
       # and Rosetta emulate x64 silently) and ship broken or slow — an
@@ -658,7 +643,7 @@ jobs:
             apps/desktop/release/*.dmg
             apps/desktop/release/*.zip
             apps/desktop/release/*.exe
-            apps/desktop/release/*.msix
+            # apps/desktop/release/*.msix
             apps/desktop/release/*.AppImage
             apps/desktop/release/*.blockmap
             apps/desktop/release/latest*.yml
@@ -712,6 +697,7 @@ jobs:
   # both architectures. The inner .msix files are already signed from
   # their legs; only the bundle envelope needs a signature here.
   msixbundle:
+    if: false # msix disabled for now
     name: ${{ matrix.variant }} msixbundle
     needs: build
     runs-on: windows-2025
@@ -908,13 +894,13 @@ jobs:
   # scheduled one, with no second code path.
   publish-nightly:
     name: Publish the nightly release
-    needs: [build, msixbundle, builds-table]
+    needs: [build, builds-table]
     if: |
       always()
       && inputs.upload_release == true
       && contains(inputs.tag, '-nightly.')
       && needs.build.result == 'success'
-      && needs.msixbundle.result == 'success'
+      # && needs.msixbundle.result == 'success'
       && needs.builds-table.result == 'success'
     runs-on: ubuntu-24.04
     steps:

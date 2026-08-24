@@ -221,8 +221,8 @@ const passes = {
   linux: [{ targets: "--linux AppImage", mechanism: "electron-updater" }],
   darwin: [{ targets: "--mac dmg zip", mechanism: "electron-updater" }],
   win32: [
-    { targets: "--win nsis msix", mechanism: "electron-updater" },
-    { targets: "--win msix", mechanism: "external" },
+    { targets: "--win nsis", mechanism: "electron-updater" },
+    // { targets: "--win msix", mechanism: "external" },
   ],
 }[process.platform]
 if (!passes) {
