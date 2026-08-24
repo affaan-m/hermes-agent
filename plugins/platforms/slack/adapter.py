@@ -23,6 +23,7 @@ from typing import Callable, ClassVar, Dict, Optional, Any, Tuple, List
 import aiohttp
 
 try:
+    from slack_bolt.authorization import AuthorizeResult
     from slack_bolt.async_app import AsyncApp
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
     from slack_sdk.web.async_client import AsyncWebClient
@@ -30,6 +31,7 @@ try:
     SLACK_AVAILABLE = True
 except ImportError:
     SLACK_AVAILABLE = False
+    AuthorizeResult = Any
     AsyncApp = Any
     AsyncSocketModeHandler = Any
     AsyncWebClient = Any
@@ -1091,6 +1093,36 @@ class SlackAdapter(BasePlatformAdapter):
         # first ping/pong as evidence of a wedged transport.
         self._socket_first_ping_grace_s = 60.0
 
+    async def _authorize_slack_request(
+        self,
+        enterprise_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+    ) -> Optional[Any]:
+        """Authorize a Bolt request from Hermes's resolved workspace clients.
+
+        Passing an explicit callback prevents ambient Slack OAuth client
+        credentials from replacing Hermes's direct bot-token authorization
+        with Bolt's unrelated installation store. The callback also keeps the
+        request client workspace-correct for multi-workspace Socket Mode.
+        """
+        selected_team_id = str(team_id or "")
+        client = self._team_clients.get(selected_team_id)
+        if client is None and not selected_team_id and len(self._team_clients) == 1:
+            selected_team_id, client = next(iter(self._team_clients.items()))
+        if client is None:
+            logger.error(
+                "[Slack] Cannot authorize event for unknown workspace %s",
+                selected_team_id or "(missing)",
+            )
+            return None
+
+        return AuthorizeResult(
+            enterprise_id=enterprise_id,
+            team_id=selected_team_id or team_id,
+            bot_token=getattr(client, "token", None),
+            bot_user_id=self._team_bot_user_ids.get(selected_team_id),
+        )
+
     async def _close_workspace_clients(self) -> None:
         """Close any Slack SDK clients that may own aiohttp sessions."""
         clients: List[Any] = []
@@ -1955,7 +1987,20 @@ class SlackAdapter(BasePlatformAdapter):
                 token=primary_token,
                 user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX,
             )
-            self._app = AsyncApp(token=primary_token, client=primary_client)
+            async def authorize_slack_request(
+                enterprise_id: Optional[str] = None,
+                team_id: Optional[str] = None,
+            ) -> Optional[Any]:
+                return await self._authorize_slack_request(
+                    enterprise_id=enterprise_id,
+                    team_id=team_id,
+                )
+
+            self._app = AsyncApp(
+                token=primary_token,
+                client=primary_client,
+                authorize=authorize_slack_request,  # type: ignore[arg-type]
+            )
             _apply_slack_proxy(self._app.client, proxy_url)
 
             # Register each bot token and map team_id → client
