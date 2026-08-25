@@ -163,9 +163,10 @@ class TestDataInitialized:
             # Must NOT raise NameError
             result = await adapter.connect()
 
-        # connect() returns True (warn-and-proceed path)
-        assert result is True
-        assert adapter._running is True
+        # Malformed health can never prove the exact implementation, spool,
+        # and passive-ingest state, so fail closed instead of polling messages.
+        assert result is False
+        assert adapter._running is False
 
 
 # ---------------------------------------------------------------------------

@@ -125,10 +125,12 @@ unauthorized_dm_behavior: pair
 
 whatsapp:
   unauthorized_dm_behavior: ignore
+  passive_ingest: false
 ```
 
 - `unauthorized_dm_behavior: pair` is the global default. Unknown DM senders get a pairing code.
 - `whatsapp.unauthorized_dm_behavior: ignore` makes WhatsApp stay silent for unauthorized DMs, which is usually the better choice for a private number.
+- `whatsapp.passive_ingest: true` writes a local owner-only NDJSON spool for every new Baileys protocol conversation upsert, including DMs, groups, status/broadcast/newsletter conversations, other valid conversation JIDs, messages rejected by response policy, and owner-sent replies. It is disabled by default, excludes media bytes, and does not change allowlists, read state, agent routing, or outbound behavior. The spool contains private message text; enable it only when a trusted local consumer manages retention and access.
 
 Then start the gateway:
 

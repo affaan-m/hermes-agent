@@ -54,6 +54,8 @@ def _make_adapter(bridge_script: str = "/tmp/test-bridge.js",
     adapter._bridge_process = None
     adapter._reply_prefix = None
     adapter._send_read_receipts = False
+    adapter._passive_ingest = False
+    adapter._passive_ingest_path = session_path.parent / "passive-ingest.ndjson"
     adapter._running = False
     adapter._message_handler = None
     adapter._fatal_error_code = None
@@ -85,6 +87,7 @@ def _setup_bridge_dir(tmp_path: Path) -> Path:
     bridge_dir = tmp_path / "whatsapp-bridge"
     bridge_dir.mkdir()
     (bridge_dir / "bridge.js").write_text("// current bridge code\n")
+    (bridge_dir / "passive_ingest.js").write_text("// current passive writer\n")
     (bridge_dir / "package.json").write_text('{"name": "bridge"}\n')
     session_path = tmp_path / "session"
     session_path.mkdir()
@@ -113,8 +116,102 @@ class TestFileContentHash:
         assert len(h) == 16
         assert h == _file_content_hash(f)  # deterministic
 
+    def test_implementation_hash_covers_bridge_and_passive_helper(self, tmp_path):
+        from plugins.platforms.whatsapp.adapter import _bridge_implementation_hash
+
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        first = _bridge_implementation_hash(bridge_dir / "bridge.js")
+        (bridge_dir / "passive_ingest.js").write_text("// helper-only update\n")
+        assert _bridge_implementation_hash(bridge_dir / "bridge.js") != first
+
+    def test_spool_fingerprint_is_stable_and_non_sensitive(self, tmp_path):
+        from plugins.platforms.whatsapp.adapter import _spool_destination_fingerprint
+
+        spool = tmp_path / "private-profile-name" / "passive-ingest.ndjson"
+        fingerprint = _spool_destination_fingerprint(spool)
+        assert len(fingerprint) == 16
+        assert "private-profile-name" not in fingerprint
+        assert fingerprint == _spool_destination_fingerprint(spool)
+
 
 class TestStaleBridgeHandshake:
+
+    def test_health_match_requires_exact_hash_destination_and_enabled_health(self, tmp_path):
+        from plugins.platforms.whatsapp.adapter import _bridge_health_matches
+
+        expected = {
+            "implementation_hash": "impl-current",
+            "send_read_receipts": False,
+            "passive_ingest": True,
+            "spool_fingerprint": "spool-current",
+        }
+        healthy = {
+            "status": "connected",
+            "implementationHash": "impl-current",
+            "sendReadReceipts": False,
+            "passiveIngest": True,
+            "passiveIngestHealthy": True,
+            "passiveIngestDestinationFingerprint": "spool-current",
+        }
+        assert _bridge_health_matches(healthy, **expected)
+        for key, bad_value in (
+            ("implementationHash", "impl-stale"),
+            ("passiveIngestDestinationFingerprint", "spool-other"),
+            ("passiveIngestHealthy", False),
+            ("passiveIngest", False),
+        ):
+            candidate = {**healthy, key: bad_value}
+            assert not _bridge_health_matches(candidate, **expected), key
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("changed_key", "changed_value"),
+        [
+            ("implementationHash", "helper-only-stale"),
+            ("passiveIngestDestinationFingerprint", "old-configured-path"),
+            ("passiveIngestHealthy", False),
+        ],
+    )
+    async def test_restarts_bridge_for_helper_path_or_health_mismatch(
+        self, tmp_path, changed_key, changed_value
+    ):
+        from plugins.platforms.whatsapp.adapter import (
+            _bridge_implementation_hash,
+            _spool_destination_fingerprint,
+        )
+
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        _fresh_node_modules(bridge_dir)
+        adapter = _make_adapter(
+            bridge_script=str(bridge_dir / "bridge.js"),
+            session_path=tmp_path / "session",
+        )
+        adapter._passive_ingest = True
+        health = {
+            "status": "connected",
+            "implementationHash": _bridge_implementation_hash(bridge_dir / "bridge.js"),
+            "sendReadReceipts": False,
+            "passiveIngest": True,
+            "passiveIngestHealthy": True,
+            "passiveIngestDestinationFingerprint": _spool_destination_fingerprint(
+                adapter._passive_ingest_path
+            ),
+        }
+        health[changed_key] = changed_value
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1
+        mock_proc.returncode = 1
+
+        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("aiohttp.ClientSession", _mock_health(health)), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
+             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
+             patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
+             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
+            assert await adapter.connect() is False
+
+        mock_popen.assert_called_once()
 
 
     @pytest.mark.asyncio
@@ -134,6 +231,41 @@ class TestStaleBridgeHandshake:
                 "status": "connected",
                 "scriptHash": disk_hash,
                 "sendReadReceipts": False,
+            }
+        )
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1
+        mock_proc.returncode = 1
+
+        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("aiohttp.ClientSession", mock_client), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
+             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
+             patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
+             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
+            await adapter.connect()
+
+        mock_popen.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_restarts_bridge_when_passive_ingest_config_changed(self, tmp_path):
+        from plugins.platforms.whatsapp.adapter import _file_content_hash
+
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        _fresh_node_modules(bridge_dir)
+        adapter = _make_adapter(
+            bridge_script=str(bridge_dir / "bridge.js"),
+            session_path=tmp_path / "session",
+        )
+        adapter._passive_ingest = True
+        disk_hash = _file_content_hash(bridge_dir / "bridge.js")
+        mock_client = _mock_health(
+            {
+                "status": "connected",
+                "scriptHash": disk_hash,
+                "sendReadReceipts": False,
+                "passiveIngest": False,
             }
         )
         mock_proc = MagicMock()
@@ -188,6 +320,8 @@ class TestCacheDirEnvPassthrough:
             session_path=tmp_path / "session",
         )
         adapter._send_read_receipts = True
+        adapter._passive_ingest = True
+        adapter._passive_ingest_path = tmp_path / "passive-ingest.ndjson"
         mock_proc = MagicMock()
         mock_proc.poll.return_value = 1
         mock_proc.returncode = 1
@@ -211,3 +345,5 @@ class TestCacheDirEnvPassthrough:
         assert env["HERMES_AUDIO_CACHE_DIR"] == str(get_audio_cache_dir())
         assert env["HERMES_DOCUMENT_CACHE_DIR"] == str(get_document_cache_dir())
         assert env["WHATSAPP_SEND_READ_RECEIPTS"] == "true"
+        assert env["WHATSAPP_PASSIVE_INGEST"] == "true"
+        assert env["WHATSAPP_PASSIVE_INGEST_PATH"] == str(tmp_path / "passive-ingest.ndjson")

@@ -67,6 +67,19 @@ class TestConfigYamlBridging:
         assert wa_config is not None
         assert wa_config.extra.get("reply_prefix") == ""
 
+    def test_passive_ingest_bridged_from_yaml(self, tmp_path):
+        config_yaml = tmp_path / "config.yaml"
+        config_yaml.write_text("whatsapp:\n  passive_ingest: true\n")
+
+        with patch("gateway.config.get_hermes_home", return_value=tmp_path):
+            from gateway.config import load_gateway_config
+            with patch.dict("os.environ", {"WHATSAPP_ENABLED": "true"}, clear=False):
+                config = load_gateway_config()
+
+        wa_config = config.platforms.get(Platform.WHATSAPP)
+        assert wa_config is not None
+        assert wa_config.extra.get("passive_ingest") is True
+
 
 # ---------------------------------------------------------------------------
 # WhatsAppAdapter __init__
@@ -81,6 +94,23 @@ class TestAdapterInit:
         config = PlatformConfig(enabled=True, extra={"reply_prefix": "Bot\\n"})
         adapter = WhatsAppAdapter(config)
         assert adapter._reply_prefix == "Bot\\n"
+
+    def test_passive_ingest_defaults_off_and_derives_profile_local_spool(self, tmp_path):
+        from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+        disabled = WhatsAppAdapter(
+            PlatformConfig(enabled=True, extra={"session_path": str(tmp_path / "session")})
+        )
+        assert disabled._passive_ingest is False
+
+        enabled = WhatsAppAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"session_path": str(tmp_path / "session"), "passive_ingest": True},
+            )
+        )
+        assert enabled._passive_ingest is True
+        assert enabled._passive_ingest_path == tmp_path / "passive-ingest.ndjson"
 
 
 class TestReadReceiptPolicyOrdering:

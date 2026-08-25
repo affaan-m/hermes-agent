@@ -33,6 +33,7 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { createPassiveIngestSpool } from './passive_ingest.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
@@ -84,8 +85,20 @@ const SEND_READ_RECEIPTS =
   typeof process.env.WHATSAPP_SEND_READ_RECEIPTS === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_SEND_READ_RECEIPTS.toLowerCase());
 
+const PASSIVE_INGEST =
+  typeof process !== 'undefined' &&
+  process.env &&
+  typeof process.env.WHATSAPP_PASSIVE_INGEST === 'string' &&
+  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_PASSIVE_INGEST.toLowerCase());
+
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+const PASSIVE_INGEST_PATH = process.env.WHATSAPP_PASSIVE_INGEST_PATH
+  || path.join(path.dirname(SESSION_DIR), 'passive-ingest.ndjson');
+const passiveIngestSpool = createPassiveIngestSpool({
+  enabled: PASSIVE_INGEST,
+  spoolPath: PASSIVE_INGEST_PATH,
+});
 // Cache directories: the Python gateway passes the profile-aware paths via
 // env (HERMES_HOME-aware, new cache/ layout).  Fall back to the legacy
 // hardcoded locations for bridges launched outside the gateway.
@@ -102,9 +115,15 @@ const AUDIO_CACHE_DIR = process.env.HERMES_AUDIO_CACHE_DIR
 // `hermes update` updates bridge.js on disk but a long-lived bridge process
 // keeps serving the old behavior forever).
 let SCRIPT_HASH = '';
+let IMPLEMENTATION_HASH = '';
 try {
-  SCRIPT_HASH = createHash('sha256')
-    .update(readFileSync(fileURLToPath(import.meta.url)))
+  const bridgeBytes = readFileSync(fileURLToPath(import.meta.url));
+  const passiveBytes = readFileSync(fileURLToPath(new URL('./passive_ingest.js', import.meta.url)));
+  SCRIPT_HASH = createHash('sha256').update(bridgeBytes).digest('hex').slice(0, 16);
+  IMPLEMENTATION_HASH = createHash('sha256')
+    .update(bridgeBytes)
+    .update(Buffer.from([0]))
+    .update(passiveBytes)
     .digest('hex')
     .slice(0, 16);
 } catch {}
@@ -541,6 +560,16 @@ async function startSocket() {
 
     for (const msg of messages) {
       if (!msg.message) continue;
+
+      // Passive ingestion is deliberately independent of the response path.
+      // Capture every protocol conversation upsert before self-chat, allowlist,
+      // echo, and empty-message routing filters. The helper never downloads media
+      // and a spool failure never widens or crashes agent routing.
+      try {
+        passiveIngestSpool.append({ msg, type, ownerJids: botIds });
+      } catch (err) {
+        console.error(`[bridge] passive ingest append failed: ${err?.message || String(err)}`);
+      }
 
       const chatId = msg.key.remoteJid;
       const senderId = msg.key.participant || chatId;
@@ -1110,7 +1139,13 @@ app.get('/health', (req, res) => {
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
+    implementationHash: IMPLEMENTATION_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    passiveIngest: passiveIngestSpool.enabled,
+    passiveIngestHealthy: passiveIngestSpool.healthy,
+    passiveIngestError: passiveIngestSpool.lastError !== null,
+    passiveIngestDestinationFingerprint: passiveIngestSpool.destinationFingerprint,
+    passiveIngestQueueLength: passiveIngestSpool.queueLength,
   });
 });
 
@@ -1148,6 +1183,9 @@ if (PAIR_ONLY) {
     }
     if (WHATSAPP_MODE === 'bot' && FORWARD_OWNER_MESSAGES) {
       console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
+    }
+    if (passiveIngestSpool.enabled) {
+      console.log('📥 Passive all-conversation ingestion enabled.');
     }
     console.log();
     scheduleReconnect(0);

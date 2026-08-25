@@ -340,19 +340,52 @@ def _is_allowed_bridge_path(url: str) -> bool:
 
 
 def _file_content_hash(path: Path) -> str:
-    """Return the first 16 hex chars of the SHA-256 of *path*'s contents.
-
-    Used for the bridge staleness handshake: bridge.js reports its own
-    source hash in ``/health`` (``scriptHash``), and the adapter compares
-    it against the hash of bridge.js currently on disk.  A mismatch means
-    a long-lived bridge process is serving code from before an update.
-    Returns ``""`` when the file can't be read.
-    """
+    """Return the first 16 hex chars of the SHA-256 of *path*'s contents."""
     import hashlib
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
     except OSError:
         return ""
+
+
+def _bridge_implementation_hash(bridge_path: Path) -> str:
+    """Hash the exact canonical bridge plus its passive-ingest implementation."""
+    import hashlib
+    try:
+        digest = hashlib.sha256()
+        digest.update(bridge_path.read_bytes())
+        digest.update(b"\0")
+        digest.update((bridge_path.parent / "passive_ingest.js").read_bytes())
+        return digest.hexdigest()[:16]
+    except OSError:
+        return ""
+
+
+def _spool_destination_fingerprint(spool_path: Path) -> str:
+    """Return a stable destination identity without exposing the private path."""
+    import hashlib
+    normalized = os.path.normpath(str(spool_path))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _bridge_health_matches(
+    data: dict,
+    *,
+    implementation_hash: str,
+    send_read_receipts: bool,
+    passive_ingest: bool,
+    spool_fingerprint: str,
+) -> bool:
+    """Fail closed unless health identifies the exact safe bridge configuration."""
+    return bool(
+        data.get("status") == "connected"
+        and implementation_hash
+        and data.get("implementationHash") == implementation_hash
+        and bool(data.get("sendReadReceipts", False)) == send_read_receipts
+        and bool(data.get("passiveIngest", False)) == passive_ingest
+        and data.get("passiveIngestHealthy") is True
+        and data.get("passiveIngestDestinationFingerprint") == spool_fingerprint
+    )
 
 
 def check_whatsapp_requirements() -> bool:
@@ -427,6 +460,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             "session_path",
             get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
         ))
+        passive_ingest = config.extra.get("passive_ingest", False)
+        self._passive_ingest = (
+            passive_ingest if isinstance(passive_ingest, bool)
+            else str(passive_ingest or "").strip().lower() in {"1", "true", "yes", "on"}
+        )
+        self._passive_ingest_path = self._session_path.parent / "passive-ingest.ndjson"
         self._reply_prefix: Optional[str] = config.extra.get("reply_prefix")
         self._dm_policy = str(config.extra.get("dm_policy") or _wenv("WHATSAPP_DM_POLICY", "pairing")).strip().lower()
         # Prefer config.extra, then the documented WHATSAPP_ALLOWED_USERS env
@@ -554,6 +593,23 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return False
 
         logger.info("[%s] Bridge found at %s", self.name, bridge_path)
+        expected_implementation_hash = _bridge_implementation_hash(bridge_path)
+        expected_spool_fingerprint = _spool_destination_fingerprint(
+            getattr(
+                self,
+                "_passive_ingest_path",
+                self._session_path.parent / "passive-ingest.ndjson",
+            )
+        )
+
+        def health_matches(data: dict) -> bool:
+            return _bridge_health_matches(
+                data,
+                implementation_hash=expected_implementation_hash,
+                send_read_receipts=self._send_read_receipts,
+                passive_ingest=getattr(self, "_passive_ingest", False),
+                spool_fingerprint=expected_spool_fingerprint,
+            )
         
         # Acquire scoped lock to prevent duplicate sessions
         lock_acquired = False
@@ -645,27 +701,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 # (e.g. no inbound media download).  Old
                                 # bridges that don't report scriptHash are
                                 # treated as stale by definition.
-                                running_hash = data.get("scriptHash", "")
-                                disk_hash = _file_content_hash(bridge_path)
-                                running_read_receipts = bool(data.get("sendReadReceipts", False))
-                                config_matches = running_read_receipts == self._send_read_receipts
-                                if (
-                                    running_hash
-                                    and disk_hash
-                                    and running_hash == disk_hash
-                                    and config_matches
-                                ):
+                                if health_matches(data):
                                     print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
                                     self._mark_connected()
                                     self._bridge_process = None  # Not managed by us
                                     self._http_session = aiohttp.ClientSession()
                                     self._poll_task = asyncio.create_task(self._poll_messages())
                                     return True
-                                stale_reason = (
-                                    f"running={running_hash or 'unversioned'}, disk={disk_hash}"
-                                    if running_hash != disk_hash
-                                    else "send_read_receipts config changed"
-                                )
+                                stale_reason = "implementation, spool destination, health, or config changed"
                                 print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
                             else:
                                 print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
@@ -695,6 +738,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
                 "true" if self._send_read_receipts else "false"
             )
+            bridge_env["WHATSAPP_PASSIVE_INGEST"] = (
+                "true" if getattr(self, "_passive_ingest", False) else "false"
+            )
+            passive_ingest_path = getattr(
+                self,
+                "_passive_ingest_path",
+                self._session_path.parent / "passive-ingest.ndjson",
+            )
+            bridge_env["WHATSAPP_PASSIVE_INGEST_PATH"] = str(passive_ingest_path)
             # Under multiplexing, the bridge subprocess runs with a copy of
             # os.environ that does NOT contain the secondary profile's .env
             # vars.  Inject the resolved WHATSAPP_* values so the Node bridge
@@ -769,7 +821,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             if resp.status == 200:
                                 http_ready = True
                                 data = await resp.json()
-                                if data.get("status") == "connected":
+                                if health_matches(data):
                                     print(f"[{self.name}] Bridge ready (status: connected)")
                                     break
                 except Exception:
@@ -783,8 +835,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             
             # Phase 2: HTTP is up but WhatsApp may still be connecting.
             # Give it more time to authenticate with saved credentials.
-            if data.get("status") != "connected":
-                print(f"[{self.name}] Bridge HTTP ready, waiting for WhatsApp connection...")
+            if not health_matches(data):
+                print(f"[{self.name}] Bridge HTTP ready, waiting for healthy WhatsApp connection...")
                 for attempt in range(15):
                     await asyncio.sleep(1)
                     if self._bridge_process.poll() is not None:
@@ -800,17 +852,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             ) as resp:
                                 if resp.status == 200:
                                     data = await resp.json()
-                                    if data.get("status") == "connected":
+                                    if health_matches(data):
                                         print(f"[{self.name}] Bridge ready (status: connected)")
                                         break
                     except Exception:
                         continue
                 else:
-                    # Still not connected — warn but proceed (bridge may
-                    # auto-reconnect later, e.g. after a code 515 restart).
-                    print(f"[{self.name}] ⚠ WhatsApp not connected after 30s")
+                    print(f"[{self.name}] WhatsApp bridge did not become connected and healthy")
                     print(f"[{self.name}]   Bridge log: {self._bridge_log}")
-                    print(f"[{self.name}]   If session expired, re-pair: hermes whatsapp")
+                    self._close_bridge_log()
+                    return False
             
             # Create a persistent HTTP session for all bridge communication
             self._http_session = aiohttp.ClientSession()
