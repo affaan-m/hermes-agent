@@ -6877,6 +6877,19 @@ class SlackAdapter(BasePlatformAdapter):
             text, chat_id=channel_id, team_id=team_id
         )
 
+        # Mark direct addresses for the gateway's never-silent ack: 1:1 DMs,
+        # @mentions, and replies inside a thread the bot participates in are
+        # user-initiated conversations where a completed turn must never end
+        # in total silence.  Passive free-response channel traffic is left
+        # unmarked so intentional silence stays available there.
+        _addressed_bot = bool(
+            is_one_to_one_dm
+            or is_mentioned
+            or (
+                is_thread_reply
+                and event_thread_ts in self._bot_message_ts
+            )
+        )
         msg_event = MessageEvent(
             text=(command_probe_text if is_command_text else text),
             message_type=msg_type,
@@ -6894,6 +6907,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "slack_team_id": team_id,
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
+                "addressed_bot": _addressed_bot,
             },
         )
 
