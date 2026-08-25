@@ -1429,6 +1429,26 @@ def setup_terminal_backend(config: dict):
         backend_to_idx["singularity"] = next_idx
         next_idx += 1
 
+    # Plugin-registered terminal backends (standalone plugin repos installed
+    # under ~/.hermes/plugins/). Fail-soft: a broken plugin must not take the
+    # setup wizard down.
+    plugin_backend_names = []
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()  # idempotent — plugin state may not be loaded yet
+        from agent.terminal_env_registry import list_providers
+
+        for _provider in list_providers():
+            _pname = _provider.name.strip().lower()
+            terminal_choices.append(f"{_provider.display_name} - {_provider.description}")
+            idx_to_backend[next_idx] = _pname
+            backend_to_idx[_pname] = next_idx
+            plugin_backend_names.append(_pname)
+            next_idx += 1
+    except Exception:
+        pass
+
     # Add keep current option
     keep_current_idx = next_idx
     terminal_choices.append(f"Keep current ({current_backend})")
@@ -1669,6 +1689,18 @@ def setup_terminal_backend(config: dict):
                     print_info(f"  Error: {result.stderr.strip().splitlines()[-1]}")
 
         _prompt_vercel_sandbox_settings(config)
+
+    elif selected_backend in plugin_backend_names:
+        try:
+            from agent.terminal_env_registry import get_provider
+
+            _provider = get_provider(selected_backend)
+            print_success(f"Terminal backend: {_provider.display_name}")
+            for _line in _provider.setup_instructions():
+                print_info(_line)
+            _provider.post_setup()
+        except Exception as exc:
+            print_warning(f"Backend plugin setup hook failed: {exc}")
 
     elif selected_backend == "ssh":
         print_success("Terminal backend: SSH")
@@ -3401,20 +3433,28 @@ def _run_first_time_quick_setup(config: dict, hermes_home, is_existing: bool):
 def _blank_slate_minimal_toolsets(config: dict):
     """Write the minimal toolset state for a Blank Slate install.
 
-    Only ``file`` and ``terminal`` are enabled. Two layers enforce this:
+    Only ``file``, ``terminal``, ``vision``, and ``skills`` are enabled.
+    Vision is part of
+    the core surface: ``read_file`` cannot read images and its own description
+    points at ``vision_analyze``, so an agent without it can't see screenshots
+    or image files at all. Skills stay on because the essential
+    ``hermes-agent`` skill (the agent's operating manual for driving,
+    configuring, and troubleshooting Hermes) is always seeded — without
+    ``skill_view`` it would be unloadable. Two layers enforce the selection:
 
-    1. ``platform_toolsets["cli"] = ["file", "terminal"]`` — an explicit list of
+    1. ``platform_toolsets["cli"] = ["file", "skills", "terminal", "vision"]``
+       — an explicit list of
        configurable keys, which the resolver treats as authoritative
        (``has_explicit_config``) so default toolsets aren't re-expanded.
     2. ``agent.disabled_toolsets`` — a global hard-suppression list (applied last
        in ``_get_platform_tools``, overriding every other path including the
        non-configurable platform-toolset recovery that would otherwise re-add
-       toolsets like ``kanban``). We list every known toolset except the two we
+       toolsets like ``kanban``). We list every known toolset except the ones we
        keep, guaranteeing a true blank slate regardless of platform/recovery
        quirks. The user re-enables any of them later via ``hermes tools`` (which
        rewrites ``platform_toolsets``) or by editing ``agent.disabled_toolsets``.
     """
-    keep = {"file", "terminal"}
+    keep = {"file", "terminal", "vision", "skills"}
     config.setdefault("platform_toolsets", {})["cli"] = sorted(keep)
 
     try:
@@ -3491,9 +3531,11 @@ def _run_blank_slate_setup(config: dict, hermes_home, is_existing: bool):
     print_info("to run an agent, then you choose whether to stop there or walk")
     print_info("through enabling more — opting in to exactly what you want.")
     print_info("")
-    print_info("Forced on: Provider & Model, File Operations, Terminal.")
-    print_info("Everything else (web, browser, code exec, vision, memory,")
-    print_info("delegation, cron, skills, plugins, MCP, …) starts disabled.")
+    print_info("Forced on: Provider & Model, File Operations, Terminal, Vision, Skills.")
+    print_info("Everything else (web, browser, code exec, memory,")
+    print_info("delegation, cron, plugins, MCP, …) starts disabled. The")
+    print_info("essential `hermes-agent` skill is always kept so the agent")
+    print_info("can help you drive and configure Hermes itself.")
     print()
 
     # ── Step 1: Provider & Model (REQUIRED — the agent cannot run without it) ──
@@ -3511,7 +3553,7 @@ def _run_blank_slate_setup(config: dict, hermes_home, is_existing: bool):
     save_config(config)
     print()
     print_success("Minimal baseline applied:")
-    print_info("  Toolsets: file, terminal (everything else off)")
+    print_info("  Toolsets: file, terminal, vision, skills (everything else off)")
     print_info("  Compression, memory, checkpoints, smart routing: off")
 
     # ── The fork: stop here, or walk through enabling things ──
@@ -3529,10 +3571,12 @@ def _run_blank_slate_setup(config: dict, hermes_home, is_existing: bool):
     if path == 0:
         save_config(config)
         # Blank Slate means no bundled skills; record the opt-out so future
-        # `hermes update` runs don't re-inject them.
+        # `hermes update` runs don't re-inject them. Essential skills (the
+        # `hermes-agent` operating manual) are still seeded by the sync.
         try:
-            from tools.skills_sync import set_bundled_skills_opt_out
+            from tools.skills_sync import set_bundled_skills_opt_out, sync_skills
             set_bundled_skills_opt_out(True)
+            sync_skills(quiet=True)
         except Exception as exc:
             logger.debug("blank-slate skill opt-out error: %s", exc)
         print()
@@ -3573,7 +3617,11 @@ def _blank_slate_walkthrough(config: dict, hermes_home):
             print_success(f"Seeded {copied} bundled skills.")
         else:
             set_bundled_skills_opt_out(True)
-            print_info("No skills seeded. A .no-bundled-skills marker keeps future")
+            # Essential skills (the `hermes-agent` operating manual) are
+            # still seeded even for an opted-out profile.
+            sync_skills(quiet=True)
+            print_info("No skills seeded (except the essential `hermes-agent`")
+            print_info("skill). A .no-bundled-skills marker keeps future")
             print_info("`hermes update` runs from re-injecting them. Opt back in any")
             print_info("time with `hermes skills opt-in --sync`.")
     except Exception as exc:

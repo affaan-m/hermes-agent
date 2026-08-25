@@ -54,6 +54,7 @@ def _make_dummy_env(**kwargs):
         run_as_host_user=kwargs.get("run_as_host_user", False),
         extra_args=kwargs.get("extra_args", []),
         persist_across_processes=kwargs.get("persist_across_processes", True),
+        shared_container_key=kwargs.get("shared_container_key", ""),
         shm_size=kwargs.get("shm_size", docker_env._DEFAULT_SHM_SIZE),
     )
 
@@ -713,6 +714,56 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-profile": "default",
         "hermes-egress": "off",
     }
+
+
+def test_shared_container_key_replaces_profile_identity(monkeypatch):
+    """Trusted profiles using the same explicit key share the reuse label."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "research")
+    _mock_subprocess_run(monkeypatch)
+
+    a = _make_dummy_env(task_id="abc", shared_container_key="team/workspace")
+    b = _make_dummy_env(task_id="abc", shared_container_key="team/workspace")
+
+    # Deterministic across processes/profiles, not the profile label, and
+    # digest-suffixed (label sanitization alone is lossy).
+    assert a._labels["hermes-profile"] == b._labels["hermes-profile"]
+    assert a._labels["hermes-profile"] != "research"
+    assert a._labels["hermes-profile"].startswith("team_workspace-")
+
+
+def test_distinct_shared_keys_never_collide(monkeypatch):
+    """Label sanitization is lossy — different raw keys MUST NOT resolve to
+    one container identity, or two 'isolated' teams silently attach to the
+    same running container (filesystem, processes, env)."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "research")
+    _mock_subprocess_run(monkeypatch)
+
+    # Sanitize-collision pair: both stems clean to "team_workspace".
+    a = _make_dummy_env(task_id="abc", shared_container_key="team/workspace")
+    b = _make_dummy_env(task_id="abc", shared_container_key="team_workspace")
+    assert a._labels["hermes-profile"] != b._labels["hermes-profile"]
+
+    # Truncation pair: identical first 63 chars, differ after.
+    long_a = "x" * 70 + "A"
+    long_b = "x" * 70 + "B"
+    c = _make_dummy_env(task_id="abc", shared_container_key=long_a)
+    d = _make_dummy_env(task_id="abc", shared_container_key=long_b)
+    assert c._labels["hermes-profile"] != d._labels["hermes-profile"]
+    # Both stay within Docker's 63-char label-value bound.
+    assert len(c._labels["hermes-profile"]) <= 63
+    assert len(d._labels["hermes-profile"]) <= 63
+
+
+def test_empty_shared_container_key_preserves_profile_isolation(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "research")
+    _mock_subprocess_run(monkeypatch)
+
+    env = _make_dummy_env(task_id="abc", shared_container_key="")
+
+    assert env._labels["hermes-profile"] == "research"
 
 
 # ── Cross-process container reuse (issue #20561) ──────────────────
