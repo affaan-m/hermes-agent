@@ -2174,6 +2174,27 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 await self._handle_slash_command(command)
 
+            # /ito-link is NOT a gateway command: it mints a panel identity
+            # bind nonce and answers ephemerally, never entering the
+            # agent-turn pipeline. It still needs a manifest declaration
+            # (hermes slack manifest includes it) or Slack will not deliver
+            # the command event over Socket Mode.
+            @self._app.command("/ito-link")
+            async def handle_ito_link_command(ack, command):
+                await ack(
+                    response_type="ephemeral",
+                    text="Minting your private Itô identity link…",
+                )
+                channel_id = command.get("channel_id") or ""
+                await self._handle_ito_link_request(
+                    channel_id=channel_id,
+                    user_id=command.get("user_id") or "",
+                    team_id=command.get("team_id") or "",
+                    display_name=command.get("user_name") or None,
+                    is_dm=channel_id.startswith("D"),
+                    reply_to=None,
+                )
+
             # Register Block Kit action handlers for approval buttons
             for _action_id in (
                 "hermes_approve_once",
@@ -2973,6 +2994,74 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[Slack] Ephemeral send error: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
+
+    async def _handle_ito_link_request(
+        self,
+        *,
+        channel_id: str,
+        user_id: str,
+        team_id: str,
+        display_name: Optional[str],
+        is_dm: bool,
+        reply_to: Optional[str],
+    ) -> None:
+        """Answer an /ito-link (or DM `link`) request with a private bind URL.
+
+        Channels get a chat.postEphemeral (only the requester sees the URL);
+        DMs get a normal reply (the conversation is already private). Every
+        outcome answers — never silent — and neither the nonce nor the bind
+        URL is logged.
+        """
+        from .ito_link import (
+            ItoLinkMintError,
+            link_error_message,
+            link_ready_message,
+            mint_link_nonce,
+        )
+
+        try:
+            minted = await mint_link_nonce(
+                team_id=team_id,
+                member_id=user_id,
+                display_name=display_name,
+            )
+            content = link_ready_message(minted["bind_url"])
+            logger.info(
+                "[Slack] ito-link nonce minted for team=%s member=%s",
+                team_id,
+                user_id,
+            )
+        except ItoLinkMintError as e:
+            content = link_error_message(e)
+            logger.warning(
+                "[Slack] ito-link mint failed kind=%s team=%s member=%s",
+                e.kind,
+                team_id,
+                user_id,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            content = link_error_message(ItoLinkMintError("unavailable"))
+            logger.error(
+                "[Slack] ito-link mint unexpected error: %s", e, exc_info=True,
+            )
+        if not channel_id or not user_id:
+            logger.warning("[Slack] ito-link request missing channel or user id")
+            return
+        if is_dm:
+            await self.send(
+                channel_id,
+                content,
+                reply_to=reply_to,
+                metadata={"team_id": team_id} if team_id else None,
+            )
+        else:
+            await self.send_private_notice(
+                channel_id,
+                user_id,
+                content,
+                reply_to=reply_to,
+                metadata={"team_id": team_id} if team_id else None,
+            )
 
     async def send_or_update_status(
         self,
@@ -6136,6 +6225,23 @@ class SlackAdapter(BasePlatformAdapter):
                     channel_id,
                 )
                 return
+
+        # Identity linking (spec v1): a 1:1 DM whose entire text is the link
+        # keyword mints a bind nonce and answers privately, without entering
+        # the agent-turn pipeline. Channel coverage comes from the /ito-link
+        # slash listener registered in connect().
+        from .ito_link import is_link_keyword as _is_link_keyword
+
+        if is_one_to_one_dm and _is_link_keyword(original_text or ""):
+            await self._handle_ito_link_request(
+                channel_id=channel_id,
+                user_id=str(user_id or ""),
+                team_id=str(team_id or ""),
+                display_name=None,
+                is_dm=True,
+                reply_to=event.get("thread_ts") or ts,
+            )
+            return
 
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
