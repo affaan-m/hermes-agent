@@ -1573,6 +1573,25 @@ def _never_silent_ack_enabled(user_config: Optional[dict]) -> bool:
 _NEVER_SILENT_ACK_TEXT = "✓ Received."
 
 
+def _quiet_channel_ids(user_config: Optional[dict]) -> set:
+    """Channel IDs whose working display surface is muted (``display.quiet_channels``).
+
+    Final answers still land in these channels; only the working surface —
+    reasoning prepends, tool-progress bubbles, and status/self-improvement
+    notices — is suppressed.  Used for counterparty-facing channels (supplier
+    desks) where internal bookkeeping and emoji progress must never leak,
+    while the answer itself still streams in normally.
+    """
+    try:
+        disp = (user_config or {}).get("display") or {}
+        raw = disp.get("quiet_channels") or []
+        if isinstance(raw, (list, tuple, set)):
+            return {str(c).strip() for c in raw if str(c).strip()}
+    except Exception:
+        pass
+    return set()
+
+
 def _never_silent_ack_response(event: Any, source: Any, user_config: Optional[dict]) -> str:
     """Resolve the outbound text for an intentional-silence turn.
 
@@ -4943,6 +4962,11 @@ class TurnRunner:
                 ctx._cleanup_msg_ids.append(str(result.message_id))
 
         async def _send_progress_text(text: str):
+            # display.quiet_channels: no tool-progress bubbles in
+            # counterparty-facing channels (the "working" surface stays
+            # the typing indicator + the streamed answer itself).
+            if (ctx.source.chat_id or "") in _quiet_channel_ids(_load_gateway_config()):
+                return
             result = await adapter.send(
                 chat_id=ctx.source.chat_id,
                 content=text,
@@ -5023,6 +5047,16 @@ class TurnRunner:
                         continue
                 except Exception:
                     pass
+
+                # display.quiet_channels: drop progress events at the queue
+                # for counterparty-facing channels, so no bubble is ever
+                # created.  Covers first sends, edits, overflow splits, and
+                # flood-control fallbacks alike — the per-send guard alone
+                # left the direct-send branches open (and could return None
+                # into result.success).
+                if (ctx.source.chat_id or "") in _quiet_channel_ids(_load_gateway_config()):
+                    await asyncio.sleep(0)
+                    continue
 
                 # Handle dedup messages: update last line with repeat counter
                 if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
@@ -5366,6 +5400,11 @@ class TurnRunner:
     def _status_callback_sync(self, event_type: str, message: str) -> None:
         ctx = self._ctx
         if not ctx._status_adapter or not ctx._run_still_current():
+            return
+        # display.quiet_channels: counterparty-facing channels get the
+        # final answer only — status notices (self-improvement reviews,
+        # auxiliary errors, lifecycle chatter) never surface there.
+        if (ctx._status_chat_id or "") in _quiet_channel_ids(_load_gateway_config()):
             return
         prepared_message = _prepare_gateway_status_message(
             ctx.source.platform,
@@ -20650,7 +20689,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if source.platform == Platform.MATTERMOST
                     else getattr(self, "_show_reasoning", False)
                 )
-            if _show_reasoning_effective and response and not _intentional_silence:
+            if (
+                _show_reasoning_effective
+                and response
+                and not _intentional_silence
+                and (source.chat_id or "") not in _quiet_channel_ids(_load_gateway_config())
+            ):
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
                     from gateway.stream_consumer import escape_code_fences_for_display
