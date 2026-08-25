@@ -5052,6 +5052,16 @@ class TurnRunner:
                 except Exception:
                     pass
 
+                # display.quiet_channels: drop progress events at the queue
+                # for counterparty-facing channels, so no bubble is ever
+                # created.  Covers first sends, edits, overflow splits, and
+                # flood-control fallbacks alike — the per-send guard alone
+                # left the direct-send branches open (and could return None
+                # into result.success).
+                if (ctx.source.chat_id or "") in _quiet_channel_ids(_load_gateway_config()):
+                    await asyncio.sleep(0)
+                    continue
+
                 # Handle dedup messages: update last line with repeat counter
                 if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                     _, base_msg, count = raw
