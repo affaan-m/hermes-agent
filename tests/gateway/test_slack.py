@@ -540,9 +540,11 @@ class TestAppMentionHandler:
         # covering every COMMAND_REGISTRY entry (e.g. /hermes, /btw, /stop,
         # /model, ...) so users get native-slash parity with Discord and
         # Telegram. Verify the regex matches the key expected slashes.
+        # /ito-link is a dedicated literal listener beside the combined regex:
+        # it is answered by the identity-link flow, not the gateway registry.
         assert (
-            len(registered_commands) == 1
-        ), f"expected 1 combined slash matcher, got {registered_commands!r}"
+            len(registered_commands) == 2
+        ), f"expected combined slash matcher + /ito-link, got {registered_commands!r}"
         slash_matcher = registered_commands[0]
         import re as _re
 
@@ -551,6 +553,7 @@ class TestAppMentionHandler:
             assert slash_matcher.match(
                 expected
             ), f"Slack slash regex does not match {expected}"
+        assert "/ito-link" in registered_commands
 
         # Catch-all generic matcher must be registered after the named handlers
         # so it does not shadow them. It fires for any event type not already

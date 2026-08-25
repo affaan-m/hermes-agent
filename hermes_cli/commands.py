@@ -1488,6 +1488,24 @@ def slack_app_manifest(request_url: str = "https://hermes-agent.local/slack/comm
         if usage:
             entry["usage_hint"] = usage
         slashes.append(entry)
+    # /ito-link is answered by a dedicated bolt listener in the Slack adapter
+    # (not the gateway COMMAND_REGISTRY), so it never appears in
+    # slack_native_slashes(); declare it explicitly or Socket Mode will not
+    # deliver the command event. Slack caps a manifest at 50 slash commands:
+    # when the registry already fills the cap, the tail entry yields to
+    # /ito-link and stays reachable via the /hermes <command> catch-all.
+    if not any(entry["command"] == "/ito-link" for entry in slashes):
+        slashes.append({
+            "command": "/ito-link",
+            "description": "Link your Slack identity to your Itô account",
+            "should_escape": False,
+            "url": request_url,
+        })
+    while len(slashes) > _SLACK_MAX_SLASH_COMMANDS:
+        for index in range(len(slashes) - 2, -1, -1):
+            if slashes[index]["command"] not in ("/hermes", "/ito-link"):
+                del slashes[index]
+                break
     return {"features": {"slash_commands": slashes}}
 
 
