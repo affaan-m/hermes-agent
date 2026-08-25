@@ -302,6 +302,171 @@ class TestSlackWorkspaceCollisionIsolation:
 class TestAppMentionHandler:
     """Verify that the app_mention event handler is registered."""
 
+    def test_direct_token_connect_supplies_workspace_authorizer_with_oauth_env(self):
+        """Ambient OAuth setup must not replace Hermes's bot-token authority.
+
+        Slack Bolt auto-enables its installation-store authorization whenever
+        ``SLACK_CLIENT_ID`` and ``SLACK_CLIENT_SECRET`` exist. Hermes supplies
+        an explicit workspace-aware authorizer so valid Socket Mode events use
+        the already resolved bot token instead.
+        """
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+        async_app_kwargs = {}
+
+        mock_app = MagicMock()
+        mock_app.event.side_effect = lambda _event: lambda fn: fn
+        mock_app.command.side_effect = lambda _command: lambda fn: fn
+        mock_app.client = AsyncMock()
+
+        def build_app(*args, **kwargs):
+            async_app_kwargs.update(kwargs)
+            return mock_app
+
+        mock_web_client = AsyncMock()
+        mock_web_client.token = "xoxb-fake"
+        mock_web_client.auth_test = AsyncMock(
+            return_value={
+                "user_id": "U_BOT",
+                "bot_id": "B_BOT",
+                "user": "testbot",
+                "team_id": "T_FAKE",
+                "team": "FakeTeam",
+            }
+        )
+        socket_mode_handler = MagicMock()
+        socket_mode_handler.start_async = AsyncMock(return_value=None)
+
+        with (
+            patch.object(_slack_mod, "AsyncApp", side_effect=build_app),
+            patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client),
+            patch.object(
+                _slack_mod, "AsyncSocketModeHandler", return_value=socket_mode_handler
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "SLACK_APP_TOKEN": "xapp-fake",
+                    "SLACK_CLIENT_ID": "ambient-client-id",
+                    "SLACK_CLIENT_SECRET": "ambient-client-secret",
+                },
+            ),
+            patch("gateway.status.acquire_scoped_lock", return_value=(True, None)),
+            patch("asyncio.create_task", side_effect=_fake_create_task),
+        ):
+            asyncio.run(adapter.connect())
+
+        assert async_app_kwargs["token"] == "xoxb-fake"
+        assert async_app_kwargs["client"] is mock_web_client
+        authorize = async_app_kwargs["authorize"]
+        result = asyncio.run(authorize(enterprise_id=None, team_id="T_FAKE"))
+        assert result.team_id == "T_FAKE"
+        assert result.bot_user_id == "U_BOT"
+        assert result.bot_token == "xoxb-fake"
+
+    @pytest.mark.parametrize(
+        ("clients", "bot_ids", "team_id", "expected"),
+        [
+            (
+                {"T_ONE": "xoxb-one"},
+                {"T_ONE": "U_ONE"},
+                "T_ONE",
+                ("T_ONE", "U_ONE", "xoxb-one"),
+            ),
+            (
+                {"T_ONE": "xoxb-one"},
+                {"T_ONE": "U_ONE"},
+                None,
+                ("T_ONE", "U_ONE", "xoxb-one"),
+            ),
+            ({"T_ONE": "xoxb-one"}, {"T_ONE": "U_ONE"}, "T_UNKNOWN", None),
+            (
+                {"T_ONE": "xoxb-one", "T_TWO": "xoxb-two"},
+                {"T_ONE": "U_ONE", "T_TWO": "U_TWO"},
+                "T_TWO",
+                ("T_TWO", "U_TWO", "xoxb-two"),
+            ),
+            (
+                {"T_ONE": "xoxb-one", "T_TWO": "xoxb-two"},
+                {"T_ONE": "U_ONE", "T_TWO": "U_TWO"},
+                "T_UNKNOWN",
+                None,
+            ),
+            (
+                {"T_ONE": "xoxb-one", "T_TWO": "xoxb-two"},
+                {"T_ONE": "U_ONE", "T_TWO": "U_TWO"},
+                None,
+                None,
+            ),
+        ],
+    )
+    def test_workspace_authorizer_routing_matrix(
+        self, clients, bot_ids, team_id, expected
+    ):
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._team_clients = {
+            key: MagicMock(token=token) for key, token in clients.items()
+        }
+        adapter._team_bot_user_ids = bot_ids
+
+        result = asyncio.run(
+            adapter._authorize_slack_request(enterprise_id=None, team_id=team_id)
+        )
+
+        if expected is None:
+            assert result is None
+        else:
+            expected_team, expected_bot, expected_token = expected
+            assert result.team_id == expected_team
+            assert result.bot_user_id == expected_bot
+            assert result.bot_token == expected_token
+
+    def test_real_bolt_uses_explicit_authorizer_with_ambient_oauth_env(self):
+        """Exercise Bolt's real authorization middleware selection and callback."""
+        import logging
+
+        from slack_bolt.async_app import AsyncApp as RealAsyncApp
+        from slack_bolt.context.async_context import AsyncBoltContext
+        from slack_sdk.web.async_client import AsyncWebClient
+
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        client = AsyncWebClient(token="xoxb-fake")
+        adapter._team_clients = {"T_FAKE": client}
+        adapter._team_bot_user_ids = {"T_FAKE": "U_BOT"}
+
+        async def authorize(enterprise_id=None, team_id=None):
+            return await adapter._authorize_slack_request(
+                enterprise_id=enterprise_id,
+                team_id=team_id,
+            )
+
+        with patch.dict(
+            os.environ,
+            {
+                "SLACK_BOT_TOKEN": "xoxb-fake",
+                "SLACK_CLIENT_ID": "ambient-client-id",
+                "SLACK_CLIENT_SECRET": "ambient-client-secret",
+            },
+        ):
+            app = RealAsyncApp(token="xoxb-fake", client=client, authorize=authorize)
+
+        context = AsyncBoltContext(
+            {"logger": logging.getLogger("slack-auth-test"), "client": client}
+        )
+        result = asyncio.run(
+            app._async_authorize(
+                context=context,
+                enterprise_id=None,
+                team_id="T_FAKE",
+                user_id="U_USER",
+            )
+        )
+
+        assert type(app._async_authorize).__name__ == "AsyncCallableAuthorize"
+        assert result.team_id == "T_FAKE"
+        assert result.bot_user_id == "U_BOT"
+        assert result.bot_token == "xoxb-fake"
+
     def test_app_mention_registered_on_connect(self):
         """connect() should register message + assistant lifecycle handlers."""
         config = PlatformConfig(enabled=True, token="xoxb-fake")
@@ -2924,6 +3089,67 @@ class TestAssistantThreadLifecycle:
             title="Start here",
             prompts=[{"title": "Plan", "message": "Help me plan the work"}],
         )
+
+
+    @pytest.mark.asyncio
+    async def test_assistant_thread_started_greets_once_and_sets_dynamic_prompts(
+        self, assistant_adapter
+    ):
+        assistant_adapter.config.extra["assistant_thread_greeting"] = (
+            "Hi, I’m Itô Desk. What are you working on?"
+        )
+        assistant_adapter.config.extra["suggested_prompts"] = {
+            "title": "Live desk",
+            "prompts": [
+                {"title": "Priorities", "message": "Show my current desk priorities"}
+            ],
+        }
+        assistant_adapter._app.client.chat_postMessage = AsyncMock()
+        assistant_adapter._app.client.assistant_threads_setSuggestedPrompts = AsyncMock()
+        event = {
+            "type": "assistant_thread_started",
+            "team_id": "T_TEAM",
+            "assistant_thread": {
+                "channel_id": "D123",
+                "thread_ts": "171.000",
+                "user_id": "U_USER",
+            },
+        }
+
+        await assistant_adapter._handle_assistant_thread_lifecycle_event(event)
+        await assistant_adapter._handle_assistant_thread_lifecycle_event(event)
+
+        assistant_adapter._app.client.chat_postMessage.assert_awaited_once_with(
+            channel="D123",
+            thread_ts="171.000",
+            text="Hi, I’m Itô Desk. What are you working on?",
+        )
+        assert (
+            assistant_adapter._app.client.assistant_threads_setSuggestedPrompts.await_count
+            == 2
+        )
+
+
+    @pytest.mark.asyncio
+    async def test_assistant_thread_context_changed_never_greets(
+        self, assistant_adapter
+    ):
+        assistant_adapter.config.extra["assistant_thread_greeting"] = "Hi"
+        assistant_adapter._app.client.chat_postMessage = AsyncMock()
+
+        await assistant_adapter._handle_assistant_thread_lifecycle_event(
+            {
+                "type": "assistant_thread_context_changed",
+                "team_id": "T_TEAM",
+                "assistant_thread": {
+                    "channel_id": "D123",
+                    "thread_ts": "171.000",
+                    "user_id": "U_USER",
+                },
+            }
+        )
+
+        assistant_adapter._app.client.chat_postMessage.assert_not_awaited()
 
 
     @pytest.mark.asyncio

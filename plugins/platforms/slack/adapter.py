@@ -23,6 +23,7 @@ from typing import Callable, ClassVar, Dict, Optional, Any, Tuple, List
 import aiohttp
 
 try:
+    from slack_bolt.authorization import AuthorizeResult
     from slack_bolt.async_app import AsyncApp
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
     from slack_sdk.web.async_client import AsyncWebClient
@@ -30,6 +31,7 @@ try:
     SLACK_AVAILABLE = True
 except ImportError:
     SLACK_AVAILABLE = False
+    AuthorizeResult = Any
     AsyncApp = Any
     AsyncSocketModeHandler = Any
     AsyncWebClient = Any
@@ -1054,6 +1056,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Best-effort guard so automatic Slack AI thread titles are set once
         # per visible DM thread instead of on every reply.
         self._titled_assistant_threads: set = set()
+        self._greeted_assistant_threads: set = set()
         self._TITLED_ASSISTANT_THREADS_MAX = 5000
         # Slash-command contexts: stash response_url + user_id so send()
         # can route the first reply ephemerally.  Keyed by
@@ -1090,6 +1093,36 @@ class SlackAdapter(BasePlatformAdapter):
         # Allow at least this long after (re)connect before treating a missing
         # first ping/pong as evidence of a wedged transport.
         self._socket_first_ping_grace_s = 60.0
+
+    async def _authorize_slack_request(
+        self,
+        enterprise_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+    ) -> Optional[Any]:
+        """Authorize a Bolt request from Hermes's resolved workspace clients.
+
+        Passing an explicit callback prevents ambient Slack OAuth client
+        credentials from replacing Hermes's direct bot-token authorization
+        with Bolt's unrelated installation store. The callback also keeps the
+        request client workspace-correct for multi-workspace Socket Mode.
+        """
+        selected_team_id = str(team_id or "")
+        client = self._team_clients.get(selected_team_id)
+        if client is None and not selected_team_id and len(self._team_clients) == 1:
+            selected_team_id, client = next(iter(self._team_clients.items()))
+        if client is None:
+            logger.error(
+                "[Slack] Cannot authorize event for unknown workspace %s",
+                selected_team_id or "(missing)",
+            )
+            return None
+
+        return AuthorizeResult(
+            enterprise_id=enterprise_id,
+            team_id=selected_team_id or team_id,
+            bot_token=getattr(client, "token", None),
+            bot_user_id=self._team_bot_user_ids.get(selected_team_id),
+        )
 
     async def _close_workspace_clients(self) -> None:
         """Close any Slack SDK clients that may own aiohttp sessions."""
@@ -1955,7 +1988,20 @@ class SlackAdapter(BasePlatformAdapter):
                 token=primary_token,
                 user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX,
             )
-            self._app = AsyncApp(token=primary_token, client=primary_client)
+            async def authorize_slack_request(
+                enterprise_id: Optional[str] = None,
+                team_id: Optional[str] = None,
+            ) -> Optional[Any]:
+                return await self._authorize_slack_request(
+                    enterprise_id=enterprise_id,
+                    team_id=team_id,
+                )
+
+            self._app = AsyncApp(
+                token=primary_token,
+                client=primary_client,
+                authorize=authorize_slack_request,  # type: ignore[arg-type]
+            )
             _apply_slack_proxy(self._app.client, proxy_url)
 
             # Register each bot token and map team_id → client
@@ -5194,6 +5240,38 @@ class SlackAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
 
+    async def _greet_assistant_thread(self, metadata: Dict[str, str]) -> None:
+        """Send one configured welcome message for a newly created Assistant thread."""
+        if not self._app:
+            return
+        greeting = str(self.config.extra.get("assistant_thread_greeting") or "").strip()
+        channel_id = metadata.get("channel_id", "")
+        thread_ts = metadata.get("thread_ts", "")
+        team_id = metadata.get("team_id", "")
+        key = self._workspace_thread_key(team_id, channel_id, thread_ts)
+        if not greeting or not key or key in self._greeted_assistant_threads:
+            return
+
+        try:
+            await self._get_client(channel_id, team_id=team_id).chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=greeting[:3000],
+            )
+        except Exception as e:
+            logger.debug("[Slack] assistant thread greeting failed: %s", e)
+            return
+
+        self._greeted_assistant_threads.add(key)
+        if len(self._greeted_assistant_threads) > self._TITLED_ASSISTANT_THREADS_MAX:
+            excess = (
+                len(self._greeted_assistant_threads)
+                - self._TITLED_ASSISTANT_THREADS_MAX // 2
+            )
+            self._discard_oldest_by_thread_ts(
+                self._greeted_assistant_threads, excess, lambda entry: entry[2]
+            )
+
     async def _handle_assistant_thread_lifecycle_event(
         self, event: dict, body: Optional[dict] = None
     ) -> None:
@@ -5201,6 +5279,8 @@ class SlackAdapter(BasePlatformAdapter):
         metadata = self._extract_assistant_thread_metadata(event, body)
         self._cache_assistant_thread_metadata(metadata)
         self._seed_assistant_thread_session(metadata)
+        if event.get("type") == "assistant_thread_started":
+            await self._greet_assistant_thread(metadata)
         await self._set_assistant_suggested_prompts(
             metadata.get("channel_id", ""),
             team_id=metadata.get("team_id", ""),
@@ -6797,6 +6877,19 @@ class SlackAdapter(BasePlatformAdapter):
             text, chat_id=channel_id, team_id=team_id
         )
 
+        # Mark direct addresses for the gateway's never-silent ack: 1:1 DMs,
+        # @mentions, and replies inside a thread the bot participates in are
+        # user-initiated conversations where a completed turn must never end
+        # in total silence.  Passive free-response channel traffic is left
+        # unmarked so intentional silence stays available there.
+        _addressed_bot = bool(
+            is_one_to_one_dm
+            or is_mentioned
+            or (
+                is_thread_reply
+                and event_thread_ts in self._bot_message_ts
+            )
+        )
         msg_event = MessageEvent(
             text=(command_probe_text if is_command_text else text),
             message_type=msg_type,
@@ -6814,6 +6907,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "slack_team_id": team_id,
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
+                "addressed_bot": _addressed_bot,
             },
         )
 

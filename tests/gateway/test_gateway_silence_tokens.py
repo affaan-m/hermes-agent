@@ -165,6 +165,21 @@ async def test_prose_mentioning_silence_token_is_delivered(monkeypatch, tmp_path
     assert response == text
 
 
+def _silent_agent_result():
+    return {
+        "final_response": "[SILENT]",
+        "messages": [
+            {"role": "user", "content": "side chatter"},
+            {"role": "assistant", "content": "[SILENT]"},
+        ],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "failed": False,
+    }
+
+
 @pytest.mark.asyncio
 async def test_agent_end_hook_includes_model_and_provider(monkeypatch, tmp_path):
     """Gateway hooks receive the actual model/provider for post-turn routing."""
@@ -195,3 +210,56 @@ async def test_agent_end_hook_includes_model_and_provider(monkeypatch, tmp_path)
     )
     assert end_context["model"] == "gpt-5.6-terra"
     assert end_context["provider"] == "openai-codex"
+
+
+@pytest.mark.asyncio
+async def test_directly_addressed_silence_gets_never_silent_ack(monkeypatch, tmp_path):
+    """A direct address must never end in total silence: the gateway replaces
+    the intentional-silence marker with a minimal visible ack."""
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value=_silent_agent_result())
+
+    event = _event()
+    event.metadata["addressed_bot"] = True
+    response = await runner._handle_message_with_agent(
+        event, _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == "✓ Received."
+    # The ack replaces delivery text only — the [SILENT] assistant turn is
+    # still persisted so alternation is preserved.
+    appended = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
+    assert {"role": "assistant", "content": "[SILENT]"}.items() <= appended[-1].items()
+
+
+@pytest.mark.asyncio
+async def test_explicitly_passive_silence_stays_silent(monkeypatch, tmp_path):
+    """Free-response passive traffic keeps the intentional-silence path even
+    with the ack enabled (adapter marked the event as not addressed)."""
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value=_silent_agent_result())
+
+    event = _event()
+    event.metadata["addressed_bot"] = False
+    response = await runner._handle_message_with_agent(
+        event, _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == ""
+
+
+@pytest.mark.asyncio
+async def test_never_silent_ack_config_opt_out(monkeypatch, tmp_path):
+    """gateway.never_silent_ack: false restores legacy silence even for a
+    direct address."""
+    (tmp_path / "config.yaml").write_text("gateway:\n  never_silent_ack: false\n")
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value=_silent_agent_result())
+
+    event = _event()
+    event.metadata["addressed_bot"] = True
+    response = await runner._handle_message_with_agent(
+        event, _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == ""
