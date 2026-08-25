@@ -178,6 +178,31 @@ async def test_underscored_alias_for_hyphenated_builtin_not_flagged(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_gateway_only_plugin_receives_authenticated_event(monkeypatch):
+    runner = _make_runner()
+    event = _make_event("/mutate exact")
+    seen = []
+
+    import hermes_cli.plugins as plugins_mod
+    monkeypatch.setattr(
+        plugins_mod,
+        "get_plugin_command_handler",
+        lambda name, **kwargs: (lambda args, inbound: seen.append((args, inbound)) or "done")
+        if name == "mutate" and kwargs.get("surface") == "gateway" else None,
+    )
+    monkeypatch.setattr(
+        plugins_mod,
+        "get_plugin_commands",
+        lambda: {"mutate": {"handler": object(), "gateway_only": True}},
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "done"
+    assert seen == [("exact", event)]
+
+
+@pytest.mark.asyncio
 async def test_command_hook_rewrite_routes_to_plugin(monkeypatch):
     """A rewrite decision should re-resolve the command and route to the new one."""
     import gateway.run as gateway_run
@@ -216,7 +241,7 @@ async def test_command_hook_rewrite_routes_to_plugin(monkeypatch):
     monkeypatch.setattr(
         _plugins_mod,
         "get_plugin_command_handler",
-        lambda name: (lambda args: f"metrics {args}") if name == "metricas" else None,
+        lambda name, **kwargs: (lambda args: f"metrics {args}") if name == "metricas" else None,
     )
 
     result = await runner._handle_message(_make_event("/status"))

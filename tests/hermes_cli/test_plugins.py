@@ -1688,6 +1688,19 @@ class TestPluginCommands:
 
 
 
+    def test_gateway_command_is_not_invocable_from_contextless_surfaces(self):
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+        handler = lambda raw_args, event: (raw_args, event)
+
+        ctx.register_gateway_command("mutate", handler)
+
+        assert mgr._plugin_commands["mutate"]["gateway_only"] is True
+        with patch("hermes_cli.plugins._ensure_plugins_discovered", return_value=mgr):
+            assert get_plugin_command_handler("mutate") is None
+            assert get_plugin_command_handler("mutate", surface="gateway") is handler
+
     def test_register_command_empty_name_rejected(self, caplog):
         """Empty name after normalization is rejected with a warning."""
         mgr = PluginManager()

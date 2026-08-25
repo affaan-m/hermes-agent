@@ -17520,14 +17520,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugin-registered slash commands
         if command:
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
+                from hermes_cli.plugins import get_plugin_command_handler, get_plugin_commands
                 # Normalize underscores to hyphens so Telegram's underscored
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
+                normalized_command = command.replace("_", "-")
+                plugin_handler = get_plugin_command_handler(normalized_command, surface="gateway")
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
+                    entry = get_plugin_commands().get(normalized_command, {})
+                    result = (
+                        plugin_handler(user_args, event)
+                        if entry.get("gateway_only")
+                        else plugin_handler(user_args)
+                    )
                     if asyncio.iscoroutine(result):
                         result = await result
                     return str(result) if result else None

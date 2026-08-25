@@ -2166,6 +2166,26 @@ class PluginContext:
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
         return handle
 
+    def register_gateway_command(
+        self,
+        name: str,
+        handler: Callable,
+        description: str = "",
+        args_hint: str = "",
+    ) -> Optional[PluginRegistration]:
+        """Register a slash command callable only from authenticated gateway events.
+
+        The handler signature is ``fn(raw_args: str, event: MessageEvent)``. CLI,
+        TUI, desktop, and other contextless dispatch paths cannot resolve it.
+        """
+        handle = self.register_command(name, handler, description, args_hint)
+        if handle is not None:
+            clean = name.lower().strip().lstrip("/").replace(" ", "-")
+            entry = self._manager._plugin_commands.get(clean)
+            if entry is not None and entry.get("handler") is handler:
+                entry["gateway_only"] = True
+        return handle
+
     # -- tool dispatch -------------------------------------------------------
 
     def dispatch_tool(self, tool_name: str, args: dict, **kwargs) -> str:
@@ -6421,10 +6441,18 @@ def get_plugin_context_engine():
     return _ensure_plugins_discovered()._context_engine
 
 
-def get_plugin_command_handler(name: str) -> Optional[Callable]:
-    """Return the handler for a plugin-registered slash command, or ``None``."""
+def get_plugin_command_handler(name: str, *, surface: Optional[str] = None) -> Optional[Callable]:
+    """Return a plugin slash handler when it is permitted on ``surface``.
+
+    Gateway-only handlers fail closed unless the caller explicitly proves it is
+    the gateway dispatch path by passing ``surface='gateway'``.
+    """
     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
-    return entry["handler"] if entry else None
+    if not entry:
+        return None
+    if entry.get("gateway_only") and surface != "gateway":
+        return None
+    return entry["handler"]
 
 
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
