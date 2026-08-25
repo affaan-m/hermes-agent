@@ -3019,6 +3019,9 @@ class SlackAdapter(BasePlatformAdapter):
             mint_link_nonce,
         )
 
+        if not channel_id or not user_id:
+            logger.warning("[Slack] ito-link request missing channel or user id")
+            return
         try:
             minted = await mint_link_nonce(
                 team_id=team_id,
@@ -3044,9 +3047,6 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error(
                 "[Slack] ito-link mint unexpected error: %s", e, exc_info=True,
             )
-        if not channel_id or not user_id:
-            logger.warning("[Slack] ito-link request missing channel or user id")
-            return
         if is_dm:
             await self.send(
                 channel_id,
