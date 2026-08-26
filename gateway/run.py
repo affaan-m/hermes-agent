@@ -1611,6 +1611,78 @@ def _never_silent_ack_response(event: Any, source: Any, user_config: Optional[di
     return ""
 
 
+def _is_operator_source(source: Any) -> bool:
+    """Whether the source user is an operator on the platform user allowlist
+    (e.g. SLACK_ALLOWED_USERS), as opposed to a counterparty admitted through
+    a chat-scoped allowlist (SLACK_GROUP_ALLOWED_CHATS)."""
+    plat = getattr(source, "platform", None)
+    env_name = {
+        "slack": "SLACK_ALLOWED_USERS",
+        "telegram": "TELEGRAM_ALLOWED_USERS",
+    }.get(str(getattr(plat, "value", plat) or "").lower(), "")
+    if not env_name:
+        return False
+    raw = os.getenv(env_name, "")
+    allowed = {p.strip().lower() for p in raw.replace(",", " ").split() if p.strip()}
+    if not allowed:
+        return False
+    uid = str(getattr(source, "user_id", "") or "").lower()
+    uname = str(getattr(source, "user_name", "") or "").lower()
+    return bool((uid and uid in allowed) or (uname and uname in allowed))
+
+
+def _operator_unaddressed_in_quiet(event: Any, source: Any, user_config: Optional[dict]) -> bool:
+    """True when an operator sent a message NOT addressed to the bot in a
+    display.quiet_channels channel (e.g. answering the counterparty directly
+    in a supplier-desk channel).
+
+    Those turns are operator bookkeeping (draft internals, status chatter):
+    the response is rerouted to the platform home channel and nothing is
+    streamed into the counterparty-facing channel.  Counterparty messages
+    and bot-addressed messages keep normal in-channel behavior.
+    """
+    if (getattr(source, "chat_id", "") or "") not in _quiet_channel_ids(user_config):
+        return False
+    if _event_addressed_bot(event, source):
+        return False
+    return _is_operator_source(source)
+
+
+def _jobs_notice_chat(user_config: Optional[dict], source: Any) -> str:
+    """Channel that receives background-job lifecycle notices.
+
+    For internal chats, when ``gateway.jobs_channel`` is set, completion and
+    failure notices go there instead of the origin chat (the #ito-jobs
+    split).  Counterparty-facing (quiet) channels keep in-channel delivery
+    so desk answers stay with the conversation.
+    """
+    origin = getattr(source, "chat_id", "") or ""
+    if origin in _quiet_channel_ids(user_config):
+        return origin
+    try:
+        gw = (user_config or {}).get("gateway") or {}
+        target = str(gw.get("jobs_channel") or "").strip()
+    except Exception:
+        target = ""
+    return target or origin
+
+
+def _trace_notice_chat(user_config: Optional[dict], source: Any) -> str:
+    """Channel that receives self-improvement / background-review traces.
+
+    These are internal bookkeeping: in counterparty-facing (quiet) channels
+    they are suppressed entirely (handled at the caller); for internal chats
+    they route to ``gateway.desk_log_channel`` when set (the #ito-desk-log
+    split) so the home channel stays a clean ops summary.
+    """
+    try:
+        gw = (user_config or {}).get("gateway") or {}
+        target = str(gw.get("desk_log_channel") or "").strip()
+    except Exception:
+        target = ""
+    return target or (getattr(source, "chat_id", "") or "")
+
+
 def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
     """True when gateway.message_timestamps.enabled is opted in.
 
@@ -5539,7 +5611,7 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
-        _want_stream_deltas = _streaming_enabled
+        _want_stream_deltas = _streaming_enabled and not ctx.suppress_streaming
         _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
@@ -5985,9 +6057,17 @@ class TurnRunner:
         def _deliver_bg_review_message(message: str) -> None:
             if not ctx._status_adapter or not ctx._run_still_current():
                 return
+            # display.quiet_channels: self-improvement/memory notices are
+            # internal bookkeeping — never in counterparty channels.
+            # gateway.desk_log_channel: in internal channels they route to
+            # the desk-log channel instead of the origin chat.
+            _bg_cfg = _load_gateway_config()
+            if (ctx._status_chat_id or "") in _quiet_channel_ids(_bg_cfg):
+                return
+            _trace_chat_id = _trace_notice_chat(_bg_cfg, ctx.source)
             safe_schedule_threadsafe(
                 ctx._status_adapter.send(
-                    ctx._status_chat_id,
+                    _trace_chat_id,
                     message,
                     metadata=_interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)),
                 ),
@@ -10552,6 +10632,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # merge semantics for media.
         if not steered and not redirected:
             self._queue_or_replace_pending_event(session_key, event)
+
+        # display.quiet_channels: follow-ups in counterparty-facing channels
+        # queue silently.  The desk's live turn is never interrupted and no
+        # "Interrupting current task" ack is ever shown to a supplier; the
+        # queued message is answered in order when the current turn ends.
+        if (event.source.chat_id or "") in _quiet_channel_ids(_load_gateway_config()):
+            return True
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -20526,6 +20613,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                suppress_streaming=_operator_unaddressed_in_quiet(
+                    event, source, _load_gateway_config(),
+                ),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -21167,6 +21257,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
                 return None
+
+            # Operator bookkeeping reroute: an operator's unaddressed message
+            # in a quiet (counterparty-facing) channel gets its answer in the
+            # platform home channel — draft internals and status chatter never
+            # land in front of the supplier.  Fail-open: any lookup/send
+            # problem falls back to normal in-channel delivery.
+            if response and _operator_unaddressed_in_quiet(
+                event, source, _load_gateway_config(),
+            ):
+                _home = self.config.get_home_channel(source.platform) if self.config else None
+                _home_adapter = self._adapter_for_source(source)
+                if _home and _home.chat_id and _home_adapter:
+                    try:
+                        await _home_adapter.send(
+                            _home.chat_id,
+                            f"<#{source.chat_id}> operator bookkeeping:\n{response}",
+                        )
+                        logger.info(
+                            "Routed operator bookkeeping answer from %s to home channel %s",
+                            source.chat_id, _home.chat_id,
+                        )
+                        return None
+                    except Exception as _home_err:
+                        logger.warning(
+                            "Home-channel reroute failed for %s: %s — falling back to in-channel delivery",
+                            source.chat_id, _home_err,
+                        )
 
             return response
             
@@ -28268,6 +28385,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        suppress_streaming: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28288,6 +28406,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                suppress_streaming=suppress_streaming,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -28301,6 +28420,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                suppress_streaming=suppress_streaming,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -28444,6 +28564,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        suppress_streaming: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -28753,6 +28874,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            suppress_streaming=suppress_streaming,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -29982,6 +30104,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message=next_message,
                     context_prompt=context_prompt,
                     history=updated_history,
+                    suppress_streaming=suppress_streaming,
                     source=next_source,
                     session_id=session_id,
                     session_key=next_session_key,

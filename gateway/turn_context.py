@@ -37,6 +37,10 @@ class TurnContext:
     source: Any = None
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
     _live_status_adapter: Any = None
+    # When True, the turn runs without the stream consumer (no streamed
+    # preview into the channel).  Set for operator-bookkeeping turns in
+    # quiet channels, whose answers are rerouted to the home channel.
+    suppress_streaming: bool = False
     _live_status_mode: str = "off"
     _thinking_enabled: bool = False
     progress_mode: str = "off"
