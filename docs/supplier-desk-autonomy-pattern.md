@@ -1,5 +1,10 @@
 # Supplier-Desk Autonomy Pattern
 
+Policy core: the Desk Provisioning Matrix
+(`DESK-PROVISIONING-MATRIX-20260826.md`) — AUTO vs APPROVAL decision table,
+the 120-second end-to-end standard, and the never-silent guarantee. This
+document is the mechanics; the matrix is the law.
+
 How to run a Hermes gateway agent as a counterparty-facing desk (supplier or
 buyer channels) with production discipline. All of it is config keyed by
 channel id — no per-channel code. Adopting it for a new channel is one entry
