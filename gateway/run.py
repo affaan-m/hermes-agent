@@ -29270,7 +29270,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
 
-        _notify_task = asyncio.create_task(_notify_long_running())
+        # display.quiet_channels: no "⏳ Working — N min" heartbeat bubbles in
+        # counterparty-facing channels.  The desk works quietly there; the
+        # only working indicator is the assistant typing status.
+        if (source.chat_id or "") in _quiet_channel_ids(_load_gateway_config()):
+            _notify_task = None
+        else:
+            _notify_task = asyncio.create_task(_notify_long_running())
 
         def _stream_confirmed_final_delivery(
             consumer,
