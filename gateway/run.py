@@ -1610,14 +1610,17 @@ def _is_quiet_channel(user_config: Optional[dict], chat_id: Any) -> bool:
     if cid in _quiet_channel_ids(user_config):
         return True
     internal = _internal_channel_ids(user_config)
+    # The not-internal default is opt-in: it only applies when the operator
+    # pins an internal set via display.internal_channels.  Without that
+    # config, behavior stays exactly the legacy explicit-list semantics.
+    if not internal:
+        return False
     try:
         home = (user_config or {}).get("gateway", {}).get("home_channel") or {}
         if isinstance(home, dict) and home.get("chat_id"):
             internal.add(str(home["chat_id"]))
     except Exception:
         pass
-    for default_internal in ("C0B541TF71N", "-1003795075025"):
-        internal.add(default_internal)
     return cid not in internal
 
 
