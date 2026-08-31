@@ -1570,6 +1570,57 @@ def _never_silent_ack_enabled(user_config: Optional[dict]) -> bool:
 _NEVER_SILENT_ACK_TEXT = "✓ Received."
 
 
+def _internal_channel_ids(user_config: Optional[dict]) -> set:
+    """Channels that are INTERNAL surfaces (home, approvals, jobs, desk-log,
+    telegram ops).  Everything else is treated as counterparty-facing for
+    display purposes.  Config: display.internal_channels; the platform home
+    channel is always internal."""
+    ids: set = set()
+    try:
+        disp = (user_config or {}).get("display") or {}
+        raw = disp.get("internal_channels") or []
+        if isinstance(raw, (list, tuple, set)):
+            ids |= {str(c).strip() for c in raw if str(c).strip()}
+    except Exception:
+        pass
+    try:
+        gw = (user_config or {}).get("gateway") or {}
+        for key in ("jobs_channel", "desk_log_channel"):
+            val = str(gw.get(key) or "").strip()
+            if val:
+                ids.add(val)
+    except Exception:
+        pass
+    return ids
+
+
+def _is_quiet_channel(user_config: Optional[dict], chat_id: Any) -> bool:
+    """Whether the channel gets the counterparty display surface (no reasoning,
+    progress, status, or bookkeeping traces).
+
+    True when the channel is in display.quiet_channels explicitly, OR when it
+    is not a known internal channel — external channels are quiet by default
+    so a brand-new supplier/customer channel never shows internal traces
+    before being enrolled.  display.internal_channels pins the internal set;
+    home channel ids (Slack home + telegram home) are always internal.
+    """
+    cid = str(chat_id or "")
+    if not cid:
+        return False
+    if cid in _quiet_channel_ids(user_config):
+        return True
+    internal = _internal_channel_ids(user_config)
+    try:
+        home = (user_config or {}).get("gateway", {}).get("home_channel") or {}
+        if isinstance(home, dict) and home.get("chat_id"):
+            internal.add(str(home["chat_id"]))
+    except Exception:
+        pass
+    for default_internal in ("C0B541TF71N", "-1003795075025"):
+        internal.add(default_internal)
+    return cid not in internal
+
+
 def _quiet_channel_ids(user_config: Optional[dict]) -> set:
     """Channel IDs whose working display surface is muted (``display.quiet_channels``).
 
@@ -1638,7 +1689,7 @@ def _operator_unaddressed_in_quiet(event: Any, source: Any, user_config: Optiona
     streamed into the counterparty-facing channel.  Counterparty messages
     and bot-addressed messages keep normal in-channel behavior.
     """
-    if (getattr(source, "chat_id", "") or "") not in _quiet_channel_ids(user_config):
+    if not _is_quiet_channel(user_config, getattr(source, "chat_id", "")):
         return False
     if _event_addressed_bot(event, source):
         return False
@@ -1654,7 +1705,7 @@ def _jobs_notice_chat(user_config: Optional[dict], source: Any) -> str:
     so desk answers stay with the conversation.
     """
     origin = getattr(source, "chat_id", "") or ""
-    if origin in _quiet_channel_ids(user_config):
+    if _is_quiet_channel(user_config, origin):
         return origin
     try:
         gw = (user_config or {}).get("gateway") or {}
@@ -5041,7 +5092,7 @@ class TurnRunner:
             # display.quiet_channels: no tool-progress bubbles in
             # counterparty-facing channels (the "working" surface stays
             # the typing indicator + the streamed answer itself).
-            if (ctx.source.chat_id or "") in _quiet_channel_ids(_load_gateway_config()):
+            if _is_quiet_channel(_load_gateway_config(), ctx.source.chat_id):
                 return
             result = await adapter.send(
                 chat_id=ctx.source.chat_id,
@@ -5130,7 +5181,7 @@ class TurnRunner:
                 # flood-control fallbacks alike — the per-send guard alone
                 # left the direct-send branches open (and could return None
                 # into result.success).
-                if (ctx.source.chat_id or "") in _quiet_channel_ids(_load_gateway_config()):
+                if _is_quiet_channel(_load_gateway_config(), ctx.source.chat_id):
                     await asyncio.sleep(0)
                     continue
 
@@ -5480,7 +5531,7 @@ class TurnRunner:
         # display.quiet_channels: counterparty-facing channels get the
         # final answer only — status notices (self-improvement reviews,
         # auxiliary errors, lifecycle chatter) never surface there.
-        if (ctx._status_chat_id or "") in _quiet_channel_ids(_load_gateway_config()):
+        if _is_quiet_channel(_load_gateway_config(), ctx._status_chat_id):
             return
         prepared_message = _prepare_gateway_status_message(
             ctx.source.platform,
@@ -6066,7 +6117,7 @@ class TurnRunner:
             # gateway.desk_log_channel: in internal channels they route to
             # the desk-log channel instead of the origin chat.
             _bg_cfg = _load_gateway_config()
-            if (ctx._status_chat_id or "") in _quiet_channel_ids(_bg_cfg):
+            if _is_quiet_channel(_bg_cfg, ctx._status_chat_id):
                 return
             _trace_chat_id = _trace_notice_chat(_bg_cfg, ctx.source)
             safe_schedule_threadsafe(
@@ -10627,7 +10678,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # queue silently.  The desk's live turn is never interrupted and no
         # "Interrupting current task" ack is ever shown to a supplier; the
         # queued message is answered in order when the current turn ends.
-        if (event.source.chat_id or "") in _quiet_channel_ids(_load_gateway_config()):
+        if _is_quiet_channel(_load_gateway_config(), event.source.chat_id):
             return True
 
         is_queue_mode = effective_mode == "queue"
@@ -20756,7 +20807,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _show_reasoning_effective
                 and response
                 and not _intentional_silence
-                and (source.chat_id or "") not in _quiet_channel_ids(_load_gateway_config())
+                and not _is_quiet_channel(_load_gateway_config(), source.chat_id)
             ):
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
@@ -29359,7 +29410,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # display.quiet_channels: no "⏳ Working — N min" heartbeat bubbles in
         # counterparty-facing channels.  The desk works quietly there; the
         # only working indicator is the assistant typing status.
-        if (source.chat_id or "") in _quiet_channel_ids(_load_gateway_config()):
+        if _is_quiet_channel(_load_gateway_config(), source.chat_id):
             _notify_task = None
         else:
             _notify_task = asyncio.create_task(_notify_long_running())
