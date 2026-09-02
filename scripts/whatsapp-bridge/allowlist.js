@@ -9,6 +9,20 @@ export function normalizeWhatsAppIdentifier(value) {
     .replace(/^\+/, '');
 }
 
+export function validateCanonicalPassiveAuthority(mode, allowedUsers, forwardOwnerMessages) {
+  if (
+    mode !== 'self-chat'
+    || !(allowedUsers instanceof Set)
+    || allowedUsers.size !== 1
+    || allowedUsers.has('*')
+    || forwardOwnerMessages !== false
+  ) {
+    throw new Error(
+      'canonical passive WhatsApp authority requires self-chat, exactly one concrete allowed user, and owner forwarding disabled',
+    );
+  }
+}
+
 export function parseAllowedUsers(rawValue) {
   return new Set(
     String(rawValue || '')

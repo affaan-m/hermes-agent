@@ -29,9 +29,19 @@ import { randomBytes, createHash } from 'crypto';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
-import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import {
+  matchesAllowedUser,
+  parseAllowedUsers,
+  validateCanonicalPassiveAuthority,
+} from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { createDurableSpool } from './ingest_spool.js';
+import {
+  awaitReadySocketGeneration,
+  createReconnectCoordinator,
+  createSerializedSender,
+} from './send_queue.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -65,6 +75,18 @@ const FORWARD_OWNER_MESSAGES =
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+
+function defaultIngestSpoolPath(sessionDir) {
+  const resolved = path.resolve(sessionDir);
+  const whatsappDir = path.dirname(resolved);
+  let profileRoot = path.dirname(whatsappDir);
+  if (path.basename(profileRoot) === 'platforms') profileRoot = path.dirname(profileRoot);
+  return path.join(profileRoot, 'state', 'whatsapp-ingest', 'events.ndjson');
+}
+
+const INGEST_SPOOL_PATH = getArg('ingest-spool', defaultIngestSpoolPath(SESSION_DIR));
+const INGEST_MAX_SPOOL_BYTES = 64 * 1024 * 1024;
+const INGEST_MAX_RECORD_BYTES = 8 * 1024;
 // Cache directories: the Python gateway passes the profile-aware paths via
 // env (HERMES_HOME-aware, new cache/ layout).  Fall back to the legacy
 // hardcoded locations for bridges launched outside the gateway.
@@ -102,35 +124,93 @@ const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10
 // fires. Fail fast instead so the gateway can surface a real error and retry.
 const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000', 10);
 
-// --- Send queue: serialise all sock.sendMessage() calls across concurrent
-//     HTTP handlers so a single Baileys socket never has overlapping sends.
-//     Overlapping sends are the root cause of cross-chat contamination
-//     (#33360) — the WhatsApp protocol-level routing can misdeliver when
-//     two sendMessage() Promises race on the same socket. ---
-let _sendQueue = Promise.resolve();
-
-function enqueueSend(fn) {
-  const task = _sendQueue.then(() => fn(), () => fn());
-  _sendQueue = task.catch(() => {});
-  return task;
+if (!PAIR_ONLY) {
+  validateCanonicalPassiveAuthority(
+    WHATSAPP_MODE,
+    ALLOWED_USERS,
+    FORWARD_OWNER_MESSAGES,
+  );
 }
+
+const BRIDGE_CONTRACT_FILES = [
+  'allowlist.js',
+  'bridge.js',
+  'ingest_spool.js',
+  'outbound_ids.js',
+  'owner_message_gate.js',
+  'send_queue.js',
+];
+const BRIDGE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const bundleDigest = createHash('sha256');
+for (const name of BRIDGE_CONTRACT_FILES) {
+  bundleDigest.update(name);
+  bundleDigest.update('\0');
+  bundleDigest.update(readFileSync(path.join(BRIDGE_DIR, name)));
+  bundleDigest.update('\0');
+}
+const INGEST_BUNDLE_HASH = bundleDigest.digest('hex');
+const INGEST_CONFIG_HASH = createHash('sha256').update(JSON.stringify({
+  allowedUsers: [...ALLOWED_USERS].sort(),
+  forwardOwnerMessages: FORWARD_OWNER_MESSAGES,
+  maxRecordBytes: INGEST_MAX_RECORD_BYTES,
+  maxSpoolBytes: INGEST_MAX_SPOOL_BYTES,
+  responseMode: WHATSAPP_MODE,
+  spoolPath: path.resolve(INGEST_SPOOL_PATH),
+})).digest('hex');
+const INGEST_CONTRACT = Object.freeze({
+  version: 2,
+  bundleHash: INGEST_BUNDLE_HASH,
+  spoolPathHash: createHash('sha256').update(path.resolve(INGEST_SPOOL_PATH)).digest('hex'),
+  recordSchemaVersion: 2,
+  maxSpoolBytes: INGEST_MAX_SPOOL_BYTES,
+  maxRecordBytes: INGEST_MAX_RECORD_BYTES,
+  configHash: INGEST_CONFIG_HASH,
+  responseMode: WHATSAPP_MODE,
+  allowedUserCount: ALLOWED_USERS.size,
+  forwardOwnerMessages: FORWARD_OWNER_MESSAGES,
+});
+
+// This append-only capture path has no transport or agent-routing capability.
+// Construction is fail-closed: a missing private spool prevents the bridge
+// from starting instead of silently dropping canonical intake.
+const ingestSpool = PAIR_ONLY ? null : createDurableSpool({
+  spoolPath: INGEST_SPOOL_PATH,
+  maxSpoolBytes: INGEST_MAX_SPOOL_BYTES,
+  maxRecordBytes: INGEST_MAX_RECORD_BYTES,
+});
+let shuttingDown = false;
+function shutdownBridge() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    ingestSpool?.close();
+  } finally {
+    process.exit(0);
+  }
+}
+process.once('SIGTERM', shutdownBridge);
+process.once('SIGINT', shutdownBridge);
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Never release the global Baileys send queue merely because the caller-facing
+// Keep one active send per socket. If a caller-visible timeout fires, retire
+// that socket and establish a replacement before releasing the queue generation.
+const sendSerialized = createSerializedSender(
+  (chatId, payload) => {
+    const transport = sock;
+    if (!transport) throw new Error('WhatsApp socket unavailable');
+    return {
+      context: transport,
+      promise: transport.sendMessage(chatId, payload),
+    };
+  },
+  { onTimeout: retireTimedOutSocket },
+);
 function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
-  let timer;
-  const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`sendMessage timed out after ${timeoutMs / 1000}s`)),
-      timeoutMs,
-    );
-  });
-  return enqueueSend(() =>
-    Promise.race([sock.sendMessage(chatId, payload), timeoutPromise])
-      .finally(() => clearTimeout(timer))
-  );
+  return sendSerialized(chatId, payload, timeoutMs);
 }
 
 function formatOutgoingMessage(message) {
@@ -234,12 +314,62 @@ function rememberSentId(id) {
 
 let sock = null;
 let connectionState = 'disconnected';
+const retiredSockets = new WeakSet();
+const passiveCaptureRetiredSockets = new WeakSet();
+const socketReadiness = new WeakMap();
+const reconnectCoordinator = createReconnectCoordinator();
 
-async function startSocket() {
+function cancelPendingReconnect(socket) {
+  return reconnectCoordinator.cancel(socket);
+}
+
+function scheduleReconnect(socket, delay, reconnect) {
+  reconnectCoordinator.schedule(socket, delay, owner => {
+    if (retiredSockets.has(socket) || sock !== null) return;
+    return reconnect(owner);
+  });
+}
+
+async function retireTimedOutSocket(error, timedOutSocket) {
+  if (!timedOutSocket) return;
+  retiredSockets.add(timedOutSocket);
+  passiveCaptureRetiredSockets.add(timedOutSocket);
+  if (sock === timedOutSocket) {
+    sock = null;
+    connectionState = 'reconnecting';
+  }
+  try {
+    timedOutSocket.end(error);
+  } catch {
+    try { timedOutSocket.ws?.close(); } catch {}
+  }
+  const reconnectStart = cancelPendingReconnect(timedOutSocket);
+  if (reconnectStart) {
+    try { await reconnectStart; } catch {}
+  }
+  await awaitReadySocketGeneration(timedOutSocket, {
+    cancelPendingReconnect,
+    getCurrentSocket: () => sock,
+    getReadiness: socket => socketReadiness.get(socket),
+    isRetired: socket => retiredSockets.has(socket),
+    startReplacement: startSocket,
+  });
+}
+
+async function startSocket(reconnectOwner = null) {
+  if (reconnectOwner && retiredSockets.has(reconnectOwner)) {
+    throw new Error('reconnect owner retired before socket construction');
+  }
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  if (reconnectOwner && retiredSockets.has(reconnectOwner)) {
+    throw new Error('reconnect owner retired during auth setup');
+  }
   const { version } = await fetchLatestBaileysVersion();
+  if (reconnectOwner && retiredSockets.has(reconnectOwner)) {
+    throw new Error('reconnect owner retired during version setup');
+  }
 
-  sock = makeWASocket({
+  const socket = makeWASocket({
     version,
     auth: state,
     logger,
@@ -255,11 +385,27 @@ async function startSocket() {
       return { conversation: '' };
     },
   });
+  sock = socket;
+  let resolveOpen;
+  let rejectOpen;
+  let opened = false;
+  const openPromise = new Promise((resolve, reject) => {
+    resolveOpen = resolve;
+    rejectOpen = reject;
+  });
+  socketReadiness.set(socket, openPromise);
 
-  sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+  socket.ev.on('creds.update', () => {
+    if (retiredSockets.has(socket) || passiveCaptureRetiredSockets.has(socket) || sock !== socket) return;
+    saveCreds();
+    lidToPhone = buildLidMap();
+  });
 
-  sock.ev.on('connection.update', (update) => {
+  socket.ev.on('connection.update', (update) => {
+    if (retiredSockets.has(socket) || passiveCaptureRetiredSockets.has(socket)) return;
     const { connection, lastDisconnect, qr } = update;
+
+    if (connection !== 'close' && sock !== socket) return;
 
     if (qr) {
       console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
@@ -268,10 +414,14 @@ async function startSocket() {
     }
 
     if (connection === 'close') {
+      passiveCaptureRetiredSockets.add(socket);
+      if (sock !== socket) return;
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      if (sock === socket) sock = null;
       connectionState = 'disconnected';
 
       if (reason === DisconnectReason.loggedOut) {
+        rejectOpen(new Error('WhatsApp session logged out before socket readiness'));
         console.log('❌ Logged out. Delete session and restart to re-authenticate.');
         process.exit(1);
       } else {
@@ -281,10 +431,23 @@ async function startSocket() {
         } else {
           console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+        const reconnectDelay = reason === 515 ? 1000 : 3000;
+        if (opened) {
+          scheduleReconnect(socket, reconnectDelay, owner => {
+            return startSocket(owner).catch((error) => {
+              console.error(`[bridge] WhatsApp reconnect failed: ${error.message}`);
+            });
+          });
+        } else {
+          scheduleReconnect(socket, reconnectDelay, owner => {
+            return startSocket(owner).then(resolveOpen, rejectOpen);
+          });
+        }
       }
     } else if (connection === 'open') {
+      opened = true;
       connectionState = 'connected';
+      resolveOpen(socket);
       console.log('✅ WhatsApp connected!');
       if (PAIR_ONLY) {
         console.log('✅ Pairing complete. Credentials saved.');
@@ -294,17 +457,47 @@ async function startSocket() {
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  socket.ev.on('messages.upsert', async ({ messages, type }) => {
     // In self-chat mode, your own messages commonly arrive as 'append' rather
     // than 'notify'. Accept both and filter agent echo-backs below.
+    const generationIsActive = () => (
+      !passiveCaptureRetiredSockets.has(socket) && sock === socket
+    );
     if (type !== 'notify' && type !== 'append') return;
+    if (!generationIsActive()) return;
 
     const botIds = Array.from(new Set([
-      normalizeWhatsAppId(sock.user?.id),
-      normalizeWhatsAppId(sock.user?.lid),
+      normalizeWhatsAppId(socket.user?.id),
+      normalizeWhatsAppId(socket.user?.lid),
     ].filter(Boolean)));
 
-    for (const msg of messages) {
+    // Capture the complete upsert batch synchronously before any response
+    // filtering or await. One slow media path can therefore never delay or
+    // reorder durable intake for later events in the same Baileys callback.
+    let capturedMessages = [];
+    try {
+      const captured = ingestSpool.appendBatch(messages, {
+        ownerId: socket.user?.id || socket.user?.lid || '',
+        ownerIds: [socket.user?.id, socket.user?.lid].filter(Boolean),
+      });
+      capturedMessages = messages.filter((_, index) => captured[index]);
+    } catch {
+      console.error('[bridge] WhatsApp ingest spool unavailable; agent routing suppressed.');
+    }
+    try {
+      if (!ingestSpool.health().healthy) {
+        console.error('[bridge] WhatsApp ingest loss is latched; agent routing suppressed.');
+        return;
+      }
+    } catch {
+      console.error('[bridge] WhatsApp ingest health unavailable; agent routing suppressed.');
+      return;
+    }
+    if (retiredSockets.has(socket)) return;
+
+    for (const msg of capturedMessages) {
+      // Empty/decryption-retry protocol events are durably represented by the
+      // passive path but have no response body and never reach agent routing.
       if (!msg.message) continue;
 
       const chatId = msg.key.remoteJid;
@@ -427,7 +620,8 @@ async function startSocket() {
         hasMedia = true;
         mediaType = 'image';
         try {
-          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: socket.updateMediaMessage });
+          if (!generationIsActive()) continue;
           const mime = messageContent.imageMessage.mimetype || 'image/jpeg';
           const extMap = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' };
           const ext = extMap[mime] || '.jpg';
@@ -443,7 +637,8 @@ async function startSocket() {
         hasMedia = true;
         mediaType = 'video';
         try {
-          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: socket.updateMediaMessage });
+          if (!generationIsActive()) continue;
           const mime = messageContent.videoMessage.mimetype || 'video/mp4';
           const ext = mime.includes('mp4') ? '.mp4' : '.mkv';
           mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
@@ -458,7 +653,8 @@ async function startSocket() {
         mediaType = messageContent.pttMessage ? 'ptt' : 'audio';
         try {
           const audioMsg = messageContent.pttMessage || messageContent.audioMessage;
-          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: socket.updateMediaMessage });
+          if (!generationIsActive()) continue;
           const mime = audioMsg.mimetype || 'audio/ogg';
           const ext = mime.includes('ogg') ? '.ogg' : mime.includes('mp4') ? '.m4a' : '.ogg';
           mkdirSync(AUDIO_CACHE_DIR, { recursive: true });
@@ -474,7 +670,8 @@ async function startSocket() {
         mediaType = 'document';
         const fileName = messageContent.documentMessage.fileName || 'document';
         try {
-          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: socket.updateMediaMessage });
+          if (!generationIsActive()) continue;
           mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
           const safeFileName = path.basename(fileName).replace(/[^a-zA-Z0-9._-]/g, '_');
           const filePath = path.join(DOCUMENT_CACHE_DIR, `doc_${randomBytes(6).toString('hex')}_${safeFileName}`);
@@ -501,8 +698,8 @@ async function startSocket() {
       // Skip empty messages
       if (!body && !hasMedia) {
         if (WHATSAPP_DEBUG) {
-          try { 
-            console.log(JSON.stringify({ event: 'ignored', reason: 'empty', chatId, messageKeys: Object.keys(msg.message || {}) })); 
+          try {
+            console.log(JSON.stringify({ event: 'ignored', reason: 'empty', chatId, messageKeys: Object.keys(msg.message || {}) }));
           } catch (err) {
             console.error('Failed to log empty message event:', err);
           }
@@ -538,12 +735,14 @@ async function startSocket() {
         fromOwner,
       };
 
+      if (!generationIsActive()) continue;
       messageQueue.push(event);
       if (messageQueue.length > MAX_QUEUE_SIZE) {
         messageQueue.shift();
       }
     }
   });
+  return openPromise;
 }
 
 // HTTP server
@@ -792,11 +991,27 @@ app.get('/chat/:id', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
+  let ingestHealth = null;
+  try {
+    ingestHealth = ingestSpool?.health() || null;
+  } catch {
+    ingestHealth = {
+      healthy: false,
+      failureLatched: true,
+      lastAppendAt: null,
+      lastErrorAt: Date.now(),
+      lastErrorCode: 'health_probe',
+    };
+  }
   res.json({
     status: connectionState,
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
+    ingestSpoolEnabled: ingestSpool !== null,
+    ingestSpoolHealthy: ingestHealth?.healthy === true,
+    ingestSpool: ingestHealth,
+    ingestContract: INGEST_CONTRACT,
   });
 });
 
@@ -806,7 +1021,10 @@ if (PAIR_ONLY) {
   console.log('📱 WhatsApp pairing mode');
   console.log(`📁 Session: ${SESSION_DIR}`);
   console.log();
-  startSocket();
+  startSocket().catch((error) => {
+    console.error(`[bridge] WhatsApp startup failed: ${error.message}`);
+    process.exit(1);
+  });
 } else {
   app.listen(PORT, '127.0.0.1', () => {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
@@ -824,6 +1042,8 @@ if (PAIR_ONLY) {
       console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
     }
     console.log();
-    startSocket();
+    startSocket().catch((error) => {
+      console.error(`[bridge] WhatsApp startup failed: ${error.message}`);
+    });
   });
 }
