@@ -1,0 +1,7 @@
+name: temporal_knowledge
+version: 0.1.0
+description: Temporal knowledge graph for verifying deal baselines before drafting
+author: Hermes Agent
+kind: standalone
+entry: __init__:register
+cli_entry: __init__:register_cli

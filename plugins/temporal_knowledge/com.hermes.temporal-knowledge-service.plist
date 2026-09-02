@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hermes.temporal-knowledge-service</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/affoon/.hermes/hermes-agent/plugins/temporal_knowledge/run-desk-service.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/affoon/.hermes/profiles/ito/logs/temporal-service.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/affoon/.hermes/profiles/ito/logs/temporal-service.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>GRAPHITI_PORT</key>
+        <string>8098</string>
+        <key>GRAPHITI_DB</key>
+        <string>/Users/affoon/.hermes/profiles/ito/temporal_graph.db</string>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.envrc
+*.env
+!.env.example
+*.session
+*.log
+logs/
+state/
+.DS_Store
+node_modules/

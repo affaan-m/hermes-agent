@@ -1,0 +1,1049 @@
+#!/usr/bin/env node
+/**
+ * Hermes Agent WhatsApp Bridge
+ *
+ * Standalone Node.js process that connects to WhatsApp via Baileys
+ * and exposes HTTP endpoints for the Python gateway adapter.
+ *
+ * Endpoints (matches gateway/platforms/whatsapp.py expectations):
+ *   GET  /messages       - Long-poll for new incoming messages
+ *   POST /send           - Send a message { chatId, message, replyTo? }
+ *   POST /edit           - Edit a sent message { chatId, messageId, message }
+ *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
+ *   POST /typing         - Send typing indicator { chatId }
+ *   GET  /chat/:id       - Get chat info
+ *   GET  /health         - Health check
+ *
+ * Usage:
+ *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
+ */
+
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } from '@whiskeysockets/baileys';
+import express from 'express';
+import { Boom } from '@hapi/boom';
+import pino from 'pino';
+import path from 'path';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { randomBytes, createHash } from 'crypto';
+import { execSync } from 'child_process';
+import { tmpdir } from 'os';
+import qrcode from 'qrcode-terminal';
+import {
+  matchesAllowedUser,
+  parseAllowedUsers,
+  validateCanonicalPassiveAuthority,
+} from './allowlist.js';
+import { createOutboundIdTracker } from './outbound_ids.js';
+import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { createDurableSpool } from './ingest_spool.js';
+import {
+  awaitReadySocketGeneration,
+  createReconnectCoordinator,
+  createSerializedSender,
+} from './send_queue.js';
+
+// Parse CLI args
+const args = process.argv.slice(2);
+function getArg(name, defaultVal) {
+  const idx = args.indexOf(`--${name}`);
+  return idx !== -1 && args[idx + 1] ? args[idx + 1] : defaultVal;
+}
+
+const WHATSAPP_DEBUG =
+  typeof process !== 'undefined' &&
+  process.env &&
+  typeof process.env.WHATSAPP_DEBUG === 'string' &&
+  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_DEBUG.toLowerCase());
+
+// Opt-in: when true (and WHATSAPP_MODE === 'bot'), fromMe inbound messages
+// that are NOT echoes of our own /send or /send-media calls are forwarded
+// to the Python adapter with `fromOwner: true`. This lets plugins detect
+// "owner just typed in this customer chat" — needed for handover / sliding
+// TTL flows. Default OFF: existing deployments see no behavior change.
+//
+// Heuristic limitation: we distinguish bot-API-sent from owner-typed by
+// looking up `key.id` in `recentlySentIds` (populated when /send returns).
+// On bridge restart that set is empty, so a few in-flight bot replies may
+// briefly look like owner-typed until they age out. Acceptable; we don't
+// persist the set.
+const FORWARD_OWNER_MESSAGES =
+  typeof process !== 'undefined' &&
+  process.env &&
+  typeof process.env.WHATSAPP_FORWARD_OWNER_MESSAGES === 'string' &&
+  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_FORWARD_OWNER_MESSAGES.toLowerCase());
+
+const PORT = parseInt(getArg('port', '3000'), 10);
+const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+
+function defaultIngestSpoolPath(sessionDir) {
+  const resolved = path.resolve(sessionDir);
+  const whatsappDir = path.dirname(resolved);
+  let profileRoot = path.dirname(whatsappDir);
+  if (path.basename(profileRoot) === 'platforms') profileRoot = path.dirname(profileRoot);
+  return path.join(profileRoot, 'state', 'whatsapp-ingest', 'events.ndjson');
+}
+
+const INGEST_SPOOL_PATH = getArg('ingest-spool', defaultIngestSpoolPath(SESSION_DIR));
+const INGEST_MAX_SPOOL_BYTES = 64 * 1024 * 1024;
+const INGEST_MAX_RECORD_BYTES = 8 * 1024;
+// Cache directories: the Python gateway passes the profile-aware paths via
+// env (HERMES_HOME-aware, new cache/ layout).  Fall back to the legacy
+// hardcoded locations for bridges launched outside the gateway.
+const IMAGE_CACHE_DIR = process.env.HERMES_IMAGE_CACHE_DIR
+  || path.join(process.env.HOME || '~', '.hermes', 'image_cache');
+const DOCUMENT_CACHE_DIR = process.env.HERMES_DOCUMENT_CACHE_DIR
+  || path.join(process.env.HOME || '~', '.hermes', 'document_cache');
+const AUDIO_CACHE_DIR = process.env.HERMES_AUDIO_CACHE_DIR
+  || path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
+
+// Self-hash of this script file.  Reported in /health so the Python gateway
+// can detect a running bridge that predates the current bridge.js and
+// restart it instead of silently reusing stale code (stale-bridge trap:
+// `hermes update` updates bridge.js on disk but a long-lived bridge process
+// keeps serving the old behavior forever).
+let SCRIPT_HASH = '';
+try {
+  SCRIPT_HASH = createHash('sha256')
+    .update(readFileSync(fileURLToPath(import.meta.url)))
+    .digest('hex')
+    .slice(0, 16);
+} catch {}
+const PAIR_ONLY = args.includes('--pair-only');
+const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
+const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
+const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
+const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
+  ? DEFAULT_REPLY_PREFIX
+  : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
+const MAX_MESSAGE_LENGTH = parseInt(process.env.WHATSAPP_MAX_MESSAGE_LENGTH || '4096', 10);
+const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10);
+// Per-call timeout for sock.sendMessage(). Baileys occasionally hangs forever
+// when uploading media to WhatsApp servers (and, less often, on text sends),
+// which pins the bridge's HTTP handler until the upstream aiohttp timeout
+// fires. Fail fast instead so the gateway can surface a real error and retry.
+const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000', 10);
+
+if (!PAIR_ONLY) {
+  validateCanonicalPassiveAuthority(
+    WHATSAPP_MODE,
+    ALLOWED_USERS,
+    FORWARD_OWNER_MESSAGES,
+  );
+}
+
+const BRIDGE_CONTRACT_FILES = [
+  'allowlist.js',
+  'bridge.js',
+  'ingest_spool.js',
+  'outbound_ids.js',
+  'owner_message_gate.js',
+  'send_queue.js',
+];
+const BRIDGE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const bundleDigest = createHash('sha256');
+for (const name of BRIDGE_CONTRACT_FILES) {
+  bundleDigest.update(name);
+  bundleDigest.update('\0');
+  bundleDigest.update(readFileSync(path.join(BRIDGE_DIR, name)));
+  bundleDigest.update('\0');
+}
+const INGEST_BUNDLE_HASH = bundleDigest.digest('hex');
+const INGEST_CONFIG_HASH = createHash('sha256').update(JSON.stringify({
+  allowedUsers: [...ALLOWED_USERS].sort(),
+  forwardOwnerMessages: FORWARD_OWNER_MESSAGES,
+  maxRecordBytes: INGEST_MAX_RECORD_BYTES,
+  maxSpoolBytes: INGEST_MAX_SPOOL_BYTES,
+  responseMode: WHATSAPP_MODE,
+  spoolPath: path.resolve(INGEST_SPOOL_PATH),
+})).digest('hex');
+const INGEST_CONTRACT = Object.freeze({
+  version: 2,
+  bundleHash: INGEST_BUNDLE_HASH,
+  spoolPathHash: createHash('sha256').update(path.resolve(INGEST_SPOOL_PATH)).digest('hex'),
+  recordSchemaVersion: 2,
+  maxSpoolBytes: INGEST_MAX_SPOOL_BYTES,
+  maxRecordBytes: INGEST_MAX_RECORD_BYTES,
+  configHash: INGEST_CONFIG_HASH,
+  responseMode: WHATSAPP_MODE,
+  allowedUserCount: ALLOWED_USERS.size,
+  forwardOwnerMessages: FORWARD_OWNER_MESSAGES,
+});
+
+// This append-only capture path has no transport or agent-routing capability.
+// Construction is fail-closed: a missing private spool prevents the bridge
+// from starting instead of silently dropping canonical intake.
+const ingestSpool = PAIR_ONLY ? null : createDurableSpool({
+  spoolPath: INGEST_SPOOL_PATH,
+  maxSpoolBytes: INGEST_MAX_SPOOL_BYTES,
+  maxRecordBytes: INGEST_MAX_RECORD_BYTES,
+});
+let shuttingDown = false;
+function shutdownBridge() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    ingestSpool?.close();
+  } finally {
+    process.exit(0);
+  }
+}
+process.once('SIGTERM', shutdownBridge);
+process.once('SIGINT', shutdownBridge);
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Never release the global Baileys send queue merely because the caller-facing
+// Keep one active send per socket. If a caller-visible timeout fires, retire
+// that socket and establish a replacement before releasing the queue generation.
+const sendSerialized = createSerializedSender(
+  (chatId, payload) => {
+    const transport = sock;
+    if (!transport) throw new Error('WhatsApp socket unavailable');
+    return {
+      context: transport,
+      promise: transport.sendMessage(chatId, payload),
+    };
+  },
+  { onTimeout: retireTimedOutSocket },
+);
+function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
+  return sendSerialized(chatId, payload, timeoutMs);
+}
+
+function formatOutgoingMessage(message) {
+  // In bot mode, messages come from a different number so the prefix is
+  // redundant — the sender identity is already clear.  Only prepend in
+  // self-chat mode where bot and user share the same number.
+  if (WHATSAPP_MODE !== 'self-chat') return message;
+  return REPLY_PREFIX ? `${REPLY_PREFIX}${message}` : message;
+}
+
+function splitLongMessage(message, maxLength = MAX_MESSAGE_LENGTH) {
+  const text = String(message || '');
+  if (!text) return [];
+  if (!Number.isFinite(maxLength) || maxLength < 1 || text.length <= maxLength) {
+    return [text];
+  }
+
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > maxLength) {
+    let splitAt = remaining.lastIndexOf('\n', maxLength);
+    if (splitAt < Math.floor(maxLength / 2)) {
+      splitAt = remaining.lastIndexOf(' ', maxLength);
+    }
+    if (splitAt < 1) splitAt = maxLength;
+
+    chunks.push(remaining.slice(0, splitAt).trimEnd());
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
+
+function trackSentMessageId(sent) {
+  rememberSentId(sent?.key?.id);
+}
+
+function normalizeWhatsAppId(value) {
+  if (!value) return '';
+  return String(value).replace(':', '@');
+}
+
+function getMessageContent(msg) {
+  const content = msg?.message || {};
+  if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;
+  if (content.viewOnceMessage?.message) return content.viewOnceMessage.message;
+  if (content.viewOnceMessageV2?.message) return content.viewOnceMessageV2.message;
+  if (content.documentWithCaptionMessage?.message) return content.documentWithCaptionMessage.message;
+  if (content.templateMessage?.hydratedTemplate) return content.templateMessage.hydratedTemplate;
+  if (content.buttonsMessage) return content.buttonsMessage;
+  if (content.listMessage) return content.listMessage;
+  return content;
+}
+
+function getContextInfo(messageContent) {
+  if (!messageContent || typeof messageContent !== 'object') return {};
+  for (const value of Object.values(messageContent)) {
+    if (value && typeof value === 'object' && value.contextInfo) {
+      return value.contextInfo;
+    }
+  }
+  return {};
+}
+
+mkdirSync(SESSION_DIR, { recursive: true });
+
+// Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
+function buildLidMap() {
+  const map = {};
+  try {
+    for (const f of readdirSync(SESSION_DIR)) {
+      const m = f.match(/^lid-mapping-(\d+)\.json$/);
+      if (!m) continue;
+      const phone = m[1];
+      const lid = JSON.parse(readFileSync(path.join(SESSION_DIR, f), 'utf8'));
+      if (lid) map[String(lid)] = phone;
+    }
+  } catch {}
+  return map;
+}
+let lidToPhone = buildLidMap();
+
+const logger = pino({ level: 'warn' });
+
+// Message queue for polling
+const messageQueue = [];
+const MAX_QUEUE_SIZE = 100;
+
+// Track recently sent message IDs.  Two purposes:
+//   1. Prevent echo-back loops with media in self-chat mode.
+//   2. (When WHATSAPP_FORWARD_OWNER_MESSAGES=true) distinguish our own
+//      bot-API outbound messages from owner-typed messages on the linked
+//      device so we can forward only the latter.
+// Capacity bounded (see outbound_ids.js) to keep memory flat under
+// sustained sending.
+const recentlySentIds = createOutboundIdTracker(512);
+
+function rememberSentId(id) {
+  recentlySentIds.remember(id);
+}
+
+let sock = null;
+let connectionState = 'disconnected';
+const retiredSockets = new WeakSet();
+const passiveCaptureRetiredSockets = new WeakSet();
+const socketReadiness = new WeakMap();
+const reconnectCoordinator = createReconnectCoordinator();
+
+function cancelPendingReconnect(socket) {
+  return reconnectCoordinator.cancel(socket);
+}
+
+function scheduleReconnect(socket, delay, reconnect) {
+  reconnectCoordinator.schedule(socket, delay, owner => {
+    if (retiredSockets.has(socket) || sock !== null) return;
+    return reconnect(owner);
+  });
+}
+
+async function retireTimedOutSocket(error, timedOutSocket) {
+  if (!timedOutSocket) return;
+  retiredSockets.add(timedOutSocket);
+  passiveCaptureRetiredSockets.add(timedOutSocket);
+  if (sock === timedOutSocket) {
+    sock = null;
+    connectionState = 'reconnecting';
+  }
+  try {
+    timedOutSocket.end(error);
+  } catch {
+    try { timedOutSocket.ws?.close(); } catch {}
+  }
+  const reconnectStart = cancelPendingReconnect(timedOutSocket);
+  if (reconnectStart) {
+    try { await reconnectStart; } catch {}
+  }
+  await awaitReadySocketGeneration(timedOutSocket, {
+    cancelPendingReconnect,
+    getCurrentSocket: () => sock,
+    getReadiness: socket => socketReadiness.get(socket),
+    isRetired: socket => retiredSockets.has(socket),
+    startReplacement: startSocket,
+  });
+}
+
+async function startSocket(reconnectOwner = null) {
+  if (reconnectOwner && retiredSockets.has(reconnectOwner)) {
+    throw new Error('reconnect owner retired before socket construction');
+  }
+  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  if (reconnectOwner && retiredSockets.has(reconnectOwner)) {
+    throw new Error('reconnect owner retired during auth setup');
+  }
+  const { version } = await fetchLatestBaileysVersion();
+  if (reconnectOwner && retiredSockets.has(reconnectOwner)) {
+    throw new Error('reconnect owner retired during version setup');
+  }
+
+  const socket = makeWASocket({
+    version,
+    auth: state,
+    logger,
+    printQRInTerminal: false,
+    browser: ['Hermes Agent', 'Chrome', '120.0'],
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    // Required for Baileys 7.x: without this, incoming messages that need
+    // E2EE session re-establishment are silently dropped (msg.message === null)
+    getMessage: async (key) => {
+      // We don't maintain a message store, so return a placeholder.
+      // This is enough for Baileys to complete the retry handshake.
+      return { conversation: '' };
+    },
+  });
+  sock = socket;
+  let resolveOpen;
+  let rejectOpen;
+  let opened = false;
+  const openPromise = new Promise((resolve, reject) => {
+    resolveOpen = resolve;
+    rejectOpen = reject;
+  });
+  socketReadiness.set(socket, openPromise);
+
+  socket.ev.on('creds.update', () => {
+    if (retiredSockets.has(socket) || passiveCaptureRetiredSockets.has(socket) || sock !== socket) return;
+    saveCreds();
+    lidToPhone = buildLidMap();
+  });
+
+  socket.ev.on('connection.update', (update) => {
+    if (retiredSockets.has(socket) || passiveCaptureRetiredSockets.has(socket)) return;
+    const { connection, lastDisconnect, qr } = update;
+
+    if (connection !== 'close' && sock !== socket) return;
+
+    if (qr) {
+      console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
+      qrcode.generate(qr, { small: true });
+      console.log('\nWaiting for scan...\n');
+    }
+
+    if (connection === 'close') {
+      passiveCaptureRetiredSockets.add(socket);
+      if (sock !== socket) return;
+      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      if (sock === socket) sock = null;
+      connectionState = 'disconnected';
+
+      if (reason === DisconnectReason.loggedOut) {
+        rejectOpen(new Error('WhatsApp session logged out before socket readiness'));
+        console.log('❌ Logged out. Delete session and restart to re-authenticate.');
+        process.exit(1);
+      } else {
+        // 515 = restart requested (common after pairing). Always reconnect.
+        if (reason === 515) {
+          console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
+        } else {
+          console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
+        }
+        const reconnectDelay = reason === 515 ? 1000 : 3000;
+        if (opened) {
+          scheduleReconnect(socket, reconnectDelay, owner => {
+            return startSocket(owner).catch((error) => {
+              console.error(`[bridge] WhatsApp reconnect failed: ${error.message}`);
+            });
+          });
+        } else {
+          scheduleReconnect(socket, reconnectDelay, owner => {
+            return startSocket(owner).then(resolveOpen, rejectOpen);
+          });
+        }
+      }
+    } else if (connection === 'open') {
+      opened = true;
+      connectionState = 'connected';
+      resolveOpen(socket);
+      console.log('✅ WhatsApp connected!');
+      if (PAIR_ONLY) {
+        console.log('✅ Pairing complete. Credentials saved.');
+        // Give Baileys a moment to flush creds, then exit cleanly
+        setTimeout(() => process.exit(0), 2000);
+      }
+    }
+  });
+
+  socket.ev.on('messages.upsert', async ({ messages, type }) => {
+    // In self-chat mode, your own messages commonly arrive as 'append' rather
+    // than 'notify'. Accept both and filter agent echo-backs below.
+    const generationIsActive = () => (
+      !passiveCaptureRetiredSockets.has(socket) && sock === socket
+    );
+    if (type !== 'notify' && type !== 'append') return;
+    if (!generationIsActive()) return;
+
+    const botIds = Array.from(new Set([
+      normalizeWhatsAppId(socket.user?.id),
+      normalizeWhatsAppId(socket.user?.lid),
+    ].filter(Boolean)));
+
+    // Capture the complete upsert batch synchronously before any response
+    // filtering or await. One slow media path can therefore never delay or
+    // reorder durable intake for later events in the same Baileys callback.
+    let capturedMessages = [];
+    try {
+      const captured = ingestSpool.appendBatch(messages, {
+        ownerId: socket.user?.id || socket.user?.lid || '',
+        ownerIds: [socket.user?.id, socket.user?.lid].filter(Boolean),
+      });
+      capturedMessages = messages.filter((_, index) => captured[index]);
+    } catch {
+      console.error('[bridge] WhatsApp ingest spool unavailable; agent routing suppressed.');
+    }
+    try {
+      if (!ingestSpool.health().healthy) {
+        console.error('[bridge] WhatsApp ingest loss is latched; agent routing suppressed.');
+        return;
+      }
+    } catch {
+      console.error('[bridge] WhatsApp ingest health unavailable; agent routing suppressed.');
+      return;
+    }
+    if (retiredSockets.has(socket)) return;
+
+    for (const msg of capturedMessages) {
+      // Empty/decryption-retry protocol events are durably represented by the
+      // passive path but have no response body and never reach agent routing.
+      if (!msg.message) continue;
+
+      const chatId = msg.key.remoteJid;
+      if (WHATSAPP_DEBUG) {
+        try {
+          console.log(JSON.stringify({
+            event: 'upsert', type,
+            fromMe: !!msg.key.fromMe, chatId,
+            senderId: msg.key.participant || chatId,
+            messageKeys: Object.keys(msg.message || {}),
+          }));
+        } catch {}
+      }
+      const senderId = msg.key.participant || chatId;
+      const isGroup = chatId.endsWith('@g.us');
+      const senderNumber = senderId.replace(/@.*/, '');
+
+      // Handle fromMe messages based on mode
+      let fromOwner = false;
+      if (msg.key.fromMe) {
+        if (isGroup || chatId.includes('status')) continue;
+
+        if (WHATSAPP_MODE === 'bot') {
+          // Bot mode: separate bot number. fromMe inbound is either
+          //   (a) an echo of our own /send (recentlySentIds will catch it), or
+          //   (b) a message the owner typed from their own phone using the
+          //       linked-device session.
+          //
+          // We always drop (a). We drop (b) too unless the operator opts in
+          // via WHATSAPP_FORWARD_OWNER_MESSAGES so existing deployments see
+          // no behavior change. When opted in, we still gate on the
+          // customer chatId allowlist — without that gate, any contact
+          // the owner replied to would leak into Hermes and trigger
+          // implicit handover. See `owner_message_gate.js`.
+          const decision = classifyOwnerMessageGate({
+            fromMe: true,
+            fromOwnerEnabled: FORWARD_OWNER_MESSAGES,
+            recentlySent: recentlySentIds,
+            allowlistMatches: (id) => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
+            messageId: msg.key.id,
+            chatId,
+          });
+          if (decision.action === 'drop_echo') continue;
+          if (decision.action === 'drop_disabled') continue;
+          if (decision.action === 'drop_allowlist') {
+            try {
+              console.log(JSON.stringify({
+                event: 'ignored',
+                reason: 'allowlist_mismatch_owner_chat',
+                chatId,
+                senderId,
+              }));
+            } catch {}
+            continue;
+          }
+          fromOwner = true;
+        } else {
+          // Self-chat mode: only allow messages in the user's own self-chat.
+          // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
+          // AND classic format: 34652029134@s.whatsapp.net
+          // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
+          const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
+          const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
+          const chatNumber = chatId.replace(/@.*/, '');
+          const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
+          if (!isSelfChat) continue;
+        }
+      }
+
+      // Handle !fromMe messages (from other people) based on mode.
+      // Self-chat mode only responds to the user's own messages to
+      // themselves — stranger DMs / group pings must never reach the
+      // Python gateway, otherwise a pairing-code reply fires in response
+      // to arbitrary incoming messages (#8389).
+      if (!msg.key.fromMe) {
+        if (WHATSAPP_MODE === 'self-chat') {
+          try {
+            console.log(JSON.stringify({
+              event: 'ignored',
+              reason: 'self_chat_mode_rejects_non_self',
+              chatId,
+              senderId,
+            }));
+          } catch {}
+          continue;
+        }
+        if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+          try {
+            console.log(JSON.stringify({
+              event: 'ignored',
+              reason: 'allowlist_mismatch',
+              chatId,
+              senderId,
+            }));
+          } catch {}
+          continue;
+        }
+      }
+
+      const messageContent = getMessageContent(msg);
+      const contextInfo = getContextInfo(messageContent);
+      const mentionedIds = Array.from(new Set((contextInfo?.mentionedJid || []).map(normalizeWhatsAppId).filter(Boolean)));
+      const quotedMessageId = contextInfo?.stanzaId || null;
+      const quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || '') || null;
+      const quotedRemoteJid = normalizeWhatsAppId(contextInfo?.remoteJid || '') || null;
+      const hasQuotedMessage = !!contextInfo?.quotedMessage;
+
+      // Extract message body
+      let body = '';
+      let hasMedia = false;
+      let mediaType = '';
+      const mediaUrls = [];
+
+      if (messageContent.conversation) {
+        body = messageContent.conversation;
+      } else if (messageContent.extendedTextMessage?.text) {
+        body = messageContent.extendedTextMessage.text;
+      } else if (messageContent.imageMessage) {
+        body = messageContent.imageMessage.caption || '';
+        hasMedia = true;
+        mediaType = 'image';
+        try {
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: socket.updateMediaMessage });
+          if (!generationIsActive()) continue;
+          const mime = messageContent.imageMessage.mimetype || 'image/jpeg';
+          const extMap = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' };
+          const ext = extMap[mime] || '.jpg';
+          mkdirSync(IMAGE_CACHE_DIR, { recursive: true });
+          const filePath = path.join(IMAGE_CACHE_DIR, `img_${randomBytes(6).toString('hex')}${ext}`);
+          writeFileSync(filePath, buf);
+          mediaUrls.push(filePath);
+        } catch (err) {
+          console.error('[bridge] Failed to download image:', err.message);
+        }
+      } else if (messageContent.videoMessage) {
+        body = messageContent.videoMessage.caption || '';
+        hasMedia = true;
+        mediaType = 'video';
+        try {
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: socket.updateMediaMessage });
+          if (!generationIsActive()) continue;
+          const mime = messageContent.videoMessage.mimetype || 'video/mp4';
+          const ext = mime.includes('mp4') ? '.mp4' : '.mkv';
+          mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
+          const filePath = path.join(DOCUMENT_CACHE_DIR, `vid_${randomBytes(6).toString('hex')}${ext}`);
+          writeFileSync(filePath, buf);
+          mediaUrls.push(filePath);
+        } catch (err) {
+          console.error('[bridge] Failed to download video:', err.message);
+        }
+      } else if (messageContent.audioMessage || messageContent.pttMessage) {
+        hasMedia = true;
+        mediaType = messageContent.pttMessage ? 'ptt' : 'audio';
+        try {
+          const audioMsg = messageContent.pttMessage || messageContent.audioMessage;
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: socket.updateMediaMessage });
+          if (!generationIsActive()) continue;
+          const mime = audioMsg.mimetype || 'audio/ogg';
+          const ext = mime.includes('ogg') ? '.ogg' : mime.includes('mp4') ? '.m4a' : '.ogg';
+          mkdirSync(AUDIO_CACHE_DIR, { recursive: true });
+          const filePath = path.join(AUDIO_CACHE_DIR, `aud_${randomBytes(6).toString('hex')}${ext}`);
+          writeFileSync(filePath, buf);
+          mediaUrls.push(filePath);
+        } catch (err) {
+          console.error('[bridge] Failed to download audio:', err.message);
+        }
+      } else if (messageContent.documentMessage) {
+        body = messageContent.documentMessage.caption || '';
+        hasMedia = true;
+        mediaType = 'document';
+        const fileName = messageContent.documentMessage.fileName || 'document';
+        try {
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: socket.updateMediaMessage });
+          if (!generationIsActive()) continue;
+          mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
+          const safeFileName = path.basename(fileName).replace(/[^a-zA-Z0-9._-]/g, '_');
+          const filePath = path.join(DOCUMENT_CACHE_DIR, `doc_${randomBytes(6).toString('hex')}_${safeFileName}`);
+          writeFileSync(filePath, buf);
+          mediaUrls.push(filePath);
+        } catch (err) {
+          console.error('[bridge] Failed to download document:', err.message);
+        }
+      }
+
+      // For media without caption, use a placeholder so the API message is never empty
+      if (hasMedia && !body) {
+        body = `[${mediaType} received]`;
+      }
+
+      // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
+      if (msg.key.fromMe && ((REPLY_PREFIX && body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
+        if (WHATSAPP_DEBUG) {
+          try { console.log(JSON.stringify({ event: 'ignored', reason: 'agent_echo', chatId, messageId: msg.key.id })); } catch {}
+        }
+        continue;
+      }
+
+      // Skip empty messages
+      if (!body && !hasMedia) {
+        if (WHATSAPP_DEBUG) {
+          try {
+            console.log(JSON.stringify({ event: 'ignored', reason: 'empty', chatId, messageKeys: Object.keys(msg.message || {}) }));
+          } catch (err) {
+            console.error('Failed to log empty message event:', err);
+          }
+        }
+        continue;
+      }
+
+      // Resolve LID → phone for the senderId so the gateway can match
+      // against phone-based allowlists (WHATSAPP_ALLOWED_USERS).
+      const resolvedSenderId = lidToPhone[senderNumber]
+        ? (lidToPhone[senderNumber] + '@s.whatsapp.net')
+        : senderId;
+      const resolvedSenderNumber = lidToPhone[senderNumber] || senderNumber;
+
+      const event = {
+        messageId: msg.key.id,
+        chatId,
+        senderId: resolvedSenderId,
+        senderName: msg.pushName || resolvedSenderNumber,
+        chatName: isGroup ? (chatId.split('@')[0]) : (msg.pushName || resolvedSenderNumber),
+        isGroup,
+        body,
+        hasMedia,
+        mediaType,
+        mediaUrls,
+        mentionedIds,
+        quotedMessageId,
+        quotedParticipant,
+        quotedRemoteJid,
+        hasQuotedMessage,
+        botIds,
+        timestamp: msg.messageTimestamp,
+        fromOwner,
+      };
+
+      if (!generationIsActive()) continue;
+      messageQueue.push(event);
+      if (messageQueue.length > MAX_QUEUE_SIZE) {
+        messageQueue.shift();
+      }
+    }
+  });
+  return openPromise;
+}
+
+// HTTP server
+const app = express();
+app.use(express.json());
+
+// Host-header validation — defends against DNS rebinding.
+// The bridge binds loopback-only (127.0.0.1) but a victim browser on
+// the same machine could be tricked into fetching from an attacker
+// hostname that TTL-flips to 127.0.0.1. Reject any request whose Host
+// header doesn't resolve to a loopback alias.
+// See GHSA-ppp5-vxwm-4cf7.
+const _ACCEPTED_HOST_VALUES = new Set([
+  'localhost',
+  '127.0.0.1',
+  '[::1]',
+  '::1',
+]);
+
+app.use((req, res, next) => {
+  const raw = (req.headers.host || '').trim();
+  if (!raw) {
+    return res.status(400).json({ error: 'Missing Host header' });
+  }
+  // Strip port suffix: "localhost:3000" → "localhost"
+  const hostOnly = (raw.includes(':')
+    ? raw.substring(0, raw.lastIndexOf(':'))
+    : raw
+  ).replace(/^\[|\]$/g, '').toLowerCase();
+  if (!_ACCEPTED_HOST_VALUES.has(hostOnly)) {
+    return res.status(400).json({
+      error: 'Invalid Host header. Bridge accepts loopback hosts only.',
+    });
+  }
+  next();
+});
+
+// Poll for new messages (long-poll style)
+app.get('/messages', (req, res) => {
+  const msgs = messageQueue.splice(0, messageQueue.length);
+  res.json(msgs);
+});
+
+// Send a message
+app.post('/send', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, message, replyTo } = req.body;
+  if (!chatId || !message) {
+    return res.status(400).json({ error: 'chatId and message are required' });
+  }
+
+  try {
+    const chunks = splitLongMessage(formatOutgoingMessage(message));
+    const messageIds = [];
+    for (let i = 0; i < chunks.length; i += 1) {
+      const sent = await sendWithTimeout(chatId, { text: chunks[i] });
+      trackSentMessageId(sent);
+      if (sent?.key?.id) messageIds.push(sent.key.id);
+      if (chunks.length > 1 && i < chunks.length - 1) {
+        await sleep(CHUNK_DELAY_MS);
+      }
+    }
+
+    res.json({
+      success: true,
+      messageId: messageIds[messageIds.length - 1],
+      messageIds,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Edit a previously sent message
+app.post('/edit', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, messageId, message } = req.body;
+  if (!chatId || !messageId || !message) {
+    return res.status(400).json({ error: 'chatId, messageId, and message are required' });
+  }
+
+  try {
+    const key = { id: messageId, fromMe: true, remoteJid: chatId };
+    const chunks = splitLongMessage(formatOutgoingMessage(message));
+    const messageIds = [];
+
+    await sendWithTimeout(chatId, { text: chunks[0], edit: key });
+    if (chunks.length > 1) {
+      for (let i = 1; i < chunks.length; i += 1) {
+        const sent = await sendWithTimeout(chatId, { text: chunks[i] });
+        trackSentMessageId(sent);
+        if (sent?.key?.id) messageIds.push(sent.key.id);
+        if (i < chunks.length - 1) {
+          await sleep(CHUNK_DELAY_MS);
+        }
+      }
+    }
+
+    res.json({ success: true, messageIds });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// MIME type map and media type inference for /send-media
+const MIME_MAP = {
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+  webp: 'image/webp', gif: 'image/gif',
+  mp4: 'video/mp4', mov: 'video/quicktime', avi: 'video/x-msvideo',
+  mkv: 'video/x-matroska', '3gp': 'video/3gpp',
+  pdf: 'application/pdf',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+};
+
+function inferMediaType(ext) {
+  if (['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext)) return 'image';
+  if (['mp4', 'mov', 'avi', 'mkv', '3gp'].includes(ext)) return 'video';
+  if (['ogg', 'opus', 'mp3', 'wav', 'm4a'].includes(ext)) return 'audio';
+  return 'document';
+}
+
+// Send media (image, video, document) natively
+app.post('/send-media', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, filePath, mediaType, caption, fileName } = req.body;
+  if (!chatId || !filePath) {
+    return res.status(400).json({ error: 'chatId and filePath are required' });
+  }
+
+  try {
+    if (!existsSync(filePath)) {
+      return res.status(404).json({ error: `File not found: ${filePath}` });
+    }
+
+    const buffer = readFileSync(filePath);
+    const ext = filePath.toLowerCase().split('.').pop();
+    const type = mediaType || inferMediaType(ext);
+    let msgPayload;
+
+    switch (type) {
+      case 'image':
+        msgPayload = { image: buffer, caption: caption || undefined, mimetype: MIME_MAP[ext] || 'image/jpeg' };
+        break;
+      case 'video':
+        msgPayload = { video: buffer, caption: caption || undefined, mimetype: MIME_MAP[ext] || 'video/mp4' };
+        break;
+      case 'audio': {
+        // WhatsApp only renders a native voice bubble (ptt) when the file is ogg/opus.
+        // If the caller passes mp3, wav, m4a etc. (e.g. from Edge TTS / NeuTTS),
+        // silently convert to ogg/opus via ffmpeg so ptt is always honoured.
+        let audioBuffer = buffer;
+        let audioExt = ext;
+        const needsConversion = !['ogg', 'opus'].includes(ext);
+        let tmpPath = null;
+        if (needsConversion) {
+          tmpPath = path.join(tmpdir(), `hermes_voice_${randomBytes(6).toString('hex')}.ogg`);
+          try {
+            execSync(
+              `ffmpeg -y -i ${JSON.stringify(filePath)} -ar 48000 -ac 1 -c:a libopus ${JSON.stringify(tmpPath)}`,
+              { timeout: 30000, stdio: 'pipe' }
+            );
+            audioBuffer = readFileSync(tmpPath);
+            audioExt = 'ogg';
+          } catch (convErr) {
+            // ffmpeg not available or conversion failed — fall back to original format
+            console.warn('[bridge] ffmpeg conversion failed, sending as file attachment:', convErr.message);
+          } finally {
+            try { if (tmpPath && existsSync(tmpPath)) unlinkSync(tmpPath); } catch (_) {}
+          }
+        }
+        const audioMime = (audioExt === 'ogg' || audioExt === 'opus') ? 'audio/ogg; codecs=opus' : 'audio/mpeg';
+        msgPayload = { audio: audioBuffer, mimetype: audioMime, ptt: audioExt === 'ogg' || audioExt === 'opus' };
+        break;
+      }
+      case 'document':
+      default:
+        msgPayload = {
+          document: buffer,
+          fileName: fileName || path.basename(filePath),
+          caption: caption || undefined,
+          mimetype: MIME_MAP[ext] || 'application/octet-stream',
+        };
+        break;
+    }
+
+    const sent = await sendWithTimeout(chatId, msgPayload);
+    trackSentMessageId(sent);
+    res.json({ success: true, messageId: sent?.key?.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Typing indicator
+app.post('/typing', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected' });
+  }
+
+  const { chatId } = req.body;
+  if (!chatId) return res.status(400).json({ error: 'chatId required' });
+
+  try {
+    await sock.sendPresenceUpdate('composing', chatId);
+    res.json({ success: true });
+  } catch (err) {
+    res.json({ success: false });
+  }
+});
+
+// Chat info
+app.get('/chat/:id', async (req, res) => {
+  const chatId = req.params.id;
+  const isGroup = chatId.endsWith('@g.us');
+
+  if (isGroup && sock) {
+    try {
+      const metadata = await sock.groupMetadata(chatId);
+      return res.json({
+        name: metadata.subject,
+        isGroup: true,
+        participants: metadata.participants.map(p => p.id),
+      });
+    } catch {
+      // Fall through to default
+    }
+  }
+
+  res.json({
+    name: chatId.replace(/@.*/, ''),
+    isGroup,
+    participants: [],
+  });
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  let ingestHealth = null;
+  try {
+    ingestHealth = ingestSpool?.health() || null;
+  } catch {
+    ingestHealth = {
+      healthy: false,
+      failureLatched: true,
+      lastAppendAt: null,
+      lastErrorAt: Date.now(),
+      lastErrorCode: 'health_probe',
+    };
+  }
+  res.json({
+    status: connectionState,
+    queueLength: messageQueue.length,
+    uptime: process.uptime(),
+    scriptHash: SCRIPT_HASH,
+    ingestSpoolEnabled: ingestSpool !== null,
+    ingestSpoolHealthy: ingestHealth?.healthy === true,
+    ingestSpool: ingestHealth,
+    ingestContract: INGEST_CONTRACT,
+  });
+});
+
+// Start
+if (PAIR_ONLY) {
+  // Pair-only mode: just connect, show QR, save creds, exit. No HTTP server.
+  console.log('📱 WhatsApp pairing mode');
+  console.log(`📁 Session: ${SESSION_DIR}`);
+  console.log();
+  startSocket().catch((error) => {
+    console.error(`[bridge] WhatsApp startup failed: ${error.message}`);
+    process.exit(1);
+  });
+} else {
+  app.listen(PORT, '127.0.0.1', () => {
+    console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
+    console.log(`📁 Session stored in: ${SESSION_DIR}`);
+    if (ALLOWED_USERS.size > 0) {
+      console.log(`🔒 Allowed users: ${Array.from(ALLOWED_USERS).join(', ')}`);
+    } else if (WHATSAPP_MODE === 'self-chat') {
+      console.log(`🔒 Self-chat mode — only your own messages to yourself are processed.`);
+    } else {
+      console.log(`🔒 No WHATSAPP_ALLOWED_USERS set — incoming messages are rejected.`);
+      console.log(`   Set WHATSAPP_ALLOWED_USERS=<phone> to authorize specific users,`);
+      console.log(`   or WHATSAPP_ALLOWED_USERS=* for an explicit open bot.`);
+    }
+    if (WHATSAPP_MODE === 'bot' && FORWARD_OWNER_MESSAGES) {
+      console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
+    }
+    console.log();
+    startSocket().catch((error) => {
+      console.error(`[bridge] WhatsApp startup failed: ${error.message}`);
+    });
+  });
+}

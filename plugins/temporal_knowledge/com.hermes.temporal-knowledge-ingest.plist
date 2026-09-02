@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hermes.temporal-knowledge-ingest</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>source /Users/affoon/.hermes/hermes-agent/venv/bin/activate && python3 /Users/affoon/.hermes/hermes-agent/plugins/temporal_knowledge/temporal_graph.py --ingest --prune</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/affoon/.hermes/profiles/ito/logs/temporal-ingest.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/affoon/.hermes/profiles/ito/logs/temporal-ingest.err</string>
+</dict>
+</plist>
