@@ -21,6 +21,9 @@ import os
 import re
 import threading
 import time
+
+from agent import fast_path as _fast_path
+from agent import latency_trace as _latency_trace
 import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
@@ -389,6 +392,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
                 _ttfb_timeout = _ttfb_cap
 
+    # Fast path: a trivial turn waits far less for a first byte before reconnecting.
+    if _codex_watchdog_enabled and _fast_path.active_plan(agent) is not None:
+        _ttfb_enabled = True
+        _ttfb_timeout = _fast_path.first_byte_cutoff(agent, _ttfb_timeout)
+
     _codex_idle_enabled = _codex_watchdog_enabled
     _codex_idle_timeout = _env_float(
         "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS",
@@ -620,7 +628,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             messages=anthropic_messages,
             tools=tools_for_api,
             max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
-            reasoning_config=agent.reasoning_config,
+            reasoning_config=_fast_path.effective_reasoning_config(agent),
             is_oauth=agent._is_anthropic_oauth,
             preserve_dots=agent._anthropic_preserve_dots(),
             context_length=ctx_len,
@@ -696,7 +704,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             model=agent.model,
             messages=_msgs_for_codex,
             tools=tools_for_api,
-            reasoning_config=agent.reasoning_config,
+            reasoning_config=_fast_path.effective_reasoning_config(agent),
             session_id=getattr(agent, "session_id", None),
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
@@ -814,7 +822,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             max_tokens=agent.max_tokens,
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
-            reasoning_config=agent.reasoning_config,
+            reasoning_config=_fast_path.effective_reasoning_config(agent),
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
             provider_profile=_profile,
@@ -846,7 +854,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         max_tokens=agent.max_tokens,
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
-        reasoning_config=agent.reasoning_config,
+        reasoning_config=_fast_path.effective_reasoning_config(agent),
         request_overrides=agent.request_overrides,
         session_id=getattr(agent, "session_id", None),
         model_lower=(agent.model or "").lower(),
@@ -2114,6 +2122,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                 if _diag.get("first_chunk_at") is None:
                     _diag["first_chunk_at"] = last_chunk_time["t"]
+                    _latency_trace.mark("api.first_chunk", agent=agent)
                 # Approximate byte size from the chunk's repr — exact wire
                 # bytes aren't exposed by the SDK, but len(repr(chunk)) is
                 # a stable proxy for "how much content arrived" that
@@ -2422,6 +2431,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                     if _diag.get("first_chunk_at") is None:
                         _diag["first_chunk_at"] = last_chunk_time["t"]
+                        _latency_trace.mark("api.first_chunk", agent=agent)
                     try:
                         _diag["bytes"] = int(_diag.get("bytes", 0)) + len(repr(event))
                     except Exception:
@@ -2835,12 +2845,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # but delivering no real chunks.  Kill the client so the
         # inner retry loop can start a fresh connection.
         _stale_elapsed = time.time() - last_chunk_time["t"]
-        if _stale_elapsed > _stream_stale_timeout:
+        _stale_threshold = _stream_stale_timeout
+        # Fast path: while no chunk has arrived for a trivial turn, use the
+        # tighter first-byte cutoff instead of the full stale-stream window.
+        _attempt_diag = request_client_holder.get("diag") or {}
+        if _attempt_diag.get("first_chunk_at") is None:
+            _stale_threshold = _fast_path.first_byte_cutoff(agent, _stream_stale_timeout)
+        if _stale_elapsed > _stale_threshold:
             _est_ctx = estimate_request_context_tokens(api_kwargs)
             logger.warning(
                 "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
                 "model=%s context=~%s tokens. Killing connection.",
-                _stale_elapsed, _stream_stale_timeout,
+                _stale_elapsed, _stale_threshold,
                 api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
             )
             agent._buffer_status(

@@ -35,6 +35,7 @@ from agent.iteration_budget import IterationBudget
 from agent.turn_context import build_turn_context
 from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
+from agent import latency_trace as _latency_trace
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -1213,10 +1214,20 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                def _first_delta_marked():
+                    _latency_trace.mark("api.first_text_delta", agent=agent)
+                    return _stop_spinner()
+
                 def _perform_api_call(next_api_kwargs):
+                    _latency_trace.mark(
+                        "api.request_start", agent=agent,
+                        messages=len(next_api_kwargs.get("messages") or next_api_kwargs.get("input") or []),
+                        tools=len(next_api_kwargs.get("tools") or []),
+                        streaming=bool(_use_streaming),
+                    )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
+                            next_api_kwargs, on_first_delta=_first_delta_marked
                         )
                     return agent._interruptible_api_call(next_api_kwargs)
 
@@ -2028,6 +2039,7 @@ def run_conversation(
                     _cache_pct = ""
                     if canonical_usage.cache_read_tokens and prompt_tokens:
                         _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
+                    _latency_trace.mark("api.response_complete", agent=agent, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
                     logger.info(
                         "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
                         agent.session_api_calls, agent.model, agent.provider or "unknown",

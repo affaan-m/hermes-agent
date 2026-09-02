@@ -53,6 +53,7 @@ from typing import Callable, Dict, Optional, Any, List, Union
 # gateway is a long-running daemon, so its boot cost matters less than
 # preserving the established test-patch surface.
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
+from agent import latency_trace as _latency_trace
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
 from hermes_cli.config import cfg_get
@@ -10385,6 +10386,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
+        _latency_trace.start_if_missing(f"{_platform_name}:{source.chat_id}", platform=_platform_name)
+        _latency_trace.mark("gw.inbound")
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
@@ -10404,6 +10407,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        _latency_trace.mark("gw.session_resolved")
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
@@ -10624,6 +10628,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
+        _latency_trace.mark("gw.history_loaded", history=len(history))
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -10986,6 +10991,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Session hygiene auto-compress failed: %s", e
                         )
 
+        _latency_trace.mark("gw.hygiene_done")
         # First-message onboarding -- only on the very first interaction ever
         if not history and not self.session_store.has_any_sessions():
             # Default first-contact note: a brief self-introduction.
@@ -11077,6 +11083,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source=source,
             history=history,
         )
+        _latency_trace.mark("gw.message_prepared")
         if message_text is None:
             return
 
@@ -11142,6 +11149,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # against so post-run compression publication can be identity-guarded
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
+            _latency_trace.mark("gw.agent_dispatch")
             _run_start_session_id = session_entry.session_id
             agent_result = await self._run_agent(
                 message=message_text,
@@ -11157,6 +11165,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
             )
+            _latency_trace.mark("gw.agent_returned")
 
             # Stop persistent typing indicator now that the agent is done
             try:
@@ -11211,6 +11220,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _platform_name, source.chat_id or "unknown",
                 _response_time, _api_calls, _resp_len,
             )
+            _latency_trace.mark("gw.response_ready")
+            _latency_trace.finish(api_calls=_api_calls, response_chars=_resp_len)
 
             # NOTE: the cross-process cache-coherence re-baseline
             # (_refresh_agent_cache_message_count) is intentionally deferred
@@ -17314,6 +17325,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key=session_key,
                     user_config=user_config,
                 )
+                _latency_trace.mark("agent.runtime_resolved", model=model)
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
                     model, runtime_kwargs.get("provider"), session_key or "",
@@ -17618,6 +17630,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
+            _latency_trace.mark("agent.ready", reused=reused_cached_agent)
+            _latency_trace.attach(agent)
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
             # Gate on needs_progress_queue (tool_progress OR thinking_progress)
@@ -18182,7 +18196,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+                _latency_trace.mark("agent.run_conversation_start")
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                _latency_trace.mark("agent.run_conversation_end")
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
