@@ -2807,6 +2807,26 @@ def delegate_task(
             return json.dumps(_sync_result, ensure_ascii=False)
 
         _session_key = get_current_session_key(default="")
+        _routing_platform = ""
+        _routing_chat_id = ""
+        _routing_chat_type = ""
+        _routing_thread_id = ""
+        if not _session_key:
+            # Background tasks (e.g. /background) run without a gateway
+            # approval contextvar, so get_current_session_key() returns
+            # empty.  Fall back to the parent agent's durable session id so
+            # the async completion still carries a routing key.  ALSO capture
+            # the parent's routing metadata (platform/chat_id/chat_type/
+            # thread_id) — without it, a bg_* session_key is unparseable by
+            # _parse_session_key on gateway restart and the completion event
+            # is dropped as 'Synthetic event source unresolvable'.
+            _agent_session_id = str(getattr(parent_agent, "session_id", "") or "")
+            if _agent_session_id:
+                _session_key = _agent_session_id
+            _routing_platform = str(getattr(parent_agent, "platform", "") or "")
+            _routing_chat_id = str(getattr(parent_agent, "_chat_id", "") or "")
+            _routing_chat_type = str(getattr(parent_agent, "_chat_type", "") or "")
+            _routing_thread_id = str(getattr(parent_agent, "_thread_id", "") or "")
         _child_agents = [c for (_, _, c) in children]
 
         # Detach every child from the parent's interrupt-propagation list — the
@@ -2847,6 +2867,10 @@ def delegate_task(
             role=top_role,
             model=creds["model"],
             session_key=_session_key,
+            routing_platform=_routing_platform,
+            routing_chat_id=_routing_chat_id,
+            routing_chat_type=_routing_chat_type,
+            routing_thread_id=_routing_thread_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
