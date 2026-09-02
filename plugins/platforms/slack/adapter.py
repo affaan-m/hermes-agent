@@ -2877,6 +2877,33 @@ class SlackAdapter(BasePlatformAdapter):
         if is_mentioned:
             # Strip the bot mention from the text
             text = text.replace(f"<@{bot_uid}>", "").strip()
+            # The "!"→"/" rewrite above ran on the raw event text BEFORE
+            # mention-stripping, so a natural "<@bot> !approve" never became
+            # a command: it missed the active-session bypass, interrupted the
+            # very turn awaiting approval, and only then reached the resolver
+            # (which found nothing pending).  Re-run command normalization on
+            # the mention-stripped text so mentioned bang/slash commands are
+            # classified as commands.  Mirrors the upstream fix that handles
+            # "@bot !cmd" and "@bot /cmd".
+            mention_stripped = original_text.replace(f"<@{bot_uid}>", "").strip()
+            if mention_stripped.startswith("/"):
+                original_text = mention_stripped
+                text = mention_stripped
+            elif mention_stripped.startswith("!"):
+                try:
+                    from hermes_cli.commands import is_gateway_known_command
+
+                    first_token = mention_stripped[1:].split(maxsplit=1)[0]
+                    cmd_name = first_token.split("@", 1)[0].lower()
+                    if (
+                        cmd_name
+                        and "/" not in cmd_name
+                        and is_gateway_known_command(cmd_name)
+                    ):
+                        original_text = "/" + mention_stripped[1:]
+                        text = original_text
+                except Exception:  # pragma: no cover - defensive
+                    pass
             # Register this thread so all future messages auto-trigger the bot.
             # Skipped in strict mode: strict_mention=true bots must be
             # re-mentioned every turn, so remembering the thread would
