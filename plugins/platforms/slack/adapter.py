@@ -2595,6 +2595,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _handle_slack_message(self, event: dict) -> None:
         """Handle an incoming Slack message event."""
+        logger.info("[Slack][SLKTRACE] enter ts=%s ch=%s type=%s subtype=%s user=%s", event.get("ts"), event.get("channel"), event.get("type"), event.get("subtype"), event.get("user"))
         # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777)
         event_ts = event.get("ts", "")
         if event_ts and self._dedup.is_duplicate(event_ts):
@@ -2849,6 +2850,7 @@ class SlackAdapter(BasePlatformAdapter):
                 return
 
             if channel_id in self._slack_free_response_channels():
+                logger.info("[Slack][SLKTRACE] free-response pass ch=%s", channel_id)
                 pass  # Free-response channel — always process
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for Slack
@@ -3278,6 +3280,7 @@ class SlackAdapter(BasePlatformAdapter):
         if _should_react:
             self._reacting_message_ids.add(ts)
 
+        logger.info("[Slack][SLKTRACE] handing off ts=%s to gateway core", ts)
         await self.handle_message(msg_event)
 
     # ----- Approval button support (Block Kit) -----
