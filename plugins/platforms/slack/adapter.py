@@ -803,9 +803,11 @@ class SlackAdapter(BasePlatformAdapter):
         lets us swap the "Running /cmd…" placeholder with the real reply,
         and the message stays ephemeral ("Only visible to you").
 
-        Falls back to a simple ``True`` SendResult if the POST fails —
-        the user already saw the initial ack, so a delivery failure here
-        is non-critical.
+        Returns ``success=False`` on delivery failure so the caller
+        (``send()`` / the stream consumer) falls back to normal channel
+        delivery — the reply must never be silently dropped just because
+        the ephemeral swap failed.  The initial "Running /cmd…" ack stays
+        up either way.
         """
         formatted = self.format_message(content)
         # Slack's response_url has the same ~40k char limit as chat_postMessage.
@@ -834,13 +836,18 @@ class SlackAdapter(BasePlatformAdapter):
                         resp.status,
                         body[:200],
                     )
+                    return SendResult(
+                        success=False,
+                        error=f"response_url POST returned {resp.status}",
+                    )
         except Exception as e:
             logger.warning(
                 "[Slack] response_url POST failed: %s",
                 e,
             )
-        # Non-fatal — the user saw the initial ack already.
-        return SendResult(success=True, message_id=None)
+            return SendResult(success=False, error=str(e))
+        # Unreachable in practice (both paths above return), kept explicit.
+        return SendResult(success=False, error="response_url POST failed")
 
     def _warn_if_missing_group_dm_scopes(self, auth_response, team_name: str) -> None:
         """Nudge existing installs to reinstall when group-DM scopes are absent.
