@@ -3245,6 +3245,16 @@ class SlackAdapter(BasePlatformAdapter):
             except Exception:  # pragma: no cover - defensive
                 reply_to_text = None
 
+        # Mark direct addresses for the gateway's never-silent ack: 1:1 DMs,
+        # @mentions, and replies inside a thread the bot participates in are
+        # user-initiated conversations where a completed turn must never end
+        # in total silence.  Passive free-response channel traffic is left
+        # unmarked so intentional silence stays available there.
+        _addressed_bot = bool(
+            is_one_to_one_dm
+            or is_mentioned
+            or (is_thread_reply and event_thread_ts in self._bot_message_ts)
+        )
         msg_event = MessageEvent(
             text=text,
             message_type=msg_type,
@@ -3257,6 +3267,7 @@ class SlackAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
+            metadata={"addressed_bot": _addressed_bot},
         )
 
         # Only react when bot is directly addressed (1:1 DM or @mention).
