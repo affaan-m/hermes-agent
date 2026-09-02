@@ -276,6 +276,20 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "temporal_knowledge": {
+        "description": (
+            "Temporal knowledge graph for verifying deal/counterparty baselines "
+            "before drafting external communication. Tracks valid_from/valid_to "
+            "facts, supersession chains, and contract state over time."
+        ),
+        "tools": [
+            "temporal_baseline_check",
+            "temporal_ingest",
+            "temporal_prune",
+        ],
+        "includes": [],
+    },
+
     "discord": {
         "description": "Discord read and participate tools (fetch messages, search members, create threads)",
         "tools": ["discord"],
