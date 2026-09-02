@@ -40,13 +40,13 @@ const DEFAULT_LAYOUT: ThemeLayout = {
 
 export const defaultTheme: DashboardTheme = {
   name: "default",
-  label: "Hermes Teal",
-  description: "Classic dark teal — the canonical Hermes look",
+  label: "Ito Agent",
+  description: "Ito Markets dark — cool neutral with the desk green",
   palette: {
-    background: { hex: "#041c1c", alpha: 1 },
-    midground: { hex: "#ffe6cb", alpha: 1 },
+    background: { hex: "#0c0e12", alpha: 1 },
+    midground: { hex: "#c9d4c3", alpha: 1 },
     foreground: { hex: "#ffffff", alpha: 0 },
-    warmGlow: "rgba(255, 189, 56, 0.35)",
+    warmGlow: "rgba(92, 143, 107, 0.35)",
     noiseOpacity: 1,
   },
   typography: DEFAULT_TYPOGRAPHY,
