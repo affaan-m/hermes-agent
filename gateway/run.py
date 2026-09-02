@@ -6765,6 +6765,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
             if not platform_config.enabled:
                 continue
+            # Cross-host single-owner gate for shared bot credentials (see
+            # gateway/host_identity.py). Two tailnet hosts running the same
+            # profile + telegram token spent days in a 409 getUpdates conflict
+            # storm; a local PID lock cannot see the other host. When
+            # ``gateway.telegram_owner`` names a different host, this gateway
+            # skips loading telegram and runs as a standby — the owner host is
+            # the only getUpdates consumer. Skipped platforms are NOT counted
+            # as enabled or failed, so the gateway stays up on the others.
+            if platform.value == "telegram":
+                try:
+                    from gateway.host_identity import telegram_owner_permits_local
+                    _owner_ok, _owner_reason = telegram_owner_permits_local(
+                        _load_gateway_config()
+                    )
+                except Exception:
+                    _owner_ok, _owner_reason = True, ""
+                if not _owner_ok:
+                    logger.warning("%s", _owner_reason)
+                    continue
             enabled_platform_count += 1
             
             adapter = self._create_adapter(platform, platform_config)
