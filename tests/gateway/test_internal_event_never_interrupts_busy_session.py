@@ -148,4 +148,6 @@ async def test_non_internal_event_still_interrupts() -> None:
         handled = await runner._handle_active_session_busy_message(event, sk)
 
     assert handled is True
-    parent.interrupt.assert_called_once_with("please stop")
+    # The event is already queued for the next turn. Interrupt is control flow
+    # only; carrying the text here would persist it twice.
+    parent.interrupt.assert_called_once_with(None)

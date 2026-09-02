@@ -5318,7 +5318,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # at the next check point.
         if effective_mode == "interrupt" and running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             try:
-                running_agent.interrupt(event.text)
+                # The complete MessageEvent is already durable in the pending
+                # FIFO above. Passing its text to AIAgent.interrupt() also
+                # persists that text in the interrupted turn; draining the
+                # pending event then persists it a second time. Interrupt only
+                # as control flow here. The queued event owns the user turn.
+                running_agent.interrupt(None)
             except Exception:
                 pass  # don't let interrupt failure block the ack
 

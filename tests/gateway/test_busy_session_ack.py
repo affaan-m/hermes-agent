@@ -208,8 +208,9 @@ class TestBusySessionAck:
         assert "Interrupting" in content or "respond" in content
         assert "/stop" not in content  # no need — we ARE interrupting
 
-        # Verify agent interrupt was called
-        agent.interrupt.assert_called_once_with("Are you working?")
+        # The queued MessageEvent owns the next user turn; interrupt is only
+        # the cancellation signal and must not persist a second text copy.
+        agent.interrupt.assert_called_once_with(None)
 
     @pytest.mark.asyncio
     async def test_queue_mode_suppresses_interrupt_and_updates_ack(self):
