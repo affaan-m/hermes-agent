@@ -24,6 +24,9 @@ import hashlib
 import json
 import math
 import os
+import runpy
+import select
+import socket
 import statistics
 import subprocess
 import sys
@@ -34,6 +37,7 @@ import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+_MOCK_STARTUP_TIMEOUT = 15.0
 
 
 def _parse_args(argv=None):
@@ -138,25 +142,123 @@ def _build_home(args) -> Path:
     return home
 
 
-def _start_mock(args, home: Path) -> subprocess.Popen:
-    log = home / "mock_requests.jsonl"
-    if log.exists():
-        log.unlink()
-    proc = subprocess.Popen(
-        [sys.executable, str(REPO / "scripts/latency_bench/mock_openai_server.py"),
-         "--port", str(args.mock_port), "--ttft-ms", str(args.ttft_ms), "--tps", str(args.tps),
-         "--log", str(log)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    deadline = time.time() + 15
-    while time.time() < deadline:
+def _wait_mock_ready(proc, ready_fd: int, port: int, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    data = b""
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"Mock child exited before readiness (code {proc.returncode})")
+        readable, _, _ = select.select([ready_fd], [], [], min(0.05, max(0, deadline - time.monotonic())))
+        if not readable:
+            continue
+        chunk = os.read(ready_fd, 4096)
+        if not chunk:
+            raise RuntimeError("Mock child closed its readiness pipe")
+        data += chunk
+        if len(data) > 4096:
+            raise RuntimeError("Mock child sent an oversized readiness message")
+        if b"\n" in data:
+            try:
+                message = json.loads(data)
+            except (ValueError, UnicodeError) as exc:
+                raise RuntimeError("Mock child sent invalid readiness JSON") from exc
+            expected = {"pid": proc.pid, "host": "127.0.0.1", "port": port}
+            if message != expected or proc.poll() is not None:
+                raise RuntimeError("Mock child readiness identity mismatch or early exit")
+            return
+    raise RuntimeError("Mock child startup timed out")
+
+
+def _stop_mock(proc) -> None:
+    try:
+        if proc.poll() is None:
+            proc.terminate()
         try:
-            urllib.request.urlopen(f"http://127.0.0.1:{args.mock_port}/v1/models", timeout=1).read()
-            return proc
-        except Exception:
-            time.sleep(0.1)
-    proc.kill()
-    raise SystemExit("mock server did not start")
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    finally:
+        listener = getattr(proc, "_mock_listener", None)
+        if listener is not None:
+            listener.close()
+
+
+def _start_mock(args, home: Path) -> subprocess.Popen:
+    if os.name != "posix":
+        raise RuntimeError("Mock startup requires POSIX socket/pipe inheritance")
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ready_read = ready_write = None
+    proc = None
+    try:
+        # Keep this descriptor open until child shutdown, including after ready.
+        # SO_REUSEADDR permits sequential runs after TCP TIME_WAIT. Listen before
+        # handoff so another reusable bind cannot become the serving endpoint.
+        # No SO_REUSEPORT or bind/probe/close gap, and no request to existing services.
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", args.mock_port))
+        listener.listen(socket.SOMAXCONN)
+        ready_read, ready_write = os.pipe()
+        with (home / "mock-startup.stderr").open("xb") as stderr:
+            proc = subprocess.Popen(
+                [sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--mock-child",
+                 str(listener.fileno()), str(ready_write),
+                 "--port", str(args.mock_port), "--ttft-ms", str(args.ttft_ms), "--tps", str(args.tps),
+                 "--log", str(home / "mock_requests.jsonl")],
+                pass_fds=(listener.fileno(), ready_write), cwd=home,
+                env={"PATH": os.defpath, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+                     "HERMES_HOME": str(home)},
+                stdout=subprocess.DEVNULL, stderr=stderr,
+            )
+        proc._mock_listener = listener
+        os.close(ready_write)
+        ready_write = None
+        _wait_mock_ready(proc, ready_read, args.mock_port, _MOCK_STARTUP_TIMEOUT)
+        return proc
+    except BaseException:
+        if proc is not None:
+            _stop_mock(proc)
+        else:
+            listener.close()
+        raise
+    finally:
+        for fd in (ready_read, ready_write):
+            if fd is not None:
+                os.close(fd)
+
+
+async def _serve_mock_app(app, listener, ready_fd: int) -> None:
+    from aiohttp import web
+
+    runner = web.AppRunner(app)
+    try:
+        await runner.setup()
+        await web.SockSite(runner, listener).start()
+        # SockSite.start has registered the inherited listener with the event loop.
+        message = {"pid": os.getpid(), "host": "127.0.0.1", "port": listener.getsockname()[1]}
+        os.write(ready_fd, (json.dumps(message) + "\n").encode("utf-8"))
+        os.close(ready_fd)
+        ready_fd = None
+        await asyncio.Event().wait()
+    finally:
+        if ready_fd is not None:
+            os.close(ready_fd)
+        await runner.cleanup()
+
+
+def _mock_child(listener_fd: int, ready_fd: int, argv: list) -> None:
+    from aiohttp import web
+
+    listener = socket.socket(fileno=listener_fd)
+    # Reuse the existing mock's routes/app construction without changing that file.
+    # Replace only its CLI runner so it adopts our reserved socket and signals ready.
+    def run_app(app, **_kwargs):
+        return asyncio.run(_serve_mock_app(app, listener, ready_fd))
+
+    web.run_app = run_app
+    server = REPO / "scripts/latency_bench/mock_openai_server.py"
+    sys.argv = [str(server), *argv]
+    runpy.run_path(str(server), run_name="__main__")
 
 
 def _seed_history(session_store, session_id: str, messages: list) -> int:
@@ -340,12 +442,7 @@ def main():
     try:
         results, imported, session_id = asyncio.run(_run(args, home, history))
     finally:
-        mock.terminate()
-        try:
-            mock.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            mock.kill()
-            mock.wait(timeout=5)
+        _stop_mock(mock)
     rows, totals = _stage_table(results)
     mock_reqs = []
     mlog = home / "mock_requests.jsonl"
@@ -373,4 +470,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) >= 4 and sys.argv[1] == "--mock-child":
+        _mock_child(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4:])
+    else:
+        main()

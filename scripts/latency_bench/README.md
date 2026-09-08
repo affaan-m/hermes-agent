@@ -43,6 +43,27 @@ with a fake Telegram adapter. `--api-mode` can select `chat_completions` or
 `--stall-turn N` stalls the first request of turn N, indexed from zero including
 warmup. The mock supports streaming and non-streaming on both transports.
 
+Mock startup on POSIX systems reserves `127.0.0.1:--mock-port` in the parent
+and passes that socket to a Python `-I -B` child with a minimal environment. An
+occupied port fails at bind, before spawning the child or making any HTTP,
+model or control request. No `/v1/models` readiness probe is used. The child
+adopts the listener with `aiohttp.web.SockSite` and acknowledges its PID and
+endpoint over a private inherited pipe only after the site starts. The parent
+checks that identity and child liveness within 15 seconds. Invalid readiness,
+early exit and timeout stop/reap the child and close the reserved descriptors.
+`SO_REUSEADDR` permits a same-port restart after prior TCP traffic; the parent
+calls `listen` before handoff and never enables `SO_REUSEPORT`.
+The parent retains its socket until shutdown, preventing port takeover even if
+the child exits after readiness. Startup diagnostics remain in
+`mock-startup.stderr` in the new scratch directory.
+
+Preparation remains independent of the POSIX startup mechanism. Full mock
+startup currently requires POSIX descriptor inheritance; unsupported systems
+fail before opening a listener. Focused readiness tests use stdlib stub servers,
+real child processes and inherited descriptors, plus a fake aiohttp interface
+to check acknowledgement ordering. They do not validate the actual aiohttp
+runtime, Hermes imports or model calls.
+
 Completed runs always retain `result.json` in the scratch directory. `--out`
 requests an additional copy; existing output files are refused, with the scratch
 result preserved even if export fails. Results include actual imported
