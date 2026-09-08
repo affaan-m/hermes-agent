@@ -2,45 +2,45 @@
 """In-process latency benchmark for one trivial gateway turn.
 
 Builds a throwaway HERMES_HOME, starts the mock model server, constructs a
-real ``GatewayRunner`` with a fake Telegram adapter, optionally imports a real
-session transcript from a live ``state.db`` (read-only), then pushes N
+real ``GatewayRunner`` with a fake Telegram adapter, seeds deterministic
+synthetic conversation history, then pushes N
 trivial messages through ``GatewayRunner._handle_message`` and reports the
 per-stage latency breakdown collected by ``agent.latency_trace``.
 
-Nothing here touches a live profile: the live DB is opened read-only and the
-scratch home is deleted only when ``--clean`` is passed.
+No profile or database imports are supported. Scratch homes must be new and
+are retained for inspection. ``--prepare-only`` uses only the standard library
+and does not import Hermes, start a server, or change runtime environment.
 
 Example:
   python scripts/latency_bench/bench_trivial_turn.py \
-      --home /tmp/hermes-bench --turns 5 \
-      --profile ~/.hermes/profiles/ito \
-      --live-db ~/.hermes/profiles/ito/state.db --history-session 20260811_150601_4623e079
+      --prepare-only --history-pairs 8
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import math
 import os
-import shutil
-import sqlite3
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
+import tomllib
 import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 
 
-def _parse_args():
+def _parse_args(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--home", required=True, help="scratch HERMES_HOME (created)")
-    ap.add_argument("--profile", default="", help="profile dir to copy SOUL.md/memories/skills from")
-    ap.add_argument("--live-db", default="", help="live state.db to import history from (read-only)")
-    ap.add_argument("--history-session", default="", help="session id in --live-db to import")
+    ap.add_argument("--home", default="", help="new scratch directory; default: unique temporary directory")
+    ap.add_argument("--history-pairs", type=int, default=8, help="synthetic user/assistant pairs (0 to 10000)")
+    ap.add_argument("--prepare-only", action="store_true", help="write synthetic inputs and source manifest without importing Hermes or starting the mock")
     ap.add_argument("--turns", type=int, default=5)
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--message", default="ok thanks")
@@ -50,18 +50,68 @@ def _parse_args():
     ap.add_argument("--toolsets", default="hermes-cli")
     ap.add_argument("--label", default="baseline")
     ap.add_argument("--out", default="")
-    ap.add_argument("--clean", action="store_true")
-    ap.add_argument("--fast-path", default="", help="value for HERMES_FAST_PATH env (prototype switch)")
+    ap.add_argument("--fast-path", choices=("0", "1"), default="0", help="prototype switch in this benchmark process only (default: 0)")
     ap.add_argument("--stall-turn", type=int, default=-1, help="arm the mock to stall the first model request of this turn index")
     ap.add_argument("--api-mode", default="", help="force the agent wire protocol, e.g. codex_responses (the live Ito path); default is what the config resolves")
-    return ap.parse_args()
+    args = ap.parse_args(argv)
+    if not 0 <= args.history_pairs <= 10000:
+        ap.error("--history-pairs must be between 0 and 10000")
+    if args.turns < 1 or args.warmup < 0:
+        ap.error("--turns must be positive and --warmup nonnegative")
+    if not 1 <= args.mock_port <= 65535:
+        ap.error("--mock-port must be between 1 and 65535")
+    if any(not math.isfinite(v) or v < 0 for v in (args.ttft_ms, args.tps)):
+        ap.error("--ttft-ms and --tps must be finite and nonnegative")
+    if args.stall_turn < -1 or args.stall_turn >= args.turns + args.warmup:
+        ap.error("--stall-turn must be -1 or a valid turn index including warmup")
+    return args
+
+
+def _synthetic_history(pairs: int) -> list:
+    messages = []
+    for i in range(pairs):
+        messages.extend([
+            {"role": "user", "content": f"Synthetic benchmark note {i}: the sample job is pending."},
+            {"role": "assistant", "content": f"Recorded synthetic note {i}. No action taken."},
+        ])
+    return messages
+
+
+def _fixture_record(messages: list) -> dict:
+    data = json.dumps(messages, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {"kind": "synthetic-v1", "messages": len(messages), "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def _source_provenance() -> dict:
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(REPO), *args], text=True).strip()
+
+    files = (
+        "pyproject.toml", "run_agent.py", "gateway/run.py", "agent/fast_path.py",
+        "agent/latency_trace.py", "agent/chat_completion_helpers.py",
+        "agent/conversation_loop.py", "agent/turn_context.py", "agent/turn_finalizer.py",
+        "scripts/latency_bench/bench_trivial_turn.py", "scripts/latency_bench/mock_openai_server.py",
+    )
+    return {
+        "repo": str(REPO), "head": git("rev-parse", "HEAD"),
+        "dirty": bool(git("status", "--porcelain", "--untracked-files=normal")),
+        "checkout_version": tomllib.loads((REPO / "pyproject.toml").read_text())["project"]["version"],
+        "python": sys.version.split()[0], "executable": sys.executable,
+        "file_sha256": {name: hashlib.sha256((REPO / name).read_bytes()).hexdigest() for name in files},
+        "installed_gateway_identity": "not verified",
+    }
 
 
 def _build_home(args) -> Path:
-    home = Path(args.home).expanduser().resolve()
-    if home.exists() and args.clean:
-        shutil.rmtree(home)
-    home.mkdir(parents=True, exist_ok=True)
+    if args.home:
+        home = Path(args.home).expanduser().absolute()
+        # mkdir is exclusive, including when the requested path is a symlink.
+        # Never reuse or recursively delete a directory supplied by the caller.
+        home.mkdir(mode=0o700, exist_ok=False)
+    else:
+        home = Path(tempfile.mkdtemp(prefix="hermes-latency-bench-"))
+    home = home.resolve()
     cfg = {
         "model": {
             "provider": "custom",
@@ -80,18 +130,9 @@ def _build_home(args) -> Path:
         "platforms": {"telegram": {"enabled": False}},
         "_config_version": 33,
     }
-    import yaml
-    (home / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
-    (home / ".env").write_text("OPENAI_API_KEY=bench-local\n")
-    if args.profile:
-        prof = Path(args.profile).expanduser()
-        for name in ("SOUL.md",):
-            if (prof / name).exists():
-                shutil.copy(prof / name, home / name)
-        if (prof / "memories").exists():
-            shutil.copytree(prof / "memories", home / "memories", dirs_exist_ok=True)
-        if (prof / "skills").exists() and not (home / "skills").exists():
-            os.symlink(prof / "skills", home / "skills")
+    # JSON is valid YAML and keeps preparation independent of gateway deps.
+    (home / "config.yaml").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    (home / "SOUL.md").write_text("You are a synthetic latency benchmark assistant.\n", encoding="utf-8")
     for d in ("sessions", "logs"):
         (home / d).mkdir(exist_ok=True)
     return home
@@ -118,29 +159,10 @@ def _start_mock(args, home: Path) -> subprocess.Popen:
     raise SystemExit("mock server did not start")
 
 
-def _import_history(session_store, session_id: str, live_db: str, live_session: str) -> int:
-    con = sqlite3.connect(f"file:{live_db}?mode=ro", uri=True)
-    rows = con.execute(
-        "SELECT role, content, tool_call_id, tool_calls, tool_name, reasoning, timestamp "
-        "FROM messages WHERE session_id=? AND active=1 ORDER BY id",
-        (live_session,),
-    ).fetchall()
-    con.close()
-    n = 0
-    for role, content, tool_call_id, tool_calls, tool_name, reasoning, ts in rows:
-        msg = {"role": role, "content": content}
-        if tool_call_id:
-            msg["tool_call_id"] = tool_call_id
-        if tool_calls:
-            try:
-                msg["tool_calls"] = json.loads(tool_calls)
-            except Exception:
-                pass
-        if tool_name:
-            msg["name"] = tool_name
-        session_store.append_to_transcript(session_id, msg)
-        n += 1
-    return n
+def _seed_history(session_store, session_id: str, messages: list) -> int:
+    for message in messages:
+        session_store.append_to_transcript(session_id, dict(message))
+    return len(messages)
 
 
 class _Recorder:
@@ -183,12 +205,11 @@ def _make_fake_adapter(recorder):
     return FakeTelegramAdapter()
 
 
-async def _run(args, home: Path):
+async def _run(args, home: Path, history: list):
     os.environ["HERMES_HOME"] = str(home)
     os.environ["HERMES_LATENCY_TRACE_JSONL"] = str(home / "latency.jsonl")
-    os.environ.setdefault("OPENAI_API_KEY", "bench-local")
-    if args.fast_path:
-        os.environ["HERMES_FAST_PATH"] = args.fast_path
+    os.environ["OPENAI_API_KEY"] = "bench-local"
+    os.environ["HERMES_FAST_PATH"] = args.fast_path
     sys.path.insert(0, str(REPO))
 
     import logging
@@ -222,9 +243,7 @@ async def _run(args, home: Path):
 
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="-100424242", chat_type="group", user_id="4242", user_name="bench")
     entry = runner.session_store.get_or_create_session(source)
-    imported = 0
-    if args.live_db and args.history_session:
-        imported = _import_history(runner.session_store, entry.session_id, os.path.expanduser(args.live_db), args.history_session)
+    imported = _seed_history(runner.session_store, entry.session_id, history)
 
     trace_path = home / "latency.jsonl"
     if trace_path.exists():
@@ -289,14 +308,44 @@ def _stage_table(results):
     return rows, totals
 
 
+def _write_result(home: Path, output: str, report: dict) -> Path:
+    # Preserve completed measurements even if an optional export is rejected.
+    primary = home / "result.json"
+    data = json.dumps(report, indent=1, default=str)
+    with primary.open("x", encoding="utf-8") as fh:
+        fh.write(data)
+    if output and Path(output).absolute() != primary.absolute():
+        try:
+            with Path(output).open("x", encoding="utf-8") as fh:
+                fh.write(data)
+        except OSError as exc:
+            raise OSError(f"Result retained at {primary}; could not write --out") from exc
+    return primary
+
+
 def main():
     args = _parse_args()
+    source = _source_provenance()
     home = _build_home(args)
+    history = _synthetic_history(args.history_pairs)
+    fixture = _fixture_record(history)
+    (home / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+    manifest = {"status": "prepared_only", "source": source, "fixture": fixture,
+                "args": vars(args), "scratch_home": str(home)}
+    (home / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    if args.prepare_only:
+        print(json.dumps(manifest, indent=2))
+        return
     mock = _start_mock(args, home)
     try:
-        results, imported, session_id = asyncio.run(_run(args, home))
+        results, imported, session_id = asyncio.run(_run(args, home, history))
     finally:
         mock.terminate()
+        try:
+            mock.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            mock.kill()
+            mock.wait(timeout=5)
     rows, totals = _stage_table(results)
     mock_reqs = []
     mlog = home / "mock_requests.jsonl"
@@ -310,9 +359,17 @@ def main():
     print("\n| stage | median ms | max ms |\n|---|---:|---:|")
     for label, med, mx, n in rows:
         print(f"| {label} | {med * 1000:.0f} | {mx * 1000:.0f} |")
-    if args.out:
-        Path(args.out).write_text(json.dumps({"label": args.label, "args": vars(args), "results": results, "stages": rows, "totals": totals, "mock_requests": mock_reqs}, indent=1, default=str))
-        print(f"\nwrote {args.out}")
+    source["imported_modules"] = {
+        name: str(Path(module.__file__).resolve())
+        for name in ("gateway.run", "run_agent", "agent.fast_path", "agent.chat_completion_helpers")
+        if (module := sys.modules.get(name)) is not None and getattr(module, "__file__", None)
+    }
+    out = _write_result(home, args.out, {
+        "label": args.label, "args": vars(args), "source": source,
+        "fixture": fixture, "results": results, "stages": rows,
+        "totals": totals, "mock_requests": mock_reqs,
+    })
+    print(f"\nwrote {out}")
 
 
 if __name__ == "__main__":
