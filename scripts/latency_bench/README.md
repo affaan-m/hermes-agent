@@ -72,6 +72,29 @@ Use matching fixture digests, source hashes, transport, warmup, delay and turn
 counts for paired comparisons. Synthetic fixture sizes are not token counts,
 and this workload does not reproduce the historical Ito Ops transcript.
 
+Each benchmark turn starts a unique trace context and reads only the bytes
+appended during that turn, capped at 2 MiB. Missing, foreign, duplicate,
+truncated, malformed or unfinished traces are recorded as errors instead of
+reusing the preceding turn's record. A caught turn exception stops further
+turns, retains the attempted turn's wall time and records its exception class.
+
+Summary `n` counts every measured attempt, including untraced attempts. Separate
+`wall_n`, `traced_n` and `delivered_n` counters describe coverage; missing timing
+values are `null`, displayed as `unavailable`. Repeated stage intervals are
+summed within each turn before taking medians across observed turns. The table
+reports each stage's observed-turn count; stage medians need not sum to a total
+median. Labels describe time since the preceding mark, not isolated component
+costs. The first adapter delivery may be a status/error message, not final text.
+
+Missing or invalid measured/warmup accounting yields `benchmark_status:
+incomplete`, retains `result.json` and exits unsuccessfully.
+The complete requested turn order, unique turn indices and warmup flags must
+match; a short run cannot pass by reporting only its surviving attempts. Trace
+totals must fit inside the enclosing wall time, allowing for trace rounding.
+`valid_for_comparison` is an accounting precondition only: it does not verify
+response correctness, matching source/fixture/payloads between runs, actual
+runtime identity, or model-side improvement. Those checks remain required.
+
 The September 2 receipt reported checkout 0.18.0 versus an installed gateway
 copy of 0.19.0. The installed source identity is still unverified. Neither a
 preparation manifest nor a mock benchmark proves deployed compatibility or a
