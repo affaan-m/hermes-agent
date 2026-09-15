@@ -528,20 +528,26 @@ describe('useVirtualHistory offset cache reuse', () => {
     })
 
     try {
-      await vi.waitFor(() => {
-        expect(expose.current?.scroll?.getViewportHeight()).toBe(10)
-      }, { timeout: 1000, interval: 5 })
+      await vi.waitFor(
+        () => {
+          expect(expose.current?.scroll?.getViewportHeight()).toBe(10)
+        },
+        { timeout: 1000, interval: 5 }
+      )
       const scroll = expose.current!.scroll!
 
       scroll.scrollTo(0)
       // Harness exposes the range after the hook's measurement layout effect.
       // Deferred range growth must mount item-0 before this test unmounts it.
-      await vi.waitFor(() => {
-        expect(scroll.getScrollTop()).toBe(0)
-        expect(expose.current!.virtualHistory.start).toBe(0)
-        expect(expose.current!.virtualHistory.end).toBeGreaterThan(0)
-        expect(expose.current!.virtualHistory.offsets[1]).toBe(2)
-      }, { timeout: 1000, interval: 5 })
+      await vi.waitFor(
+        () => {
+          expect(scroll.getScrollTop()).toBe(0)
+          expect(expose.current!.virtualHistory.start).toBe(0)
+          expect(expose.current!.virtualHistory.end).toBeGreaterThan(0)
+          expect(expose.current!.virtualHistory.offsets[1]).toBe(2)
+        },
+        { timeout: 1000, interval: 5 }
+      )
       scroll.scrollTo(5)
       const adjustScrollTop = vi.spyOn(scroll, 'adjustScrollTop')
       const staleHeights = new Map(initialHeights)
