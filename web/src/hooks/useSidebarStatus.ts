@@ -1,27 +1,32 @@
-import { useEffect, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import type { StatusResponse } from "@/lib/api";
+import { ProfileContext } from "@/contexts/profile-context";
+import { createSidebarStatusPoll } from "@/lib/sidebar-status-poll";
 
 const POLL_MS = 10_000;
 
-/**
- * Light-weight status poll for the app shell (sidebar). The Status page uses
- * its own faster interval; we keep this slower to avoid duplicate load.
- */
+/** Response-bound, profile-specific status for the app shell. */
 export function useSidebarStatus() {
-  const [status, setStatus] = useState<StatusResponse | null>(null);
+  const { profile } = useContext(ProfileContext);
+  const [snapshot, setSnapshot] = useState<{
+    profile: string;
+    status: StatusResponse | null;
+  } | null>(null);
 
   useEffect(() => {
-    const load = () => {
-      api
-        .getStatus()
-        .then(setStatus)
-        .catch(() => {});
+    const poll = createSidebarStatusPoll(
+      () => api.getStatus(profile),
+      (status) => setSnapshot({ profile, status }),
+    );
+    void poll.load();
+    const id = setInterval(() => void poll.load(), POLL_MS);
+    return () => {
+      poll.close();
+      clearInterval(id);
     };
-    load();
-    const id = setInterval(load, POLL_MS);
-    return () => clearInterval(id);
-  }, []);
+  }, [profile]);
 
-  return status;
+  // Hide the old scope immediately, before the replacement effect settles.
+  return snapshot?.profile === profile ? snapshot.status : null;
 }

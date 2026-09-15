@@ -370,6 +370,10 @@ function buildRoutes(
 const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
 
 export default function App() {
+  return <ProfileProvider><AppShell /></ProfileProvider>;
+}
+
+function AppShell() {
   const { t } = useI18n();
   const { pathname } = useLocation();
   const { manifests, loading: pluginsLoading } = usePlugins();
@@ -510,7 +514,6 @@ export default function App() {
   }, []);
 
   return (
-    <ProfileProvider>
     <div
       data-layout-variant={layoutVariant}
       className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-background-base text-text-primary antialiased"
@@ -825,7 +828,6 @@ export default function App() {
 
       <PluginSlot name="overlay" />
     </div>
-    </ProfileProvider>
   );
 }
 
@@ -1251,11 +1253,11 @@ function GatewayDot({ collapsed, status, tooltipWarmRef }: GatewayDotProps) {
 
   if (!status) {
     color = "bg-midground/20";
-    label = t.status.gateway;
+    label = `${t.status.gateway}: ${t.common.unknown}`;
   } else {
     const gw = gatewayLine(status, t);
     color = toneToColor[gw.tone] ?? "bg-muted-foreground";
-    label = `${t.status.gateway} ${gw.label}`;
+    label = `${t.status.gateway} (${status.gateway_profile ?? t.common.unknown}): ${gw.label}`;
   }
   const showTooltip = (event: MouseEvent<HTMLDivElement> | FocusEvent<HTMLDivElement>) => {
     setHovered(true);

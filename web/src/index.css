@@ -12,6 +12,10 @@
    Tailwind's JIT purge. */
 @source '../node_modules/@nous-research/ui/dist';
 
+/* Runtime dashboard plugins load separately from this source tree. Preserve
+   their existing text utilities when rebuilding the shared dashboard. */
+@source inline("text-[0.6rem] text-[9px] text-[10px] text-[11px] text-foreground/50 text-text-on-accent");
+
 /* ------------------------------------------------------------------ */
 /* JetBrains Mono — bundled for the embedded TUI (/chat tab).          */
 /* Gives the terminal a proper monospace font even on systems where    */
