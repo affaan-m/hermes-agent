@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
 from hermes_cli.config import get_hermes_home
+from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,18 @@ def _send_result_error(result: Any) -> Optional[str]:
     else:
         error = getattr(result, "error", None)
     return str(error) if error else None
+
+
+def _safe_delivery_error(error: Any) -> str:
+    """Return an exception/result error safe for user-visible delivery state.
+
+    Delivery failures cross a shared messaging boundary and may contain provider
+    URLs, authorization headers, tokens, or verbose transport diagnostics. The
+    global redaction setting must not disable this boundary, so force redaction
+    and keep the result bounded for chat/tool consumers.
+    """
+    text = redact_sensitive_text(str(error), force=True)
+    return text[:1000]
 
 
 def _is_thread_not_found_delivery_error(result: Any) -> bool:
@@ -304,16 +317,18 @@ class DeliveryRouter:
             except Exception as e:
                 # A hard failure raises here. If the platform reported a
                 # whole-chat death, record it so future deliveries short-circuit.
+                raw_error = str(e)
+                safe_error = _safe_delivery_error(raw_error)
                 if target.platform != Platform.LOCAL and target.chat_id:
-                    dead_kind = _classify_dead_from_error_text(str(e))
+                    dead_kind = _classify_dead_from_error_text(raw_error)
                     if dead_kind:
                         self.dead_targets.mark_dead(
                             target.platform.value, target.chat_id,
-                            reason=f"{dead_kind}: {str(e)[:120]}",
+                            reason=f"{dead_kind}: {safe_error[:120]}",
                         )
                 results[target.to_string()] = {
                     "success": False,
-                    "error": str(e)
+                    "error": safe_error,
                 }
         
         return results

@@ -283,6 +283,33 @@ async def test_platform_send_failure_raises_for_delivery_result(tmp_path, monkey
         await router._deliver_to_platform(target, "hello", metadata={"telegram_reply_to_message_id": "9001"})
 
 
+@pytest.mark.asyncio
+async def test_delivery_result_redacts_provider_error_details(tmp_path, monkeypatch):
+    """Shared delivery results never expose provider credentials or unbounded errors."""
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+
+    class ExplodingAdapter:
+        async def send(self, chat_id, content, metadata=None):
+            raise RuntimeError(
+                "POST https://provider.test/hook Authorization: Bearer "
+                + ("A" * 80)
+                + " failed: "
+                + ("x" * 2000)
+            )
+
+    router = DeliveryRouter(
+        GatewayConfig(), adapters={Platform.TELEGRAM: ExplodingAdapter()}
+    )
+    target = DeliveryTarget.parse("telegram:722341991")
+
+    result = await router.deliver("hello", [target])
+    error = result["telegram:722341991"]["error"]
+
+    assert "A" * 80 not in error
+    assert len(error) <= 1000
+
+
+
 # ---------------------------------------------------------------------------
 # Cron output truncation / adapter-aware chunking (issue #50126)
 # ---------------------------------------------------------------------------
