@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
 import { I18nProvider } from "@/i18n";
@@ -17,7 +17,17 @@ function rendered(value: StatusResponse | null) {
   node.innerHTML = html;
   return node;
 }
-beforeEach(() => localStorage.clear());
+beforeEach(() => {
+  // Per-file jsdom does not guarantee ambient localStorage in every Node runtime.
+  const store = new Map<string, string>();
+  vi.stubGlobal("localStorage", {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => { store.set(key, String(value)); },
+    removeItem: (key: string) => { store.delete(key); },
+    clear: () => { store.clear(); },
+  });
+});
+afterEach(() => vi.unstubAllGlobals());
 
 describe("sidebar response-bound labels", () => {
   it("renders the response profile and the bounded 300-second/50-conversation count", () => {
