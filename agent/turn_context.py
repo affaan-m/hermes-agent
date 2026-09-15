@@ -39,6 +39,8 @@ from agent.conversation_compression import (
     recover_rotated_compression_session,
 )
 from agent.context_engine import automatic_compaction_status_message
+from agent import latency_trace as _latency_trace
+from agent import fast_path as _fast_path
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
@@ -483,6 +485,7 @@ def build_turn_context(
     """
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
+    _latency_trace.mark("turn.prologue_start", agent=agent)
 
     # Recover a session rotated by another path before binding log/turn ids or
     # copying client-supplied history. Everything in this turn must consistently
@@ -565,12 +568,16 @@ def build_turn_context(
     except Exception:
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 
+    _latency_trace.mark("turn.mcp_refresh", agent=agent)
     # Sanitize surrogate characters from user input.
     if isinstance(user_message, str):
         user_message = sanitize_surrogates(user_message)
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
 
+    # Fast path: decide once per turn whether the first model call is trivial.
+    _fp_plan = _fast_path.plan_for_turn(agent, user_message)
+    _latency_trace.mark("turn.fast_path", agent=agent, plan=_fp_plan.as_dict() if _fp_plan else None)
     # Store stream callback for _interruptible_api_call to pick up.
     agent._stream_callback = stream_callback
     agent._persist_user_message_idx = None
@@ -623,6 +630,7 @@ def build_turn_context(
                 )
         except Exception:
             pass
+    _latency_trace.mark("turn.conn_check", agent=agent)
     # Replay compression warning through status_callback for gateway platforms.
     if agent._compression_warning:
         agent._replay_compression_warning()
@@ -771,6 +779,7 @@ def build_turn_context(
         restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     active_system_prompt = agent._cached_system_prompt
+    _latency_trace.mark("turn.system_prompt", agent=agent, chars=len(active_system_prompt or ""))
 
     # Bot Mode DM tool — injected ONLY into a bot's canonical "Bot Chat"
     # session on Bot-Mode-managed installs (same gate as the protocol
@@ -897,6 +906,7 @@ def build_turn_context(
                     )
                     agent._persist_user_message_idx = current_turn_user_idx
 
+    _latency_trace.mark("turn.early_persist", agent=agent)
     # ── Preflight context compression ──
     # Gate the (expensive) full token estimate behind a cheap pre-check.
     # See ``_should_run_preflight_estimate`` for the OR semantics that fix
@@ -1272,6 +1282,7 @@ def build_turn_context(
         agent._persist_user_message_idx = current_turn_user_idx
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
+    _latency_trace.mark("turn.preflight_compression", agent=agent)
     plugin_user_context = ""
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
@@ -1325,6 +1336,7 @@ def build_turn_context(
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
+
     # Gateway must-deliver notes (auto-reset note, first-contact intro,
     # voice-channel change) ride the same user-message injection channel as
     # plugin context so the ephemeral system prompt can stay byte-stable.
@@ -1348,6 +1360,7 @@ def build_turn_context(
                 else _gateway_notes
             )
 
+    _latency_trace.mark("turn.plugin_pre_llm_hook", agent=agent)
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
@@ -1500,6 +1513,7 @@ def build_turn_context(
     # because every surface enters the turn through this prologue.
     _maybe_title_session_at_turn_start(agent, messages)
 
+    _latency_trace.mark("turn.memory_prefetch", agent=agent, prefetch_chars=len(ext_prefetch_cache or ""))
     return TurnContext(
         user_message=user_message,
         original_user_message=original_user_message,
