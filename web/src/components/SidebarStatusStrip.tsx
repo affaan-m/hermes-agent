@@ -2,21 +2,32 @@ import { Link } from "react-router";
 import type { StatusResponse } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useI18n } from "@/i18n";
+import { en } from "@/i18n/en";
 
 /** Gateway + session summary for the System sidebar block (no separate strip chrome). */
 export function SidebarStatusStrip({ status }: SidebarStatusStripProps) {
   const { t } = useI18n();
+  const labels = t.app.sidebarStatus ?? en.app.sidebarStatus!;
 
   if (status === null) {
     return (
-      <div className="px-5 py-1.5" aria-hidden>
-        <div className="h-2 w-[80%] max-w-full animate-pulse rounded-sm bg-midground/10" />
-      </div>
+      <p className="px-5 py-1.5 text-xs text-text-tertiary" role="status">
+        {labels.unavailable}
+      </p>
     );
   }
 
   const gw = gatewayLine(status, t);
-  const { activeSessionsLabel, gatewayStatusLabel } = t.app;
+  const { gatewayStatusLabel } = t.app;
+  const sessionsAvailable = status.active_sessions_available === true
+    && typeof status.active_sessions === "number" && Number.isInteger(status.active_sessions)
+    && status.active_sessions >= 0;
+  const windowLabel = status.active_sessions_window_seconds === undefined
+    ? t.common.unknown
+    : labels.recentWindow.replace("{seconds}", String(status.active_sessions_window_seconds));
+  const sampleLabel = status.active_sessions_limit === undefined
+    ? t.common.unknown
+    : labels.sampleLimit.replace("{limit}", String(status.active_sessions_limit));
 
   return (
     <Link
@@ -32,17 +43,21 @@ export function SidebarStatusStrip({ status }: SidebarStatusStripProps) {
       )}
     >
       <div className="flex flex-col gap-1 font-sans text-xs leading-snug tracking-[0.08em]">
+        <p className="break-words text-text-tertiary">
+          {labels.profile}: {status.gateway_profile ?? t.common.unknown}
+        </p>
         <p className="break-words">
           <span className="text-text-tertiary">{gatewayStatusLabel}</span>{" "}
           <span className={cn("font-medium", gw.tone)}>{gw.label}</span>
         </p>
 
-        <p className="break-words">
-          <span className="text-text-tertiary">{activeSessionsLabel}</span>{" "}
+        <p className="break-words" title={sampleLabel}>
+          <span className="text-text-tertiary">{t.status.recentSessions} ({windowLabel}):</span>{" "}
           <span className="tabular-nums text-text-secondary">
-            {status.active_sessions}
+            {sessionsAvailable ? status.active_sessions : t.common.unknown}
           </span>
         </p>
+        <p className="text-text-tertiary">{sampleLabel}</p>
       </div>
     </Link>
   );

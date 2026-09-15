@@ -1984,50 +1984,53 @@ def _probe_gateway_health() -> tuple[bool, dict | None]:
     return False, None
 
 
-def _count_status_active_sessions() -> int:
-    """Return the dashboard status active-session count.
+def _count_status_active_sessions(db_path: Optional[Path] = None) -> Optional[int]:
+    """Count recent unended conversations in the newest-start 50-row sample.
 
-    This is best-effort status garnish, not a critical path.  Opens read-only
-    (via the shared stale-schema heal, same as every other dashboard read
-    path) so /api/status never routinely writes to state.db while another
-    Hermes process is using it.
+    Status garnish must never bootstrap or heal a store. The caller captures
+    its profile path before crossing the executor boundary, where task-local
+    profile context is not automatically propagated.
     """
-    from hermes_state import _default_db_path
+    from hermes_state import SessionDB
 
-    # The heal helper bootstraps a missing store; this garnish must not — on
-    # a fresh install /api/status polls would otherwise create state.db
-    # before the user's first session.
-    if not Path(_default_db_path()).exists():
-        return 0
-
-    db = _open_session_db_for_profile(None, read_only=True)
+    path = Path(db_path) if db_path is not None else get_hermes_home() / "state.db"
+    if not path.is_file():
+        return None
+    db = SessionDB(db_path=path, read_only=True)
     try:
         sessions = db.list_sessions_rich(limit=50, compact_rows=True)
         now = time.time()
-        return sum(
-            1 for s in sessions
-            if s.get("ended_at") is None
-            and (now - s.get("last_active", s.get("started_at", 0))) < 300
-        )
+        count = 0
+        for session in sessions:
+            if session.get("ended_at") is not None:
+                continue
+            last_active = session.get("last_active", session.get("started_at"))
+            if type(last_active) not in (int, float) or not math.isfinite(last_active):
+                return None
+            if 0 <= now - last_active < 300:
+                count += 1
+        return count
     finally:
         db.close()
 
 
-async def _status_active_sessions() -> int:
+async def _status_active_sessions(db_path: Optional[Path] = None) -> Optional[int]:
+    # Capture the context-local path on this task, never inside the executor.
+    path = Path(db_path) if db_path is not None else get_hermes_home() / "state.db"
     loop = asyncio.get_running_loop()
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(None, _count_status_active_sessions),
+            loop.run_in_executor(None, _count_status_active_sessions, path),
             timeout=_STATUS_ACTIVE_SESSIONS_TIMEOUT,
         )
     except asyncio.TimeoutError:
         _log.debug(
-            "/api/status active session count exceeded %.2fs; returning 0",
+            "/api/status active session count exceeded %.2fs; returning unknown",
             _STATUS_ACTIVE_SESSIONS_TIMEOUT,
         )
     except Exception as exc:
         _log.debug("/api/status active session count unavailable: %s", exc)
-    return 0
+    return None
 
 
 # Image MIME types this endpoint will serve. Extension-allowlisted so an
@@ -3674,6 +3677,7 @@ def _merge_profile_gateway_platforms(
 
 @app.get("/api/status")
 async def get_status(profile: Optional[str] = None):
+    dashboard_home = get_hermes_home()
     status_scope = None
     requested_profile = (profile or "").strip()
     # Plain /api/status stays the machine-level public liveness probe. The
@@ -3692,6 +3696,13 @@ async def get_status(profile: Optional[str] = None):
         status_scope.__enter__()
 
     try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        gateway_profile = get_active_profile_name()
+        status_home = get_hermes_home()
+        # The configured remote health source belongs to the dashboard home,
+        # not every profile selectable through the management API.
+        same_dashboard_home = status_home.resolve() == dashboard_home.resolve()
         current_ver, latest_ver = check_config_version()
         # --- Gateway liveness detection ---
         # Delegated to the single shared ladder in gateway.status so this
@@ -3739,7 +3750,7 @@ async def get_status(profile: Optional[str] = None):
             lambda: resolve_gateway_liveness(
                 profile_dir=profile_dir,
                 runtime=local_runtime,
-                health_probe=_bounded_health_probe if _GATEWAY_HEALTH_URL else None,
+                health_probe=_bounded_health_probe if _GATEWAY_HEALTH_URL and same_dashboard_home else None,
                 pid_probe=get_running_pid_cached,
                 runtime_reader=read_runtime_status,
                 runtime_pid_probe=get_runtime_status_running_pid,
@@ -3836,7 +3847,7 @@ async def get_status(profile: Optional[str] = None):
                 gateway_platforms, topology.get("profile_platforms") or {}
             )
 
-        active_sessions = await _status_active_sessions()
+        active_sessions = await _status_active_sessions(status_home / "state.db")
 
         # Busy/drainable readout (NAS lifecycle-safety gate).  active_agents is
         # the in-flight gateway-turn count the gateway now persists at every
@@ -3922,6 +3933,7 @@ async def get_status(profile: Optional[str] = None):
             "config_version": current_ver,
             "latest_config_version": latest_ver,
             "can_update_hermes": not _dashboard_local_update_managed_externally(),
+            "gateway_profile": gateway_profile,
             "gateway_running": gateway_running,
             "gateway_state": gateway_state,
             "gateway_platforms": gateway_platforms,
@@ -3932,6 +3944,9 @@ async def get_status(profile: Optional[str] = None):
             "gateway_drainable": gateway_drainable,
             "restart_drain_timeout": restart_drain_timeout,
             "active_sessions": active_sessions,
+            "active_sessions_available": active_sessions is not None,
+            "active_sessions_window_seconds": 300,
+            "active_sessions_limit": 50,
             "auth_required": auth_required,
             "auth_providers": auth_providers,
             "auth_flows": auth_flows,
