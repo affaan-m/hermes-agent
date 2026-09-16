@@ -608,6 +608,11 @@ class GatewayConfig:
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
     thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
     max_concurrent_sessions: Optional[int] = None  # Positive int caps simultaneous active chat sessions
+    # Dispatch ordering (gateway.dispatch). Serial mode gives every message
+    # in a busy conversation its own turn in arrival order with no interrupt
+    # and no text merge; the cap bounds concurrent conversations gateway wide.
+    per_conversation_serial: bool = False
+    max_concurrent_conversations: Optional[int] = None
 
     # Multi-profile multiplexing (opt-in; default off preserves one-gateway-per-profile).
     # When True, the default profile's gateway serves inbound messages for every
@@ -729,6 +734,8 @@ class GatewayConfig:
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
+            "per_conversation_serial": self.per_conversation_serial,
+            "max_concurrent_conversations": self.max_concurrent_conversations,
             "multiplex_profiles": self.multiplex_profiles,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
@@ -791,6 +798,20 @@ class GatewayConfig:
             max_concurrent_raw,
             max_concurrent_key,
         )
+        if "per_conversation_serial" in data:
+            per_conversation_serial_raw = data.get("per_conversation_serial")
+        else:
+            per_conversation_serial_raw = nested_gateway.get("per_conversation_serial")
+        if "max_concurrent_conversations" in data:
+            max_conversations_raw = data.get("max_concurrent_conversations")
+            max_conversations_key = "max_concurrent_conversations"
+        else:
+            max_conversations_raw = nested_gateway.get("max_concurrent_conversations")
+            max_conversations_key = "gateway.max_concurrent_conversations"
+        max_concurrent_conversations = _coerce_optional_positive_int(
+            max_conversations_raw,
+            max_conversations_key,
+        )
         unauthorized_dm_behavior = _normalize_unauthorized_dm_behavior(
             data.get("unauthorized_dm_behavior"),
             "pair",
@@ -819,6 +840,8 @@ class GatewayConfig:
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
             max_concurrent_sessions=max_concurrent_sessions,
+            per_conversation_serial=_coerce_bool(per_conversation_serial_raw, False),
+            max_concurrent_conversations=max_concurrent_conversations,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
