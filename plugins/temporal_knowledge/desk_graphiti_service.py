@@ -119,6 +119,44 @@ def _graph_lock():
     return _GRAPH_RW_LOCK
 
 
+_FRESHNESS_LOG_INTERVAL = 300
+_last_freshness_log = 0.0
+
+
+def _freshness_marker_path() -> Path:
+    """Where the last successful graph commit is advertised.
+
+    The Kuzu file at graphiti_desk stopped being the store on 2026-09-01 when
+    the backend moved to Neo4j, so consumers watching file mtimes need an
+    explicit marker instead. Written atomically after every successful
+    episode commit; the mtime is the freshness signal.
+    """
+    return Path(
+        os.environ.get(
+            "GRAPHITI_FRESHNESS_FILE", "~/.hermes/profiles/ito/graphiti_freshness"
+        )
+    ).expanduser()
+
+
+def _write_freshness_marker(group_id: str, now: float | None = None) -> Path:
+    global _last_freshness_log
+    now = time.time() if now is None else now
+    path = _freshness_marker_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps({"ts": now, "group_id": group_id, "ingested": STATE["ingested"]})
+    )
+    os.replace(tmp, path)
+    if now - _last_freshness_log >= _FRESHNESS_LOG_INTERVAL:
+        _last_freshness_log = now
+        print(
+            f"[graphiti-desk] freshness marker written: {path} "
+            f"(group={group_id}, ingested={STATE['ingested']})"
+        )
+    return path
+
+
 async def _ingest_worker(g: Graphiti, queue: asyncio.Queue):
     while True:
         job = await queue.get()
@@ -171,6 +209,10 @@ async def _apply(g: Graphiti, job: dict):
         except TypeError:
             result = await g.add_episode(**kwargs)
         STATE["ingested"] += 1
+        try:
+            _write_freshness_marker(job["group_id"])
+        except Exception as exc:
+            print(f"[graphiti-desk] freshness marker write failed (non-fatal): {exc}")
         # L2 dedup merge + L4 evolution on the freshly created edges
         # (Kuzu-schema-specific; skipped on the Neo4j backend until ported.)
         try:
