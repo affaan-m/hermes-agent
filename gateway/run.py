@@ -6322,6 +6322,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
+    def _ito_auto_resume_allowed(self, source) -> bool:
+        """Ito desk gate for startup auto-resume (silent-restart contract).
+
+        A restart must never post a synthesized "session restored" turn where
+        a counterparty can read it. Auto-resume is allowed only for:
+
+        * the platform's configured home channel (Itô Ops, #all-ito-markets,
+          the WhatsApp / email home addresses), or
+        * a DM whose owner is on the platform's operator allowlist
+          (``<PLATFORM>_ALLOWED_USERS``, numeric / Slack ids only).
+
+        Every other origin (counterparty groups, Slack Connect channels,
+        DMs from anyone else) stays ``resume_pending`` and continues only when
+        a human writes in that chat again.
+        """
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        platform = getattr(source, "platform", None)
+        try:
+            home = self.config.get_home_channel(platform) if platform is not None else None
+        except Exception:  # noqa: BLE001 — never let the gate crash startup
+            home = None
+        home_id = str(getattr(home, "chat_id", "") or "").strip()
+        if chat_id and home_id and chat_id == home_id:
+            return True
+        chat_type = str(getattr(source, "chat_type", "dm") or "dm")
+        if chat_type != "dm":
+            return False
+        user_id = str(getattr(source, "user_id", "") or "").strip()
+        if not user_id:
+            return False
+        platform_value = str(getattr(platform, "value", platform) or "").strip()
+        if not platform_value:
+            return False
+        env_name = f"{platform_value.upper().replace('-', '_')}_ALLOWED_USERS"
+        allowed = {
+            part.strip()
+            for part in os.getenv(env_name, "").split(",")
+            if part.strip()
+        }
+        return user_id in allowed
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -6394,6 +6435,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             source = entry.origin
+            # Ito: auto-resume only in home channels and operator DMs. In
+            # counterparty groups/channels a restart must be silent: the
+            # synthesized continuation turn otherwise posts "session restored"
+            # noise where customers and suppliers can see it.
+            if not self._ito_auto_resume_allowed(source):
+                logger.info(
+                    "Skipping auto-resume for %s: non-home group/channel or non-operator DM",
+                    entry.session_key,
+                )
+                continue
             adapter = self.adapters.get(source.platform)
             if adapter is None:
                 logger.debug(

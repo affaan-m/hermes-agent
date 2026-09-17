@@ -2145,9 +2145,10 @@ async def git_branch_switch_route(body: GitBranchSwitchBody):
 
 @app.get("/api/status")
 async def get_status(profile: Optional[str] = None):
+    dashboard_home = get_hermes_home()
     status_scope = None
     requested_profile = (profile or "").strip()
-    # Plain /api/status stays the machine-level public liveness probe. The
+    # Plain /api/status reports this dashboard profile, not all profiles. The
     # dashboard adds ?profile= when its management switcher targets another
     # profile, so its gateway badge reflects the selected profile.
     #
@@ -2161,6 +2162,10 @@ async def get_status(profile: Optional[str] = None):
         status_scope.__enter__()
 
     try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        gateway_profile = get_active_profile_name()
+        status_home = get_hermes_home()
         current_ver, latest_ver = check_config_version()
         # --- Gateway liveness detection ---
         # Try local PID check first (same-host).  If that fails and a remote
@@ -2170,7 +2175,9 @@ async def get_status(profile: Optional[str] = None):
         gateway_running = gateway_pid is not None
         remote_health_body: dict | None = None
 
-        if not gateway_running and _GATEWAY_HEALTH_URL:
+        # The configured remote probe belongs to this dashboard process. Do
+        # not attribute its gateway to another selected profile.
+        if not gateway_running and _GATEWAY_HEALTH_URL and status_home == dashboard_home:
             loop = asyncio.get_running_loop()
             alive, remote_health_body = await loop.run_in_executor(
                 None, _probe_gateway_health
@@ -2239,22 +2246,28 @@ async def get_status(profile: Optional[str] = None):
         if gateway_running and gateway_state is None and remote_health_body is not None:
             gateway_state = "running"
 
-        active_sessions = 0
+        # Bounded recent-conversation sample, not all sessions or active turns.
+        # Explicit read-only scope avoids the import-time DEFAULT_DB_PATH and
+        # prevents a status poll from creating or repairing a live database.
+        active_sessions = None
+        active_sessions_available = False
         try:
             from hermes_state import SessionDB
-            db = SessionDB()
+            db = SessionDB(status_home / "state.db", read_only=True)
             try:
                 sessions = db.list_sessions_rich(limit=50)
                 now = time.time()
                 active_sessions = sum(
                     1 for s in sessions
                     if s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
+                    and 0 <= (now - s.get("last_active", s.get("started_at", 0))) < 300
                 )
+                active_sessions_available = True
             finally:
                 db.close()
         except Exception:
-            pass
+            active_sessions = None
+            active_sessions_available = False
 
         # Busy/drainable readout (NAS lifecycle-safety gate).  active_agents is
         # the in-flight gateway-turn count the gateway now persists at every
@@ -2306,6 +2319,7 @@ async def get_status(profile: Optional[str] = None):
             "config_version": current_ver,
             "latest_config_version": latest_ver,
             "can_update_hermes": not _dashboard_local_update_managed_externally(),
+            "gateway_profile": gateway_profile,
             "gateway_running": gateway_running,
             "gateway_state": gateway_state,
             "gateway_platforms": gateway_platforms,
@@ -2316,6 +2330,9 @@ async def get_status(profile: Optional[str] = None):
             "gateway_drainable": gateway_drainable,
             "restart_drain_timeout": restart_drain_timeout,
             "active_sessions": active_sessions,
+            "active_sessions_available": active_sessions_available,
+            "active_sessions_window_seconds": 300,
+            "active_sessions_limit": 50,
             "auth_required": auth_required,
             "auth_providers": auth_providers,
         }

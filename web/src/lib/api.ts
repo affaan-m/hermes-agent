@@ -316,7 +316,9 @@ function appendProfileParam(url: string, profile?: string): string {
 
 export const api = {
   buildWsUrl,
-  getStatus: () => fetchJSON<StatusResponse>("/api/status"),
+  getStatus: (profile?: string) => fetchJSON<StatusResponse>(
+    profile === undefined ? "/api/status" : `/api/status?profile=${encodeURIComponent(profile || "current")}`,
+  ),
   /**
    * Identity probe for the dashboard auth gate (Phase 7).
    *
@@ -1630,7 +1632,12 @@ export interface PlatformStatus {
 }
 
 export interface StatusResponse {
-  active_sessions: number;
+  active_sessions: number | null;
+  /** Profile bound to this completed response; never an aggregate. */
+  gateway_profile?: string;
+  active_sessions_available?: boolean;
+  active_sessions_window_seconds?: number;
+  active_sessions_limit?: number;
   /** Phase 7: ``true`` when the dashboard's OAuth gate is engaged
    * (public bind, no ``--insecure``). Read alongside ``auth_providers``
    * to render a "gated / loopback" badge. */

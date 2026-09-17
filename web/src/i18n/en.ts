@@ -60,6 +60,12 @@ export const en: Translations = {
     footer: {
       org: "Ito Markets",
     },
+    sidebarStatus: {
+      profile: "Profile",
+      unavailable: "Status unavailable or loading",
+      recentWindow: "last {seconds}s",
+      sampleLimit: "sample of up to {limit} newest conversations; excludes subagents and archived sessions",
+    },
     activeSessionsLabel: "Active Sessions:",
     gatewayStatusLabel: "Gateway Status:",
     gatewayStrip: {

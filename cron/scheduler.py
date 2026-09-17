@@ -43,6 +43,7 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import load_config, _expand_env_vars
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
+from cron.final_only import prepare_final_message, is_log_job
 
 logger = logging.getLogger(__name__)
 
@@ -1217,7 +1218,7 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(job: dict, content: str, adapters=None, loop=None, full_output_path=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1279,15 +1280,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    # Apply only to explicitly configured internal log jobs in this profile.
+    if is_log_job(job):
+        delivery_content = prepare_final_message(content, job=job, full_output_path=full_output_path)
+        if not delivery_content.strip():
+            return None
+        media_files = []
+        cleaned_delivery_content = delivery_content
+    else:
+        media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
     # transcript so a user reply in that chat sees the cron output in context.
     # Mirror the CLEAN, unwrapped output (not the cron header/footer).
     try:
-        mirror_enabled = _cron_mirror_delivery_enabled(job, user_cfg)
+        mirror_enabled = not is_log_job(job) and _cron_mirror_delivery_enabled(job, user_cfg)
     except Exception:
         mirror_enabled = False
     mirror_text = ""
@@ -3141,7 +3150,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         delivery_error = None
         if should_deliver:
             try:
-                delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop, full_output_path=output_file)
             except Exception as de:
                 delivery_error = str(de)
                 logger.error("Delivery failed for job %s: %s", job["id"], de)

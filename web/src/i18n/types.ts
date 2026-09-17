@@ -77,6 +77,12 @@ export interface Translations {
     footer: {
       org: string;
     };
+    sidebarStatus?: {
+      profile: string;
+      unavailable: string;
+      recentWindow: string;
+      sampleLimit: string;
+    };
     activeSessionsLabel: string;
     gatewayStatusLabel: string;
     gatewayStrip: {

@@ -7,8 +7,8 @@ Implements the desk variant of the current research frontier:
                     retrieval hit (Hebbian: facts that get used get stronger;
                     co-hit facts boost their shared entity). NO time decay:
                     salience only moves via use, authority, and contradiction.
-  L2 dedup        — at ingest, near-identical facts (exact-normalized text or
-                    embedding cosine >= threshold) MERGE instead of duplicate:
+  L2 dedup        — at ingest, exact-normalized duplicate facts MERGE:
+                    embedding similarity alone cannot establish equivalence;
                     the survivor keeps the earlier valid_from, gains the
                     loser's episode provenance, and gets a salience bump.
   L3 PPR          — Personalized PageRank over the entity<->fact bipartite
@@ -27,6 +27,7 @@ Truth stays sacred: salience only ever affects RANKING. Temporal invalidation
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import math
 import re
@@ -61,7 +62,6 @@ ENTITY_COHIT_BOOST = 0.05
 MERGE_BOOST = 0.5
 STRENGTHEN_BOOST = 0.4
 
-_DEDUP_COSINE = 0.87
 _EVOLUTION_TOP_K = 5
 _EVOLUTION_MAX_NEW_FACTS = 5
 
@@ -147,43 +147,41 @@ def _cosine(a, b) -> float:
 
 
 async def dedup_new_facts(driver, new_edges: list) -> dict:
-    """L2 merge pass over freshly created edges. Exact-normalized text match or
-    embedding cosine >= threshold against an older CURRENT fact merges the new
-    one into the old: new fact closes (invalid_at = now), old fact gains the
-    episode provenance + salience bump. Returns counters."""
+    """Merge exact-normalized text only within one directed edge identity.
+
+    High cosine also occurs for contradictory facts. Non-equivalent wording
+    stays available to the existing L4 pass, without adding a model call here.
+    Preserve survivor provenance before closing the incoming duplicate.
+    """
     merged = 0
     kept = 0
     for edge in new_edges or []:
         fact = getattr(edge, "fact", "") or ""
         if not fact:
             continue
-        rows, _, _ = await driver.execute_query(
-            "MATCH (e:RelatesToNode_) WHERE e.invalid_at IS NULL AND e.uuid <> $uuid "
-            "AND e.group_id = $gid RETURN e.uuid AS uuid, e.fact AS fact, "
-            "e.fact_embedding AS emb, e.valid_at AS valid_at, e.salience AS s, "
-            "e.episodes AS episodes LIMIT 200",
-            uuid=edge.uuid, gid=edge.group_id,
-        )
-        best = None
-        best_sim = 0.0
-        for r in rows or []:
-            if _norm_text(r["fact"]) == _norm_text(fact):
-                best = r
-                best_sim = 1.0
-                break
-            ea, eb = getattr(edge, "fact_embedding", None), r.get("emb")
-            if ea is not None and eb is not None:
-                sim = _cosine(ea, eb)
-                if sim > best_sim:
-                    best_sim = sim
-                    if sim >= _DEDUP_COSINE:
-                        best = r
-        if best is not None:
-            # merge: close the new duplicate; strengthen the survivor
-            await driver.execute_query(
-                "MATCH (e:RelatesToNode_ {uuid: $uuid}) SET e.invalid_at = $now",
-                uuid=edge.uuid, now=edge.created_at,
+        gid = getattr(edge, "group_id", None)
+        edge_name = getattr(edge, "name", None)
+        source_uuid = getattr(edge, "source_node_uuid", None)
+        target_uuid = getattr(edge, "target_node_uuid", None)
+        rows = []
+        if all(isinstance(value, str) and value.strip()
+               for value in (gid, edge_name, source_uuid, target_uuid)):
+            rows, _, _ = await driver.execute_query(
+                "MATCH (source:Entity)-[:RELATES_TO]->(e:RelatesToNode_)"
+                "-[:RELATES_TO]->(target:Entity) "
+                "WHERE e.invalid_at IS NULL AND e.uuid <> $uuid "
+                "AND e.group_id = $gid AND e.name = $edge_name "
+                "AND source.uuid = $source_uuid AND target.uuid = $target_uuid "
+                "AND source.group_id = $gid AND target.group_id = $gid "
+                "RETURN e.uuid AS uuid, e.fact AS fact, "
+                "e.fact_embedding AS emb, e.valid_at AS valid_at, e.salience AS s, "
+                "e.episodes AS episodes LIMIT 200",
+                uuid=edge.uuid, gid=gid, edge_name=edge_name,
+                source_uuid=source_uuid, target_uuid=target_uuid,
             )
+        best = next((row for row in rows or []
+                     if _norm_text(row["fact"]) == _norm_text(fact)), None)
+        if best is not None:
             eps = list(best.get("episodes") or [])
             for ep in (getattr(edge, "episodes", None) or []):
                 if ep not in eps:
@@ -193,6 +191,13 @@ async def dedup_new_facts(driver, new_edges: list) -> dict:
                 "e.salience = $s",
                 uuid=best["uuid"], eps=eps,
                 s=min(float(best.get("s") or 1.0) + MERGE_BOOST, SALIENCE_MAX),
+            )
+            # If copying provenance fails, leave incoming current. If closing
+            # then fails, both remain current and the evidence exists in both;
+            # _apply's nonfatal memory-layer behavior must not lose the source.
+            await driver.execute_query(
+                "MATCH (e:RelatesToNode_ {uuid: $uuid}) SET e.invalid_at = $now",
+                uuid=edge.uuid, now=edge.created_at,
             )
             merged += 1
         else:
@@ -230,9 +235,31 @@ class _Decisions(BaseModel):
     decisions: list[_Decision]
 
 
+def _invalidation_boundary(edge, target):
+    """Close only a fact already valid at the known event boundary."""
+    value = getattr(edge, "valid_at", None)
+    if value is None:
+        value = getattr(edge, "created_at", None)
+    try:
+        # Match historical reads: naive ISO dates mean UTC, never ingestion
+        # time. An unknown/malformed candidate start cannot authorize closure.
+        boundary = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        start = datetime.fromisoformat(str(target.get("valid_at")).replace("Z", "+00:00"))
+        boundary = boundary if boundary.tzinfo else boundary.replace(tzinfo=timezone.utc)
+        start = start if start.tzinfo else start.replace(tzinfo=timezone.utc)
+        if start > boundary:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return value
+
+
 async def evolution_pass(driver, llm_client, new_edges: list, group_id: str) -> dict:
-    """L4 A-MEM-style evolution, bounded: for up to N new facts, judge the
-    top-K similar existing current facts in one batched call each."""
+    """Judge current facts only within one directed relationship identity.
+
+    The persisted incoming fact must still be current after L2; its in-memory
+    edge object can be stale. Similar prose never grants cross-identity writes.
+    """
     from pydantic import BaseModel as _BM  # noqa: F401 (clarity for the models above)
     from graphiti_core.prompts.models import Message
 
@@ -240,14 +267,33 @@ async def evolution_pass(driver, llm_client, new_edges: list, group_id: str) -> 
     for edge in (new_edges or [])[:_EVOLUTION_MAX_NEW_FACTS]:
         new_fact = getattr(edge, "fact", "") or ""
         emb = getattr(edge, "fact_embedding", None)
-        if not new_fact:
+        gid = getattr(edge, "group_id", None)
+        edge_name = getattr(edge, "name", None)
+        source_uuid = getattr(edge, "source_node_uuid", None)
+        target_uuid = getattr(edge, "target_node_uuid", None)
+        if not new_fact or gid != group_id or not all(
+            isinstance(value, str) and value.strip()
+            for value in (gid, edge_name, source_uuid, target_uuid)
+        ):
             continue
-        # candidate pool: similar current facts in the same group
+        # L2 may have closed incoming in storage without updating edge. Both
+        # facts must share current, group-scoped, directed endpoint identity.
         rows, _, _ = await driver.execute_query(
-            "MATCH (e:RelatesToNode_) WHERE e.invalid_at IS NULL AND e.uuid <> $uuid "
-            "AND e.group_id = $gid RETURN e.uuid AS uuid, e.fact AS fact, "
-            "e.fact_embedding AS emb, e.salience AS s LIMIT 400",
-            uuid=edge.uuid, gid=group_id,
+            "MATCH (source:Entity)-[:RELATES_TO]->(incoming:RelatesToNode_)"
+            "-[:RELATES_TO]->(target:Entity) "
+            "MATCH (source)-[:RELATES_TO]->(e:RelatesToNode_)-[:RELATES_TO]->(target) "
+            "WHERE incoming.uuid = $uuid AND incoming.invalid_at IS NULL "
+            "AND incoming.group_id = $gid AND incoming.name = $edge_name "
+            "AND e.uuid <> $uuid AND e.invalid_at IS NULL "
+            "AND e.group_id = $gid AND e.name = $edge_name "
+            "AND source.uuid = $source_uuid AND target.uuid = $target_uuid "
+            "AND source.group_id = $gid AND target.group_id = $gid "
+            "RETURN e.uuid AS uuid, e.fact AS fact, "
+            "e.fact_embedding AS emb, e.salience AS s, e.episodes AS episodes, "
+            "e.valid_at AS valid_at, "
+            "incoming.episodes AS incoming_episodes LIMIT 400",
+            uuid=edge.uuid, gid=gid, edge_name=edge_name,
+            source_uuid=source_uuid, target_uuid=target_uuid,
         )
         if not rows:
             continue
@@ -276,31 +322,56 @@ async def evolution_pass(driver, llm_client, new_edges: list, group_id: str) -> 
         except Exception as exc:
             print(f"[memory-layers] evolution llm failed: {exc}")
             continue
+        decided_indices = set()
         for d in decisions:
             try:
                 idx = int(d.get("i", 0)) - 1
                 action = str(d.get("action", "KEEP")).upper()
-                if not (0 <= idx < len(candidates)) or action not in actions_taken:
+                if (not (0 <= idx < len(candidates)) or action not in actions_taken
+                        or idx in decided_indices):
                     continue
+                decided_indices.add(idx)
                 target = candidates[idx]
                 if action == "MERGE":
+                    episodes = list(target.get("episodes") or [])
+                    # Earlier new edges in this batch may have merged into
+                    # incoming already; its Python object still has old episodes.
+                    incoming_episodes = list(target.get("incoming_episodes") or [])
+                    incoming_episodes.extend(getattr(edge, "episodes", None) or [])
+                    for episode in incoming_episodes:
+                        if episode not in episodes:
+                            episodes.append(episode)
+                    await driver.execute_query(
+                        "MATCH (e:RelatesToNode_ {uuid: $uuid}) SET e.episodes = $eps, "
+                        "e.salience = $s", uuid=target["uuid"], eps=episodes,
+                        s=min(float(target.get("s") or 1.0) + MERGE_BOOST, SALIENCE_MAX),
+                    )
+                    # Preserve the incoming provenance before closing it. A
+                    # failed write leaves the new fact available for recovery.
                     await driver.execute_query(
                         "MATCH (e:RelatesToNode_ {uuid: $uuid}) SET e.invalid_at = $now",
                         uuid=edge.uuid, now=edge.created_at,
                     )
-                    await _set_salience(driver, target["uuid"],
-                                        (target.get("s") or 1.0) + MERGE_BOOST)
+                    actions_taken[action] += 1
+                    # The new fact is closed; it cannot invalidate or
+                    # strengthen another target from this stale candidate set.
+                    break
                 elif action == "STRENGTHEN":
                     await _set_salience(driver, target["uuid"],
                                         (target.get("s") or 1.0) + STRENGTHEN_BOOST)
                 elif action == "INVALIDATE":
+                    boundary = _invalidation_boundary(edge, target)
+                    if boundary is None:
+                        continue  # No reliable boundary: preserve the prior fact.
                     await driver.execute_query(
                         "MATCH (e:RelatesToNode_ {uuid: $uuid}) SET e.invalid_at = $now",
-                        uuid=target["uuid"], now=edge.created_at,
+                        uuid=target["uuid"], now=boundary,
                     )
                 actions_taken[action] += 1
             except Exception:
-                continue
+                # A mutation may have partly succeeded. Do not continue making
+                # decisions against the original candidate snapshot.
+                break
     return actions_taken
 
 

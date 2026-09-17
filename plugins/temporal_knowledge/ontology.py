@@ -24,7 +24,7 @@ class Obligation(BaseModel):
 
 class Contract(BaseModel):
     """A formal agreement between desk and counterparty."""
-    state: str | None = Field(None, description="draft | review | sent | signed | delivered")
+    state: str | None = Field(None, description="Reported state: draft | review | sent | delivered | partially_signed | completion_reported | voided. Delivery is not execution; extraction is not signature verification.")
     sha256: str | None = Field(None, description="digest of exact bytes")
 
 
@@ -62,8 +62,13 @@ class SupersededBy(BaseModel):
 
 
 class SignedContract(BaseModel):
-    """A deal has a signed or delivered contract."""
-    contract_ref: str | None = Field(None, description="obligation id or docusign envelope")
+    """A source reports execution of a contract by all required parties.
+
+    Keep this legacy edge name for graph compatibility. Never extract it for
+    sending, delivery, an unsigned draft, a signature request or partial signing.
+    This edge remains a report, not authenticated proof of signatures.
+    """
+    contract_ref: str | None = Field(None, description="Source reference for the reported completion, if explicitly present; never invent a receipt.")
 
 
 class HasAsk(BaseModel):
