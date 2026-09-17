@@ -2768,6 +2768,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._show_reasoning = self._load_show_reasoning()
         self._busy_input_mode = self._load_busy_input_mode()
         self._busy_text_mode = self._load_busy_text_mode()
+        # Dispatch policy: per-conversation ordering and the gateway wide
+        # cap on concurrent conversations (gateway/dispatch.py).
+        from gateway.dispatch import configure_dispatcher
+        configure_dispatcher(
+            per_conversation_serial=bool(
+                getattr(self.config, "per_conversation_serial", False)
+            ),
+            max_concurrent_conversations=getattr(
+                self.config, "max_concurrent_conversations", None
+            ),
+        )
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
@@ -5050,6 +5061,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
+    @staticmethod
+    def _per_conversation_serial() -> bool:
+        """True when gateway.per_conversation_serial is on for this process."""
+        try:
+            from gateway.dispatch import get_dispatcher
+            return bool(get_dispatcher().serial)
+        except Exception:
+            return False
+
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
@@ -5227,6 +5247,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # cascade after the current turn finishes.
         if getattr(event, "internal", False):
             return False
+
+        # gateway.per_conversation_serial: the follow-up becomes its own turn
+        # after the running one, in arrival order. No interrupt, no steer,
+        # no text merge, no busy ack. Photo bursts keep album merge semantics
+        # inside _queue_or_replace_pending_event.
+        if self._per_conversation_serial():
+            self._queue_or_replace_pending_event(session_key, event)
+            logger.info(
+                "dispatch queue platform=%s session=%s msg_id=%s depth=%d",
+                getattr(getattr(event.source, "platform", None), "value", "?"),
+                session_key,
+                getattr(event, "message_id", None),
+                self._queue_depth(session_key, adapter=adapter),
+            )
+            return True
 
         running_agent = self._running_agents.get(session_key)
 

@@ -491,6 +491,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.dispatch import get_dispatcher
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
@@ -2345,6 +2346,10 @@ class BasePlatformAdapter(ABC):
         # a newer task's guard, leaving stale busy state.
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
+        # Overflow tail behind the single _pending_messages slot, used when
+        # gateway.per_conversation_serial is on and no runner busy-handler
+        # owns the FIFO. Each entry is its own future turn, arrival order.
+        self._pending_overflow: Dict[str, List[MessageEvent]] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
         # Legacy busy_text_mode env var; when unset the runner syncs the
         # resolved value (driven by busy_input_mode) onto the adapter after
@@ -4399,7 +4404,7 @@ class BasePlatformAdapter(ABC):
             session_key,
         )
         self._active_sessions.pop(session_key, None)
-        self._pending_messages.pop(session_key, None)
+        self._discard_pending(session_key)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
         return True
@@ -4482,7 +4487,7 @@ class BasePlatformAdapter(ABC):
                     exc_info=True,
                 )
         if discard_pending:
-            self._pending_messages.pop(session_key, None)
+            self._discard_pending(session_key)
             self._discard_text_debounce(session_key)
         if release_guard:
             self._release_session_guard(session_key)
@@ -4499,7 +4504,7 @@ class BasePlatformAdapter(ABC):
         command was running — spawns a fresh processing task for it.
         """
         await self._flush_text_debounce_now(session_key)
-        pending_event = self._pending_messages.pop(session_key, None)
+        pending_event = self.get_pending_message(session_key)
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is None:
             return
@@ -4737,6 +4742,16 @@ class BasePlatformAdapter(ABC):
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
 
+            # gateway.per_conversation_serial: every follow-up is its own
+            # turn, in arrival order, no interrupt and no text merge.
+            if self._dispatcher.serial and event.message_type != MessageType.PHOTO:
+                depth = self._enqueue_pending_fifo(session_key, event)
+                logger.info(
+                    "dispatch queue platform=%s session=%s msg_id=%s depth=%d",
+                    self.name, session_key, getattr(event, "message_id", None), depth,
+                )
+                return
+
             # Special case: photo bursts/albums frequently arrive as multiple near-
             # simultaneous messages. Queue them without interrupting the active run,
             # then process them immediately after the current task finishes.
@@ -4807,6 +4822,34 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        # Reuse the interrupt event set by handle_message() (which marks
+        # the session active before spawning this task to prevent races).
+        # Fall back to a new Event only if the entry was removed externally.
+        interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
+        self._active_sessions[session_key] = interrupt_event
+
+        # gateway.max_concurrent_conversations: wait for a slot before any
+        # user visible side effect (typing indicator) starts. The session
+        # guard above is already held, so follow-ups queue behind us.
+        dispatch_slot = await self._dispatcher.acquire(
+            session_key,
+            platform=self.name,
+            message_id=getattr(event, "message_id", None),
+        )
+        try:
+            await self._process_message_background_dispatched(
+                event, session_key, interrupt_event
+            )
+        finally:
+            self._dispatcher.release(dispatch_slot)
+
+    async def _process_message_background_dispatched(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        interrupt_event: asyncio.Event,
+    ) -> None:
+        """Body of ``_process_message_background`` once a dispatch slot is held."""
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -4819,12 +4862,6 @@ class BasePlatformAdapter(ABC):
             if getattr(result, "success", False):
                 delivery_succeeded = True
 
-        # Reuse the interrupt event set by handle_message() (which marks
-        # the session active before spawning this task to prevent races).
-        # Fall back to a new Event only if the entry was removed externally.
-        interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
-        self._active_sessions[session_key] = interrupt_event
-        
         # Start continuous typing indicator (refreshes every 2 seconds).
         # Gated per-platform: when typing_indicator=False the refresh loop is
         # never spawned, so no "typing…" / "is thinking…" status is shown.
@@ -4879,7 +4916,7 @@ class BasePlatformAdapter(ABC):
             if (
                 response
                 and interrupt_event.is_set()
-                and session_key in self._pending_messages
+                and self._has_pending(session_key)
             ):
                 logger.info(
                     "[%s] Suppressing stale response for interrupted session %s",
@@ -5162,8 +5199,8 @@ class BasePlatformAdapter(ABC):
             await self._flush_text_debounce_now(session_key)
 
             # Check if there's a pending message that was queued during our processing
-            if session_key in self._pending_messages:
-                pending_event = self._pending_messages.pop(session_key)
+            if self._has_pending(session_key):
+                pending_event = self.get_pending_message(session_key)
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 # Keep the _active_sessions entry live across the turn chain
                 # and only CLEAR the interrupt Event — do NOT delete the entry.
@@ -5285,7 +5322,7 @@ class BasePlatformAdapter(ABC):
             # busy-handler path.  Without this block, we would delete the
             # active-session entry and the queued message would be silently
             # dropped (user never gets a reply).
-            late_pending = self._pending_messages.pop(session_key, None)
+            late_pending = self.get_pending_message(session_key)
             if late_pending is not None:
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)
@@ -5415,6 +5452,7 @@ class BasePlatformAdapter(ABC):
         self._expected_cancelled_tasks.clear()
         self._session_tasks.clear()
         self._pending_messages.clear()
+        self._overflow_map().clear()
         self._active_sessions.clear()
         for state in list(self._text_debounce_store().values()):
             if state.task is not None and not state.task.done():
@@ -5426,8 +5464,55 @@ class BasePlatformAdapter(ABC):
         return session_key in self._active_sessions and self._active_sessions[session_key].is_set()
     
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
-        """Get and clear any pending message for a session."""
-        return self._pending_messages.pop(session_key, None)
+        """Get and clear the next pending message for a session (slot, then overflow)."""
+        pending = self._pending_messages.pop(session_key, None)
+        if pending is not None:
+            return pending
+        overflow_map = self._overflow_map()
+        overflow = overflow_map.get(session_key)
+        if not overflow:
+            return None
+        pending = overflow.pop(0)
+        if not overflow:
+            overflow_map.pop(session_key, None)
+        return pending
+
+    def _overflow_map(self) -> Dict[str, List[MessageEvent]]:
+        # Some tests build adapters with object.__new__ and never run
+        # __init__; create the map lazily so those paths keep working.
+        overflow = getattr(self, "_pending_overflow", None)
+        if overflow is None:
+            overflow = {}
+            self._pending_overflow = overflow
+        return overflow
+
+    @property
+    def _dispatcher(self):
+        """Process wide conversation dispatcher (gateway/dispatch.py)."""
+        return get_dispatcher()
+
+    def _enqueue_pending_fifo(self, session_key: str, event: MessageEvent) -> int:
+        """Append a follow-up turn for a busy session, preserving arrival order.
+
+        The head lives in ``_pending_messages`` (so every existing drain site
+        sees it); later arrivals go to ``_pending_overflow``. Returns the
+        queue depth after the append.
+        """
+        if session_key not in self._pending_messages:
+            self._pending_messages[session_key] = event
+            return 1
+        tail = self._overflow_map().setdefault(session_key, [])
+        tail.append(event)
+        return 1 + len(tail)
+
+    def _has_pending(self, session_key: str) -> bool:
+        return session_key in self._pending_messages or bool(
+            self._overflow_map().get(session_key)
+        )
+
+    def _discard_pending(self, session_key: str) -> None:
+        self._pending_messages.pop(session_key, None)
+        self._overflow_map().pop(session_key, None)
     
     def build_source(
         self,
