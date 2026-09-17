@@ -56,6 +56,8 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
 from hermes_cli.config import cfg_get
+from gateway.message_failure import SAFE_FAILURE_TEXT, requires_safe_failure, destination_output_allowed
+from gateway.message_audience import OutputClass
 from hermes_cli.fallback_config import get_fallback_chain
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -407,6 +409,15 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     if len(body) > 400 or body.count("\n") > 4:
         return False
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
+
+
+def _gateway_output_allowed(runner, source, output_class) -> bool:
+    """Resolve output audience for the current target, never inherited DM trust."""
+    adapter = runner.adapters.get(source.platform)
+    return bool(adapter and destination_output_allowed(
+        adapter, source.chat_id, output_class,
+        workspace_id=getattr(source, "scope_id", None),
+    ))
 
 
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
@@ -2540,66 +2551,16 @@ def _normalize_empty_agent_response(
     *,
     history_len: int = 0,
 ) -> str:
-    """Normalize empty/None agent responses into user-facing messages.
+    """Render execution failure from structured state, never raw error prose.
 
-    Consolidates the existing ``failed`` handler and adds a catch-all for
-    the case where the agent did work (api_calls > 0) but returned no text.
-    Fix for #18765.
-
-    Also surfaces a retry hint when the agent never ran at all
-    (api_calls == 0) for a non-interrupted, non-failed turn -- this is the
-    silent-drop pattern observed after ``/stop`` where the next user
-    message hits a stale generation token and returns an empty result,
-    leaving the platform with nothing to send. (#31884)
+    history_len remains accepted for existing callers. It must not change the
+    outward failure message or expose provider/context implementation details.
     """
-    if response:
-        return response
+    from gateway.message_failure import normalize_agent_response
 
-    if agent_result.get("failed"):
-        error_detail = agent_result.get("error", "unknown error")
-        error_str = str(error_detail).lower()
-        is_context_failure = any(
-            p in error_str
-            for p in ("context", "token", "too large", "too long", "exceed", "payload")
-        ) or ("400" in error_str and history_len > 50)
-        if is_context_failure:
-            return (
-                "⚠️ Session too large for the model's context window.\n"
-                "Use /compact to compress the conversation, or "
-                "/reset to start fresh."
-            )
-        return (
-            f"The request failed: {str(error_detail)[:300]}\n"
-            "Try again or use /reset to start a fresh session."
-        )
-
-    api_calls = int(agent_result.get("api_calls", 0) or 0)
-    if api_calls > 0 and not agent_result.get("interrupted"):
-        if agent_result.get("partial"):
-            err = agent_result.get("error", "processing incomplete")
-            return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."
-        return (
-            "⚠️ Processing completed but no response was generated. "
-            "This may be a transient error — try sending your message again."
-        )
-
-    # api_calls == 0, not failed, not interrupted: the agent never ran for
-    # this turn. This is the post-/stop generation-race pattern where the
-    # gateway would otherwise silently drop the turn (response=0 chars) and
-    # the user sees no reply at all. Surface a short retry hint so the
-    # message isn't lost in silence. (#31884)
-    if (
-        api_calls == 0
-        and not agent_result.get("interrupted")
-        and not agent_result.get("failed")
-        and not agent_result.get("partial")
-    ):
-        return (
-            "⚠️ Your message wasn't processed (the previous turn was still "
-            "being cleaned up). Please send it again."
-        )
-
-    return response
+    if agent_result.get("error"):
+        logger.error("Agent result reported a failure: %s", agent_result["error"])
+    return normalize_agent_response(agent_result, response)
 
 
 def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
@@ -8580,6 +8541,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
+        if not _gateway_output_allowed(self, source, OutputClass.OPERATIONAL):
+            return
+        content = _sanitize_gateway_final_response(source.platform, content)
         adapter = self.adapters.get(source.platform)
         if not adapter:
             return
@@ -8623,6 +8587,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+        from gateway.message_audience import ParticipationDecision
+        from gateway.message_failure import authorized_delivery
+        decision = getattr(event, "_audience_decision", None)
+        if isinstance(decision, ParticipationDecision) and not decision.allow_model:
+            return None
+        if event.internal:
+            adapter = self.adapters.get(source.platform)
+            if not adapter:
+                return None
+            extra = getattr(adapter.config, "extra", {}) or {}
+            workspace = getattr(source, "scope_id", None) or (getattr(adapter, "_channel_team", {}) or {}).get(source.chat_id)
+            workspace = workspace or extra.get("workspace_id") or extra.get("scope_id")
+            if not authorized_delivery(adapter.config, source.platform, workspace, source.chat_id):
+                logger.debug("Synthetic turn suppressed: no scoped delivery authorization")
+                return None
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
@@ -9109,7 +9088,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         accepted = running_agent.steer(steer_text)
                     except Exception as exc:
                         logger.warning("Steer failed for session %s: %s", _quick_key, exc)
-                        return f"⚠️ Steer failed: {exc}"
+                        return SAFE_FAILURE_TEXT
                     if accepted:
                         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
                         return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
@@ -9780,7 +9759,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except asyncio.TimeoutError:
                             return "Quick command timed out (30s)."
                         except Exception as e:
-                            return f"Quick command error: {e}"
+                            logger.error("Quick command failed", exc_info=True)
+                            return SAFE_FAILURE_TEXT
                     else:
                         return f"Quick command '/{command}' has no command defined."
                 elif qcmd.get("type") == "alias":
@@ -10932,16 +10912,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     if _comp is not None and getattr(_comp, "_last_compress_aborted", False):
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
                                         _warn_msg = (
-                                            "⚠️ Context compression aborted "
-                                            f"({_err}). No messages were dropped — "
-                                            "conversation is unchanged. Run /compress "
-                                            "to retry, /reset for a clean session, or "
-                                            "check your auxiliary.compression model "
-                                            "configuration."
+                                            "Conversation maintenance could not finish. "
+                                            "Your messages are unchanged."
                                         )
+                                        logger.warning("Compression aborted: %s", _err)
                                         try:
                                             _adapter = self.adapters.get(source.platform)
-                                            if _adapter and source.chat_id:
+                                            if (_adapter and source.chat_id
+                                                    and _gateway_output_allowed(self, source, OutputClass.OPERATIONAL)):
                                                 await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
                                         except Exception as _werr:
                                             logger.warning(
@@ -10958,14 +10936,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         _aux_model = getattr(_comp, "_last_aux_model_failure_model", "")
                                         _aux_err = getattr(_comp, "_last_aux_model_failure_error", None) or "unknown error"
                                         _aux_msg = (
-                                            f"ℹ️ Configured compression model `{_aux_model}` "
-                                            f"failed ({_aux_err}). Recovered using your main "
-                                            "model — context is intact — but you may want to "
-                                            "check `auxiliary.compression.model` in config.yaml."
+                                            "Conversation maintenance recovered successfully. "
+                                            "Your messages are intact."
                                         )
+                                        logger.warning("Compression model %s fallback: %s", _aux_model, _aux_err)
                                         try:
                                             _adapter = self.adapters.get(source.platform)
-                                            if _adapter and source.chat_id:
+                                            if (_adapter and source.chat_id
+                                                    and _gateway_output_allowed(self, source, OutputClass.OPERATIONAL)):
                                                 await _adapter.send(source.chat_id, _aux_msg, metadata=_hyg_meta)
                                         except Exception as _werr:
                                             logger.warning(
@@ -11290,7 +11268,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if source.platform == Platform.MATTERMOST
                     else getattr(self, "_show_reasoning", False)
                 )
-            if _show_reasoning_effective and response and not _intentional_silence:
+            if (_show_reasoning_effective and response and not _intentional_silence
+                    and _gateway_output_allowed(self, source, OutputClass.REASONING)):
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
                     # Collapse long reasoning to keep messages readable
@@ -11343,6 +11322,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
+                _footer_line = ""
+            if not _gateway_output_allowed(self, source, OutputClass.RUNTIME_INTERNALS):
                 _footer_line = ""
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
@@ -11690,7 +11671,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # content the user hasn't seen (streaming only sent earlier
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
-            if agent_result.get("already_sent") and not agent_result.get("failed"):
+            if (agent_result.get("already_sent") and not requires_safe_failure(agent_result)
+                    and response != SAFE_FAILURE_TEXT):
                 if response:
                     _media_adapter = self.adapters.get(source.platform)
                     if _media_adapter:
@@ -12940,8 +12922,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             result = await self._run_in_executor_with_context(run_sync)
 
             response = result.get("final_response", "") if result else ""
-            if not response and result and result.get("error"):
-                response = f"Error: {result['error']}"
+            if result and requires_safe_failure(result):
+                logger.warning("Background task returned unsuccessful result: %r", result.get("error"))
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=SAFE_FAILURE_TEXT,
+                    metadata={**(_thread_metadata or {}), "_hermes_output_class": OutputClass.SAFE_ERROR},
+                )
+                return
 
             # Extract media files from the response
             if response:
@@ -13028,7 +13016,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
+                    content=SAFE_FAILURE_TEXT,
                     metadata=_thread_metadata,
                 )
             except Exception:
@@ -13703,9 +13691,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is ``None`` (buttons are self-explanatory); if we fell back to
         text the message itself IS the ack.
         """
+        source = event.source
+        if (source.platform == Platform.SLACK
+                and not _gateway_output_allowed(self, source, OutputClass.OPERATIONAL)):
+            return None
         from tools import slash_confirm as _slash_confirm_mod
 
-        source = event.source
         session_key = self._session_key_for_source(source)
         # Bare-runner test harnesses (object.__new__(GatewayRunner)) skip
         # __init__ and don't have the counter attribute — fall back to a
@@ -13769,13 +13760,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         reply_to_message_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Build the metadata dict platforms need for thread-aware replies."""
-        return self._thread_metadata_for_target(
+        metadata = self._thread_metadata_for_target(
             getattr(source, "platform", None),
             getattr(source, "chat_id", None),
             getattr(source, "thread_id", None),
             chat_type=getattr(source, "chat_type", None),
             reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None),
         )
+        if source.platform == Platform.SLACK and getattr(source, "scope_id", None):
+            metadata = {**(metadata or {}), "slack_team_id": source.scope_id}
+        return metadata
 
     def _thread_metadata_for_target(
         self,
@@ -16074,7 +16068,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
-        if _streaming_enabled:
+        if _streaming_enabled and _gateway_output_allowed(self, source, OutputClass.PROGRESS):
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                 _adapter = self.adapters.get(source.platform)
@@ -16154,7 +16148,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             resp.status, proxy_url, error_text[:500],
                         )
                         return {
-                            "final_response": f"⚠️ Proxy error ({resp.status}): {error_text[:300]}",
+                            "final_response": SAFE_FAILURE_TEXT,
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
@@ -16210,7 +16204,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.error("Proxy connection error to %s: %s", proxy_url, e)
             if not full_response:
                 return {
-                    "final_response": f"⚠️ Proxy connection error: {e}",
+                    "final_response": SAFE_FAILURE_TEXT,
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
@@ -16552,7 +16546,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
                 if not progress_queue:
                     return
-            if not progress_queue or not _run_still_current():
+            if (not progress_queue or not _run_still_current()
+                    or not _gateway_output_allowed(self, source, OutputClass.PROGRESS)):
                 return
 
             # First-touch onboarding: the first time a tool takes longer than
@@ -16835,6 +16830,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pass
 
         async def send_progress_messages():
+            if not _gateway_output_allowed(self, source, OutputClass.PROGRESS):
+                return
             if not progress_queue:
                 return
 
@@ -17228,6 +17225,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
+            if not _gateway_output_allowed(self, source, OutputClass.PROGRESS):
+                return
             if not _status_adapter or not _run_still_current():
                 return
             prepared_message = _prepare_gateway_status_message(
@@ -17319,8 +17318,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     model, runtime_kwargs.get("provider"), session_key or "",
                 )
             except Exception as exc:
+                logger.error("Provider authentication failed", exc_info=True)
                 return {
-                    "final_response": f"⚠️ Provider authentication failed: {exc}",
+                    "final_response": SAFE_FAILURE_TEXT,
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
@@ -17353,8 +17353,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
-            _want_stream_deltas = _streaming_enabled
-            _want_interim_messages = interim_assistant_messages_enabled
+            _allow_live_output = _gateway_output_allowed(self, source, OutputClass.PROGRESS)
+            _want_stream_deltas = _streaming_enabled and _allow_live_output
+            _want_interim_messages = interim_assistant_messages_enabled and _allow_live_output
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
                 try:
@@ -17425,6 +17426,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+                if not _gateway_output_allowed(self, source, OutputClass.PROGRESS):
+                    return
                 if not _run_still_current():
                     return
                 if _stream_consumer is not None:
@@ -17681,6 +17684,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _bg_review_pending_lock = threading.Lock()
 
             def _deliver_bg_review_message(message: str) -> None:
+                if not _gateway_output_allowed(self, source, OutputClass.OPERATIONAL):
+                    return
                 if not _status_adapter or not _run_still_current():
                     return
                 safe_schedule_threadsafe(
@@ -17884,6 +17889,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 UX.  Otherwise fall back to a plain text message with
                 ``/approve`` instructions.
                 """
+                if (source.platform == Platform.SLACK
+                        and not _gateway_output_allowed(self, source, OutputClass.OPERATIONAL)):
+                    return
                 # Pause the typing indicator while the agent waits for
                 # user approval.  Critical for Slack's Assistant API where
                 # assistant_threads_setStatus disables the compose box — the
@@ -18321,8 +18329,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result, final_response or "", history_len=len(agent_history),
                 )
                 final_response = _sanitize_gateway_final_response(source.platform, final_response)
-                if not final_response:
-                    final_response = f"⚠️ {result['error']}" if result.get("error") else ""
                 return {
                     "final_response": final_response,
                     "messages": result.get("messages", []),
@@ -18431,6 +18437,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "completed": result_holder[0].get("completed") if result_holder[0] else None,
+                "failed": result_holder[0].get("failed", False) if result_holder[0] else False,
                 "interrupted": result_holder[0].get("interrupted", False) if result_holder[0] else False,
                 "partial": result_holder[0].get("partial", False) if result_holder[0] else False,
                 "error": result_holder[0].get("error") if result_holder[0] else None,
@@ -18621,6 +18628,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _notify_start = time.time()
 
         async def _notify_long_running():
+            if not _gateway_output_allowed(self, source, OutputClass.PROGRESS):
+                return
             if _NOTIFY_INTERVAL is None:
                 return  # Notifications disabled (gateway_notify_interval: 0)
             _notify_adapter = self.adapters.get(source.platform)
@@ -19288,7 +19297,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # final answer.  Suppressing delivery here leaves the user staring
         # at silence.  (#10xxx — "agent stops after web search")
         _sc = stream_consumer_holder[0]
-        if isinstance(response, dict) and not response.get("failed"):
+        if isinstance(response, dict) and not requires_safe_failure(response):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
             # response_previewed means the interim_assistant_callback already

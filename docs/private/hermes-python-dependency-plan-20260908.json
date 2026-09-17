@@ -1,0 +1,257 @@
+{
+  "created_at": "2026-09-08T16:48:56.077128+00:00",
+  "scope": "AST and TOML/source metadata only; no Hermes/dependency imports, installs or tests",
+  "target": {
+    "python": "CPython 3.13, normal GIL build",
+    "os": "macOS",
+    "architecture": "arm64",
+    "venv": "/Users/affoon/GitHub/hermes-desk-20260908/03-fork/validation-environment/python-telegram"
+  },
+  "source_head": "330b9f7425c8e137e4f18e288e7520903121c615",
+  "source_sha256": {
+    "pyproject.toml": "df32d3d22b681cbb5b98a18709bd3c4ec5fbe9e2c20956e9fb4eec84329ba33c",
+    "uv.lock": "bc97d06f35c40c4a725e9efe60ee16b720460308a47961faf21c4779e434000a",
+    "scripts/run_tests.sh": "e40e4d8cbf417a8aacf0c2bab67e43e42232df5cab3526950073262f4fd29d00",
+    "scripts/run_tests_parallel.py": "338978835b49d96527ca0f562c4e1c2d894513487826bcf894730df3268047a1"
+  },
+  "packages": [
+    {
+      "name": "anyio",
+      "version": "4.12.1",
+      "role": "required closure",
+      "dependencies": [
+        {
+          "name": "idna"
+        },
+        {
+          "name": "typing-extensions",
+          "marker": "python_full_version < '3.13'"
+        }
+      ],
+      "wheel": {
+        "url": "https://files.pythonhosted.org/packages/38/0e/27be9fdef66e72d64c0cdc3cc2823101b80585f8119b5c112c2e8f5f7dab/anyio-4.12.1-py3-none-any.whl",
+        "hash": "sha256:d405828884fc140aa80a3c667b8beed277f1dfedec42ba031bd6ac3db606ab6c",
+        "size": 113592,
+        "upload-time": "2026-01-06T11:45:19.497Z"
+      }
+    },
+    {
+      "name": "certifi",
+      "version": "2026.5.20",
+      "role": "required closure",
+      "dependencies": [],
+      "wheel": {
+        "url": "https://files.pythonhosted.org/packages/59/8c/57e832b7af6d7c5abe66eb3fbe3a3a32f4d11ea23a1aa7131371035be991/certifi-2026.5.20-py3-none-any.whl",
+        "hash": "sha256:3c52e209ba0a4ad7aebe60436a4ab349c39e1e602e8c134221e546902ad25897",
+        "size": 134134,
+        "upload-time": "2026-05-20T11:46:48.578Z"
+      }
+    },
+    {
+      "name": "h11",
+      "version": "0.16.0",
+      "role": "required closure",
+      "dependencies": [],
+      "wheel": {
+        "url": "https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl",
+        "hash": "sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86",
+        "size": 37515,
+        "upload-time": "2025-04-24T03:35:24.344Z"
+      }
+    },
+    {
+      "name": "httpcore",
+      "version": "1.0.9",
+      "role": "required closure",
+      "dependencies": [
+        {
+          "name": "certifi"
+        },
+        {
+          "name": "h11"
+        }
+      ],
+      "wheel": {
+        "url": "https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl",
+        "hash": "sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55",
+        "size": 78784,
+        "upload-time": "2025-04-24T22:06:20.566Z"
+      }
+    },
+    {
+      "name": "httpx",
+      "version": "0.28.1",
+      "role": "required closure",
+      "dependencies": [
+        {
+          "name": "anyio"
+        },
+        {
+          "name": "certifi"
+        },
+        {
+          "name": "httpcore"
+        },
+        {
+          "name": "idna"
+        }
+      ],
+      "wheel": {
+        "url": "https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl",
+        "hash": "sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad",
+        "size": 73517,
+        "upload-time": "2024-12-06T15:37:21.509Z"
+      }
+    },
+    {
+      "name": "idna",
+      "version": "3.15",
+      "role": "required closure",
+      "dependencies": [],
+      "wheel": {
+        "url": "https://files.pythonhosted.org/packages/d2/23/408243171aa9aaba178d3e2559159c24c1171a641aa83b67bdd3394ead8e/idna-3.15-py3-none-any.whl",
+        "hash": "sha256:048adeaf8c2d788c40fee287673ccaa74c24ffd8dcf09ffa555a2fbb59f10ac8",
+        "size": 72340,
+        "upload-time": "2026-05-12T22:45:55.733Z"
+      }
+    },
+    {
+      "name": "iniconfig",
+      "version": "2.3.0",
+      "role": "required closure",
+      "dependencies": [],
+      "wheel": {
+        "url": "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl",
+        "hash": "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12",
+        "size": 7484,
+        "upload-time": "2025-10-18T21:55:41.639Z"
+      }
+    },
+    {
+      "name": "packaging",
+      "version": "26.0",
+      "role": "required closure",
+      "dependencies": [],
+      "wheel": {
+        "url": "https://files.pythonhosted.org/packages/b7/b9/c538f279a4e237a006a2c98387d081e9eb060d203d8ed34467cc0f0b9b53/packaging-26.0-py3-none-any.whl",
+        "hash": "sha256:b36f1fef9334a5588b4166f8bcd26a14e521f2b55e6b9de3aaa80d3ff7a37529",
+        "size": 74366,
+        "upload-time": "2026-01-21T20:50:37.788Z"
+      }
+    },
+    {
+      "name": "pluggy",
+      "version": "1.6.0",
+      "role": "required closure",
+      "dependencies": [],
+      "wheel": {
+        "url": "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl",
+        "hash": "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746",
+        "size": 20538,
+        "upload-time": "2025-05-15T12:30:06.134Z"
+      }
+    },
+    {
+      "name": "psutil",
+      "version": "7.2.2",
+      "role": "process-protection fixture; optional for collection",
+      "dependencies": [],
+      "wheel": {
+        "url": "https://files.pythonhosted.org/packages/80/c4/f5af4c1ca8c1eeb2e92ccca14ce8effdeec651d5ab6053c589b074eda6e1/psutil-7.2.2-cp36-abi3-macosx_11_0_arm64.whl",
+        "hash": "sha256:1a7b04c10f32cc88ab39cbf606e117fd74721c831c98a27dc04578deb0c16979",
+        "size": 129859,
+        "upload-time": "2026-01-28T18:15:23.795Z"
+      }
+    },
+    {
+      "name": "pygments",
+      "version": "2.19.2",
+      "role": "required closure",
+      "dependencies": [],
+      "wheel": {
+        "url": "https://files.pythonhosted.org/packages/c7/21/705964c7812476f378728bdf590ca4b771ec72385c533964653c68e86bdc/pygments-2.19.2-py3-none-any.whl",
+        "hash": "sha256:86540386c03d588bb81d44bc3928634ff26449851e99741617ecb9037ee5ec0b",
+        "size": 1225217,
+        "upload-time": "2025-06-21T13:39:07.939Z"
+      }
+    },
+    {
+      "name": "pytest",
+      "version": "9.0.2",
+      "role": "required closure",
+      "dependencies": [
+        {
+          "name": "colorama",
+          "marker": "sys_platform == 'win32'"
+        },
+        {
+          "name": "iniconfig"
+        },
+        {
+          "name": "packaging"
+        },
+        {
+          "name": "pluggy"
+        },
+        {
+          "name": "pygments"
+        }
+      ],
+      "wheel": {
+        "url": "https://files.pythonhosted.org/packages/3b/ab/b3226f0bd7cdcf710fbede2b3548584366da3b19b5021e74f5bde2a8fa3f/pytest-9.0.2-py3-none-any.whl",
+        "hash": "sha256:711ffd45bf766d5264d487b917733b453d917afd2b0ad65223959f59089f875b",
+        "size": 374801,
+        "upload-time": "2025-12-06T21:30:49.154Z"
+      }
+    },
+    {
+      "name": "python-telegram-bot",
+      "version": "22.6",
+      "role": "required closure",
+      "dependencies": [
+        {
+          "name": "httpx"
+        }
+      ],
+      "wheel": {
+        "url": "https://files.pythonhosted.org/packages/13/97/7298f0e1afe3a1ae52ff4c5af5087ed4de319ea73eb3b5c8c4dd4e76e708/python_telegram_bot-22.6-py3-none-any.whl",
+        "hash": "sha256:e598fe171c3dde2dfd0f001619ee9110eece66761a677b34719fb18934935ce0",
+        "size": 737267,
+        "upload-time": "2026-01-24T13:56:58.06Z"
+      }
+    },
+    {
+      "name": "pyyaml",
+      "version": "6.0.3",
+      "role": "required closure",
+      "dependencies": [],
+      "wheel": {
+        "url": "https://files.pythonhosted.org/packages/b1/16/95309993f1d3748cd644e02e38b75d50cbc0d9561d21f390a76242ce073f/pyyaml-6.0.3-cp313-cp313-macosx_11_0_arm64.whl",
+        "hash": "sha256:2283a07e2c21a2aa78d9c4442724ec1eb15f5e42a723b99cb3d822d48f5f7ad1",
+        "size": 173252,
+        "upload-time": "2025-09-25T21:32:25.149Z"
+      }
+    }
+  ],
+  "required_package_count": 13,
+  "guard_package_count": 1,
+  "selected_wheel_bytes": 3252666,
+  "requirements_sha256": "562bf57ebd86e28959bc8a837ddd6cea96ca6236d8b5f4c611045e4ab91415ff",
+  "excluded_optional_jiter": {
+    "version": "0.13.0",
+    "reason": "agent/jiter_preload.py catches missing native import; no SDK request path exercised"
+  },
+  "missing_evidence": [
+    "Root-selected separate interpreter and venv receipt, resolved wheel METADATA/install report",
+    "Root-reviewed sanitized Python launcher and network/install guard path, hash and review receipt; none supplied in lane validation-environment",
+    "Canonical runner duration and gateway conftest .pytest-cache output redirection, preserving existing repository outputs",
+    "Serialized Python test execution lease"
+  ],
+  "runtime_verified": false,
+  "static_review": {
+    "reviewer": "cache_security_review",
+    "result": "No additional mandatory package found; launcher approval pending",
+    "incorporated_finding": "Gateway conftest writes/prunes cwd/.pytest-cache independently of pytest cache flags",
+    "runtime_executed": false
+  }
+}

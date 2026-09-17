@@ -7,6 +7,7 @@ and implement the required methods.
 
 import asyncio
 import inspect
+from functools import wraps
 import ipaddress
 import logging
 import os
@@ -63,9 +64,11 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     ``direct_messages_topic_id`` when the Bot API supports it.
     """
     thread_id = getattr(source, "thread_id", None)
+    scope_id = getattr(source, "scope_id", None)
+    scoped = {"slack_team_id": scope_id} if scope_id and _platform_name(getattr(source, "platform", None)) == "slack" else {}
     if thread_id is None:
-        return None
-    metadata = {"thread_id": thread_id}
+        return scoped or None
+    metadata = {**scoped, "thread_id": thread_id}
     if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
         metadata["telegram_dm_topic_reply_fallback"] = True
         tid = str(thread_id)
@@ -2322,6 +2325,69 @@ class BasePlatformAdapter(ABC):
     # generic seam; Slack is merely the first consumer).
     supports_inchannel_continuable: bool = False
 
+    def __init_subclass__(cls, **kwargs):
+        """Keep subclass transport overrides inside the shared text boundary."""
+        super().__init_subclass__(**kwargs)
+        text_methods = {"send", "edit_message", "send_draft", "send_private_notice"}
+        slack_direct_methods = {"send_image_file", "send_image", "send_voice", "send_video",
+                                "send_document", "send_multiple_images", "send_exec_approval", "send_slash_confirm"}
+        for name in text_methods | slack_direct_methods:
+            method = cls.__dict__.get(name)
+            if method is None or getattr(method, "_audience_guarded", False):
+                continue
+            signature = inspect.signature(method)
+
+            def protect(method, signature, name):
+                @wraps(method)
+                async def guarded(self, *args, **kwargs):
+                    from gateway.message_audience import OutputClass
+                    from gateway.message_failure import prepare_outbound_text, destination_output_allowed, DeliveryPolicyDenied
+
+                    if name in slack_direct_methods and self.platform != Platform.SLACK:
+                        return await method(self, *args, **kwargs)
+
+                    bound = signature.bind(self, *args, **kwargs)
+                    metadata = bound.arguments.get("metadata") or {}
+                    binding = getattr(self, "_bind_delivery_metadata", None)
+                    if callable(binding):
+                        try:
+                            metadata = binding(bound.arguments.get("chat_id"), metadata)
+                        except DeliveryPolicyDenied:
+                            if name == "send_multiple_images":
+                                return None
+                            return SendResult(success=False, error="audience_policy_suppressed", raw_response={"suppressed": True})
+                        if "metadata" in signature.parameters:
+                            bound.arguments["metadata"] = metadata
+                    kind = metadata.get("_hermes_output_class", OutputClass.FINAL)
+                    if name in {"send_exec_approval", "send_slash_confirm"} and kind is OutputClass.FINAL:
+                        kind = OutputClass.OPERATIONAL
+                    chat_id = bound.arguments.get("chat_id")
+                    if (not isinstance(kind, OutputClass)
+                            or not destination_output_allowed(self, chat_id, kind, metadata)
+                            or (name in {"send_exec_approval", "send_slash_confirm"}
+                                and not destination_output_allowed(self, chat_id, OutputClass.OPERATIONAL, metadata))):
+                        if name == "send_multiple_images":
+                            return None  # Existing batch contract has no delivery result.
+                        return SendResult(success=False, error="audience_policy_suppressed",
+                                          raw_response={"suppressed": True})
+                    for field in ("content", "caption", "command", "description", "title", "message"):
+                        if field in bound.arguments and bound.arguments[field] is not None:
+                            bound.arguments[field] = prepare_outbound_text(bound.arguments[field], kind)
+                    if name == "send_multiple_images" and "images" in bound.arguments:
+                        bound.arguments["images"] = [
+                            (url, prepare_outbound_text(caption, kind))
+                            for url, caption in bound.arguments["images"]
+                        ]
+                    if "metadata" in bound.arguments and "_hermes_output_class" in metadata:
+                        bound.arguments["metadata"] = {
+                            key: value for key, value in metadata.items() if key != "_hermes_output_class"
+                        }
+                    return await method(*bound.args, **bound.kwargs)
+                guarded._audience_guarded = True
+                return guarded
+
+            setattr(cls, name, protect(method, signature, name))
+
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
@@ -4088,6 +4154,7 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
+        from gateway.message_failure import is_terminal_delivery_failure
         result = await self.send(
             chat_id=chat_id,
             content=content,
@@ -4095,7 +4162,7 @@ class BasePlatformAdapter(ABC):
             metadata=metadata,
         )
 
-        if result.success:
+        if result.success or is_terminal_delivery_failure(result):
             return result
 
         error_str = result.error or ""
@@ -4128,6 +4195,8 @@ class BasePlatformAdapter(ABC):
                     reply_to=reply_to,
                     metadata=metadata,
                 )
+                if is_terminal_delivery_failure(result):
+                    return result
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
@@ -4592,6 +4661,21 @@ class BasePlatformAdapter(ABC):
         """
         if not self._message_handler:
             return
+
+        from gateway.message_audience import ParticipationDecision
+        from gateway.message_failure import authorized_delivery
+        decision = getattr(event, "_audience_decision", None)
+        if isinstance(decision, ParticipationDecision) and not decision.allow_model:
+            return
+        if event.internal:
+            workspace = getattr(event.source, "scope_id", None) or (
+                getattr(self, "_channel_team", {}) or {}
+            ).get(event.source.chat_id)
+            if not workspace:
+                workspace = (self.config.extra or {}).get("workspace_id") or (self.config.extra or {}).get("scope_id")
+            if not authorized_delivery(self.config, self.platform, workspace, event.source.chat_id):
+                logger.debug("Synthetic delivery suppressed: no scoped authorization")
+                return
 
         coerce_plaintext_gateway_command(event)
 
@@ -5210,18 +5294,13 @@ class BasePlatformAdapter(ABC):
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            # Send the error to the user so they aren't left with radio silence
+            # Acknowledge failure without exposing exception details to the channel.
             try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
+                from gateway.message_failure import SAFE_FAILURE_TEXT
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                 await self.send(
                     chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
+                    content=SAFE_FAILURE_TEXT,
                     metadata=_thread_metadata,
                 )
             except Exception as notify_err:
@@ -5445,6 +5524,7 @@ class BasePlatformAdapter(ABC):
         parent_chat_id: Optional[str] = None,
         message_id: Optional[str] = None,
         role_authorized: bool = False,
+        scope_id: Optional[str] = None,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform."""
         # Normalize empty topic to None
@@ -5452,6 +5532,7 @@ class BasePlatformAdapter(ABC):
             chat_topic = None
         return SessionSource(
             platform=self.platform,
+            scope_id=scope_id,
             chat_id=str(chat_id),
             chat_name=chat_name,
             chat_type=chat_type,

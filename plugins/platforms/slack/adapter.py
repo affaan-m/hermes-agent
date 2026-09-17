@@ -73,6 +73,12 @@ _slash_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     default=None,
 )
 
+# Invocation-local private intent survives expiry/consumption of its response
+# context. It is never inferred from model-supplied delivery metadata.
+_slash_reply_context: contextvars.ContextVar[Optional[tuple]] = contextvars.ContextVar(
+    "_slash_reply_context", default=None,
+)
+
 
 @dataclass
 class _ThreadContextCache:
@@ -110,6 +116,35 @@ def check_slack_requirements() -> bool:
     from tools.lazy_deps import ensure_and_bind
 
     return ensure_and_bind("platform.slack", _import, globals(), prompt=False)
+
+
+def _participation_text(event: dict, fallback: str) -> str:
+    """Use authored content for addressing; quotes and code remain context."""
+    rich = [b for b in (event.get("blocks") or []) if b.get("type") == "rich_text"]
+    if rich:
+        parts = []
+        def visit(element):
+            kind = element.get("type")
+            if kind in {"rich_text_quote", "rich_text_preformatted"}:
+                return
+            if element.get("style", {}).get("code"):
+                return
+            if kind == "text":
+                parts.append(element.get("text", ""))
+            elif kind == "user":
+                parts.append(f"<@{element.get('user_id', '')}>")
+            else:
+                for child in element.get("elements", []):
+                    visit(child)
+        for block in rich:
+            visit(block)
+            parts.append("\n")
+        fallback = "".join(parts)
+    # Older/plain Slack payloads have no rich_text tree. Ignore quoted lines
+    # and fenced/inline code rather than treating their mentions as requests.
+    fallback = re.sub(r"```.*?(?:```|$)|`[^`\n]*(?:`|$)", "", fallback, flags=re.DOTALL)
+    return "\n".join(line for line in fallback.splitlines()
+                     if not line.lstrip().startswith((">", "&gt;"))).strip()
 
 
 def _extract_text_from_slack_blocks(blocks: list) -> str:
@@ -478,7 +513,7 @@ class SlackAdapter(BasePlatformAdapter):
         # can route the first reply ephemerally.  Keyed by
         # (channel_id, user_id) to avoid cross-user collisions.
         # Each value: {"response_url": str, "ts": float}
-        self._slash_command_contexts: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._slash_command_contexts: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         # Socket Mode resilience: track runtime connection state so we can
         # self-heal when Slack silently drops the websocket.
         self._app_token: Optional[str] = None
@@ -753,17 +788,14 @@ class SlackAdapter(BasePlatformAdapter):
     def _pop_slash_context(
         self,
         chat_id: str,
+        metadata=None,
     ) -> Optional[Dict[str, Any]]:
         """Return and remove the slash-command context for *chat_id*, if fresh.
 
         Contexts older than ``_SLASH_CTX_TTL`` seconds are silently discarded.
 
-        Uses the ``_slash_user_id`` ContextVar (set in ``_handle_slash_command``)
-        to match the exact ``(channel_id, user_id)`` key.  This prevents a
-        concurrent slash command from a different user on the same channel from
-        stealing another user's ephemeral context.  Falls back to a
-        channel-only scan when the ContextVar is unset (e.g. send() called
-        from a non-slash code path — should not match anything).
+        Uses the slash user ContextVar and bound workspace to match the exact
+        channel/user/workspace. Unrelated sends cannot consume private context.
         """
         now = time.monotonic()
         # Clean up stale entries on every lookup — dict is small.
@@ -775,21 +807,23 @@ class SlackAdapter(BasePlatformAdapter):
         for k in stale_keys:
             self._slash_command_contexts.pop(k, None)
 
-        # Precise match: (channel_id, user_id) from ContextVar.
+        # Precise match includes workspace even when channel/user IDs collide.
         uid = _slash_user_id.get()
-        if uid:
-            return self._slash_command_contexts.pop((chat_id, uid), None)
-
-        # Fallback: channel-only scan (only reachable when ContextVar is
-        # unset, i.e. send() called outside a slash-command async context).
-        match_key = None
-        for key in list(self._slash_command_contexts):
-            if key[0] == chat_id:
-                match_key = key
-                break
-        if match_key is None:
-            return None
-        return self._slash_command_contexts.pop(match_key)
+        team_id = self._metadata_team_id(metadata)
+        invocation = _slash_reply_context.get()
+        if invocation is not None:
+            key, ctx = invocation
+            if key != (chat_id, uid, team_id):
+                return None
+            if ctx.get("consumed") or now - ctx["ts"] > self._SLASH_CTX_TTL:
+                return None
+            ctx["consumed"] = True
+            if self._slash_command_contexts.get(key) is ctx:
+                self._slash_command_contexts.pop(key, None)
+            return ctx
+        if uid and team_id:
+            return self._slash_command_contexts.pop((chat_id, uid, team_id), None)
+        return None
 
     async def _send_slash_ephemeral(
         self,
@@ -803,11 +837,9 @@ class SlackAdapter(BasePlatformAdapter):
         lets us swap the "Running /cmd…" placeholder with the real reply,
         and the message stays ephemeral ("Only visible to you").
 
-        Returns ``success=False`` on delivery failure so the caller
-        (``send()`` / the stream consumer) falls back to normal channel
-        delivery — the reply must never be silently dropped just because
-        the ephemeral swap failed.  The initial "Running /cmd…" ack stays
-        up either way.
+        Returns ``success=False`` on delivery failure. ``send()`` preserves
+        that result without promoting a private reply into the public channel.
+        The initial "Running /cmd…" ack stays up either way.
         """
         formatted = self.format_message(content)
         # Slack's response_url has the same ~40k char limit as chat_postMessage.
@@ -1053,6 +1085,7 @@ class SlackAdapter(BasePlatformAdapter):
             # / ``_team_bot_user_ids`` entries from the prior session.
             self._bot_user_id = None
             self._team_clients = {}
+            self._primary_team_id = None
             self._team_bot_user_ids = {}
 
             # First token is the primary — used for AsyncApp / Socket Mode
@@ -1078,6 +1111,7 @@ class SlackAdapter(BasePlatformAdapter):
                 # token's identity even on reconnect.
                 if self._bot_user_id is None:
                     self._bot_user_id = bot_user_id
+                    self._primary_team_id = team_id
 
                 logger.info(
                     "[Slack] Authenticated as @%s in workspace %s (team: %s)",
@@ -1349,8 +1383,35 @@ class SlackAdapter(BasePlatformAdapter):
 
         logger.info("[Slack] Disconnected")
 
-    def _get_client(self, chat_id: str) -> Any:
+    @staticmethod
+    def _metadata_team_id(metadata) -> str:
+        return str((metadata or {}).get("team_id") or (metadata or {}).get("team")
+                   or (metadata or {}).get("slack_team_id") or "")
+
+    def _bind_delivery_metadata(self, chat_id, metadata):
+        """Pin the authorized workspace to the client used by this delivery."""
+        from gateway.message_failure import DeliveryPolicyDenied
+        routed = dict(metadata or {})
+        requested = {routed[key] for key in ("team_id", "team", "slack_team_id") if routed.get(key)}
+        if len(requested) > 1:
+            raise DeliveryPolicyDenied("ambiguous_workspace")
+        team_id = self._metadata_team_id(routed)
+        if team_id and team_id not in self._team_clients:
+            raise DeliveryPolicyDenied("unknown_workspace")
+        team_id = team_id or self._channel_team.get(str(chat_id)) or getattr(self, "_primary_team_id", None)
+        if team_id in self._team_clients:
+            routed["slack_team_id"] = team_id
+        else:
+            routed.pop("slack_team_id", None)
+        return routed
+
+    def _get_client(self, chat_id: str, team_id: Optional[str] = None) -> Any:
         """Return the workspace-specific WebClient for a channel."""
+        if team_id:
+            if team_id not in self._team_clients:
+                from gateway.message_failure import DeliveryPolicyDenied
+                raise DeliveryPolicyDenied("unknown_workspace")
+            return self._team_clients[team_id]
         team_id = self._channel_team.get(chat_id)
         if team_id and team_id in self._team_clients:
             return self._team_clients[team_id]
@@ -1373,12 +1434,27 @@ class SlackAdapter(BasePlatformAdapter):
             # already showed an ephemeral "Running /cmd…" message.  If we have
             # a stashed response_url for this channel, replace that ack with
             # the actual command reply ephemerally instead of posting publicly.
-            slash_ctx = self._pop_slash_context(chat_id)
+            slash_ctx = self._pop_slash_context(chat_id, metadata=metadata)
+            invocation = _slash_reply_context.get()
+            if not slash_ctx and invocation is not None and invocation[0] == (
+                chat_id, _slash_user_id.get(), self._metadata_team_id(metadata)
+            ):
+                return SendResult(success=False, error="private_delivery_failed",
+                                  retryable=False, error_kind="private_delivery_failed")
             if slash_ctx:
-                return await self._send_slash_ephemeral(
-                    slash_ctx,
-                    content,
-                )
+                try:
+                    private_result = await self._send_slash_ephemeral(
+                        slash_ctx,
+                        content,
+                    )
+                except Exception:
+                    logger.exception("[Slack] Private reply failed")
+                    return SendResult(success=False, error="private_delivery_failed",
+                                      retryable=False, error_kind="private_delivery_failed")
+                if not private_result.success:
+                    from dataclasses import replace
+                    return replace(private_result, retryable=False, error_kind="private_delivery_failed")
+                return private_result
 
             # Convert standard markdown → Slack mrkdwn
             formatted = self.format_message(content)
@@ -1414,11 +1490,11 @@ class SlackAdapter(BasePlatformAdapter):
                     if broadcast and i == 0:
                         kwargs["reply_broadcast"] = True
 
-                last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+                last_result = await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).chat_postMessage(**kwargs)
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
-                await self.stop_typing(chat_id)
+                await self.stop_typing(chat_id, metadata=metadata)
 
             # Track the sent message ts so we can auto-respond to thread
             # replies without requiring @mention.
@@ -1469,7 +1545,7 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postEphemeral(**kwargs)
+            result = await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).chat_postEphemeral(**kwargs)
             return SendResult(
                 success=True,
                 message_id=result.get("message_ts") or result.get("ts"),
@@ -1486,6 +1562,7 @@ class SlackAdapter(BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent Slack message."""
         if not self._app:
@@ -1496,6 +1573,9 @@ class SlackAdapter(BasePlatformAdapter):
                 "channel": chat_id,
                 "ts": message_id,
                 "text": formatted,
+                # Explicitly remove any previous rich content when replacing
+                # it with plain text, including a safe failure notification.
+                "blocks": [],
             }
             # Only render Block Kit on the FINAL edit. Intermediate streaming
             # edits stay plain mrkdwn — re-deriving a full block layout on every
@@ -1505,9 +1585,9 @@ class SlackAdapter(BasePlatformAdapter):
                 blocks = self._maybe_blocks(content)
                 if blocks:
                     update_kwargs["blocks"] = blocks
-            await self._get_client(chat_id).chat_update(**update_kwargs)
+            await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).chat_update(**update_kwargs)
             if finalize:
-                await self.stop_typing(chat_id)
+                await self.stop_typing(chat_id, metadata=metadata)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
@@ -1538,7 +1618,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         self._active_status_threads[chat_id] = thread_ts
         try:
-            await self._get_client(chat_id).assistant_threads_setStatus(
+            await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).assistant_threads_setStatus(
                 channel_id=chat_id,
                 thread_ts=thread_ts,
                 status="is thinking...",
@@ -1556,7 +1636,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not thread_ts:
             return
         try:
-            await self._get_client(chat_id).assistant_threads_setStatus(
+            await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).assistant_threads_setStatus(
                 channel_id=chat_id,
                 thread_ts=thread_ts,
                 status="",
@@ -1691,7 +1771,7 @@ class SlackAdapter(BasePlatformAdapter):
         last_exc = None
         for attempt in range(3):
             try:
-                result = await self._get_client(chat_id).files_upload_v2(
+                result = await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).files_upload_v2(
                     channel=chat_id,
                     file=file_path,
                     filename=os.path.basename(file_path),
@@ -1818,7 +1898,7 @@ class SlackAdapter(BasePlatformAdapter):
                     chunk_idx + 1,
                     len(chunks),
                 )
-                result = await self._get_client(chat_id).files_upload_v2(
+                result = await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).files_upload_v2(
                     channel=chat_id,
                     file_uploads=file_uploads,
                     initial_comment=initial_comment,
@@ -2184,7 +2264,7 @@ class SlackAdapter(BasePlatformAdapter):
                 response.raise_for_status()
 
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
-            result = await self._get_client(chat_id).files_upload_v2(
+            result = await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).files_upload_v2(
                 channel=chat_id,
                 content=response.content,
                 filename="image.png",
@@ -2260,7 +2340,7 @@ class SlackAdapter(BasePlatformAdapter):
             last_exc = None
             for attempt in range(3):
                 try:
-                    result = await self._get_client(chat_id).files_upload_v2(
+                    result = await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).files_upload_v2(
                         channel=chat_id,
                         file=video_path,
                         filename=os.path.basename(video_path),
@@ -2320,7 +2400,7 @@ class SlackAdapter(BasePlatformAdapter):
             last_exc = None
             for attempt in range(3):
                 try:
-                    result = await self._get_client(chat_id).files_upload_v2(
+                    result = await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).files_upload_v2(
                         channel=chat_id,
                         file=file_path,
                         filename=display_name,
@@ -2492,6 +2572,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         source = self.build_source(
             chat_id=channel_id,
+            scope_id=metadata.get("team_id") or None,
             chat_name=channel_id,
             chat_type="dm",
             user_id=user_id,
@@ -2824,57 +2905,51 @@ class SlackAdapter(BasePlatformAdapter):
                 # further changes.
                 thread_ts = None
 
-        # In channels, respond if:
-        #   0. Channel is in free_response_channels, OR require_mention is
-        #      disabled — always process regardless of mention.
-        #   1. The bot is @mentioned in this message, OR
-        #   2. The message is a reply in a thread the bot started/participated in, OR
-        #   3. The message is in a thread where the bot was previously @mentioned, OR
-        #   4. There's an existing session for this thread (survives restarts)
+        # Current explicit requests authorize participation. A historical bot
+        # reply, mentioned thread or persisted session is context, not consent.
+        from gateway.message_audience import ParticipationSignals, decide_participation
+        from gateway.message_failure import channel_policy_inputs
+
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
-        routing_text = original_text or ""
-        is_mentioned = bool(
-            (bot_uid and f"<@{bot_uid}>" in routing_text)
-            or self._slack_message_matches_mention_patterns(routing_text)
-        )
+        routing_text = _participation_text(event, original_text or "")
+        mentions = set(re.findall(r"<@([A-Za-z0-9]+)>", routing_text))
+        explicit_bot_mention = bool(bot_uid and bot_uid in mentions)
+        other_human_address = bool(mentions - ({bot_uid} if bot_uid else set()))
+        is_mentioned = bool(explicit_bot_mention or (
+            not other_human_address and self._slack_message_matches_mention_patterns(routing_text)
+        ))
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
-
-        if not is_one_to_one_dm and bot_uid:
-            # Check allowed channels — if set, only respond in these channels (whitelist)
+        explicit_command = False
+        if routing_text.startswith(("/", "!")):
+            from hermes_cli.commands import is_gateway_known_command
+            command_name, _, suffix = routing_text.split(maxsplit=1)[0][1:].partition("@")
+            aliases = self.config.extra.get("bot_command_aliases", [])
+            aliases = aliases if isinstance(aliases, list) else []
+            directed_here = not suffix or suffix in [bot_uid, *aliases]
+            explicit_command = bool(directed_here and command_name and is_gateway_known_command(command_name.lower()))
+        if not is_one_to_one_dm:
             allowed_channels = self._slack_allowed_channels()
             if allowed_channels and channel_id not in allowed_channels:
-                logger.debug(
-                    "[Slack] Ignoring message in non-allowed channel: %s", channel_id
-                )
                 return
-
-            if channel_id in self._slack_free_response_channels():
-                logger.info("[Slack][SLKTRACE] free-response pass ch=%s", channel_id)
-                pass  # Free-response channel — always process
-            elif not self._slack_require_mention():
-                pass  # Mention requirement disabled globally for Slack
-            elif self._slack_strict_mention() and not is_mentioned:
-                return  # Strict mode: ignore until @-mentioned again
-            elif not is_mentioned:
-                reply_to_bot_thread = (
-                    is_thread_reply and event_thread_ts in self._bot_message_ts
-                )
-                in_mentioned_thread = (
-                    event_thread_ts is not None
-                    and event_thread_ts in self._mentioned_threads
-                )
-                has_session = is_thread_reply and self._has_active_session_for_thread(
-                    channel_id=channel_id,
-                    thread_ts=event_thread_ts,
-                    user_id=user_id,
-                )
-                if (
-                    not reply_to_bot_thread
-                    and not in_mentioned_thread
-                    and not has_session
-                ):
-                    return
+        identity, policies = channel_policy_inputs(self.config, self.platform, team_id, channel_id)
+        operator_ids = self.config.extra.get("operator_user_ids", [])
+        sender_is_operator = isinstance(operator_ids, list) and user_id in operator_ids
+        participation = decide_participation(identity, ParticipationSignals(
+            addressed_to_agent=is_mentioned,
+            addressed_to_other_human=other_human_address,
+            explicit_command=explicit_command,
+            direct_message=bool(is_one_to_one_dm),
+            substantive_text=bool(routing_text.strip()),
+            has_attachments=bool(event.get("files") or event.get("attachments")),
+            sender_is_operator=bool(sender_is_operator),
+            sender_is_bot=bool(event.get("bot_id") or event.get("subtype") == "bot_message"),
+            open_question=routing_text.rstrip().endswith("?"),
+            thread_participation=bool(is_thread_reply),
+        ), policies)
+        if not participation.allow_model:
+            logger.debug("Slack participation suppressed: %s", participation.reason)
+            return
 
         if is_mentioned:
             # Strip the bot mention from the text
@@ -2906,7 +2981,7 @@ class SlackAdapter(BasePlatformAdapter):
                         text = original_text
                 except Exception:  # pragma: no cover - defensive
                     pass
-            # Register this thread so all future messages auto-trigger the bot.
+            # Retain thread context; participation still requires a new request.
             # Skipped in strict mode: strict_mention=true bots must be
             # re-mentioned every turn, so remembering the thread would
             # defeat the feature (and re-enable agent-to-agent ack loops).
@@ -3199,6 +3274,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Build source
         source = self.build_source(
             chat_id=channel_id,
+            scope_id=team_id or None,
             chat_name=channel_id,  # Will be resolved later if needed
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
@@ -3255,7 +3331,7 @@ class SlackAdapter(BasePlatformAdapter):
         _addressed_bot = bool(
             is_one_to_one_dm
             or is_mentioned
-            or (is_thread_reply and event_thread_ts in self._bot_message_ts)
+            or explicit_command
         )
         msg_event = MessageEvent(
             text=text,
@@ -3276,6 +3352,8 @@ class SlackAdapter(BasePlatformAdapter):
         # MPIMs are shared surfaces: reacting to every group-DM message (even
         # when unmentioned) is visible noise to the whole group, so they must
         # be @mentioned to earn a reaction — same as any channel.
+        msg_event._audience_decision = participation
+
         _should_react = (is_one_to_one_dm or is_mentioned) and self._reactions_enabled()
         if _should_react:
             self._reacting_message_ids.add(ts)
@@ -3365,7 +3443,7 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            result = await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).chat_postMessage(**kwargs)
             msg_ts = result.get("ts", "")
             if msg_ts:
                 self._approval_resolved[msg_ts] = False
@@ -3443,7 +3521,7 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            result = await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).chat_postMessage(**kwargs)
             return SendResult(
                 success=True, message_id=result.get("ts", ""), raw_response=result
             )
@@ -3761,7 +3839,7 @@ class SlackAdapter(BasePlatformAdapter):
             return cached.content
 
         try:
-            client = self._get_client(channel_id)
+            client = self._get_client(channel_id, team_id=team_id or None)
 
             # Retry with exponential backoff for Tier-3 rate limits (429).
             result = None
@@ -3922,7 +4000,7 @@ class SlackAdapter(BasePlatformAdapter):
             return cached.parent_text
 
         try:
-            client = self._get_client(channel_id)
+            client = self._get_client(channel_id, team_id=team_id or None)
             result = await client.conversations_replies(
                 channel=channel_id,
                 ts=thread_ts,
@@ -4003,6 +4081,7 @@ class SlackAdapter(BasePlatformAdapter):
         is_dm = str(channel_id).startswith("D")
         source = self.build_source(
             chat_id=channel_id,
+            scope_id=team_id or None,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
         )
@@ -4023,18 +4102,24 @@ class SlackAdapter(BasePlatformAdapter):
         # questions via "/hermes <question>" must produce public replies so
         # the whole channel can see the agent's answer.
         response_url = command.get("response_url", "")
+        private_context = None
         if response_url and user_id and channel_id and text.startswith("/"):
-            self._slash_command_contexts[(channel_id, user_id)] = {
+            key = (channel_id, user_id, team_id)
+            ctx = {
                 "response_url": response_url,
                 "ts": time.monotonic(),
             }
+            self._slash_command_contexts[key] = ctx
+            private_context = (key, ctx)
 
         # Set the ContextVar so send() can match the correct stashed
         # response_url even when multiple users slash concurrently.
         _slash_user_id_token = _slash_user_id.set(user_id or None)
+        _slash_reply_token = _slash_reply_context.set(private_context)
         try:
             await self.handle_message(event)
         finally:
+            _slash_reply_context.reset(_slash_reply_token)
             _slash_user_id.reset(_slash_user_id_token)
 
     def _has_active_session_for_thread(
@@ -4350,6 +4435,8 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    output_class=None,
+    metadata=None,
 ):
     """Out-of-process Slack delivery via the Web API ``chat.postMessage``.
 
@@ -4362,6 +4449,24 @@ async def _standalone_send(
     throwaway ``SlackAdapter`` instance's ``format_message`` — so cron-delivered
     Slack messages render identically to gateway-delivered ones.
     """
+    from gateway.message_failure import authorized_delivery, destination_output_allowed, prepare_outbound_text
+    from gateway.message_audience import OutputClass
+    from gateway.message_failure import check_delivery, DeliveryPolicyDenied, policy_denial
+    try:
+        metadata = check_delivery(pconfig, "slack", chat_id, metadata=metadata, output_class=output_class)
+    except DeliveryPolicyDenied:
+        return policy_denial()
+    from types import SimpleNamespace
+    extra = getattr(pconfig, "extra", {}) or {}
+    workspace_id = extra.get("workspace_id") or extra.get("scope_id")
+    if not authorized_delivery(pconfig, "slack", workspace_id, chat_id):
+        return {"success": False, "error": "delivery_not_authorized"}
+    kind = metadata["_hermes_output_class"]
+    target = SimpleNamespace(config=pconfig, platform="slack")
+    if not isinstance(kind, OutputClass) or not destination_output_allowed(target, chat_id, kind):
+        return {"success": False, "error": "audience_policy_suppressed"}
+    message = prepare_outbound_text(message, kind)
+
     token = getattr(pconfig, "token", None) or os.getenv("SLACK_BOT_TOKEN", "")
     if not token:
         return {"error": "Slack send failed: SLACK_BOT_TOKEN not configured"}

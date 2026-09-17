@@ -408,6 +408,12 @@ def _handle_send(args):
     if duplicate_skip:
         return json.dumps(duplicate_skip)
 
+    from gateway.message_failure import check_delivery, DeliveryPolicyDenied, policy_denial
+    try:
+        check_delivery(pconfig, platform, chat_id)
+    except DeliveryPolicyDenied:
+        return json.dumps(policy_denial())
+
     # Slack: resolve user IDs (U...) to DM channel IDs via conversations.open
     if platform_name == "slack" and chat_id and chat_id.startswith("U"):
         try:
@@ -634,6 +640,8 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    metadata=None,
+    output_class=None,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -646,6 +654,15 @@ async def _send_via_adapter(
          the runner weakref is ``None``).
       3. A descriptive error explaining both options.
     """
+    from gateway.message_failure import check_delivery, DeliveryPolicyDenied, policy_denial, is_terminal_delivery_failure, terminal_failure_result, prepare_outbound_text
+    try:
+        metadata = check_delivery(pconfig, platform, chat_id, metadata=metadata, output_class=output_class)
+    except DeliveryPolicyDenied:
+        return policy_denial()
+    chunk = prepare_outbound_text(chunk, metadata["_hermes_output_class"])
+    from gateway.message_audience import OutputClass
+    if metadata["_hermes_output_class"] is OutputClass.SAFE_ERROR:
+        media_files = []
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     runner = None
     try:
@@ -661,7 +678,8 @@ async def _send_via_adapter(
             adapter = None
         if adapter is not None:
             try:
-                metadata = {}
+                metadata = check_delivery(pconfig, platform, chat_id, adapter=adapter,
+                    metadata=metadata, output_class=metadata["_hermes_output_class"])
                 if thread_id:
                     metadata["thread_id"] = thread_id
                 if platform_name == "ntfy" and chat_id:
@@ -669,10 +687,14 @@ async def _send_via_adapter(
                 if not metadata:
                     metadata = None
                 result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+            except DeliveryPolicyDenied:
+                return policy_denial()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 return {"error": f"Plugin platform send failed: {e}"}
+            if is_terminal_delivery_failure(result):
+                return terminal_failure_result(result)
             if result.success:
                 return {"success": True, "message_id": result.message_id}
             return {"error": f"Adapter send failed: {result.error}"}
@@ -693,6 +715,7 @@ async def _send_via_adapter(
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                **_standalone_policy_kwargs(entry.standalone_sender_fn, metadata),
             )
         except asyncio.CancelledError:
             raise
@@ -720,7 +743,7 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, *, metadata=None, output_class=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -728,6 +751,16 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     (preserves code-block boundaries, adds part indicators).
     """
     from gateway.config import Platform
+    from gateway.message_failure import check_delivery, DeliveryPolicyDenied, policy_denial, prepare_outbound_text
+    try:
+        metadata = check_delivery(pconfig, platform, chat_id, metadata=metadata, output_class=output_class)
+    except DeliveryPolicyDenied:
+        return policy_denial()
+    message = prepare_outbound_text(message, metadata["_hermes_output_class"])
+    from gateway.message_audience import OutputClass
+    output_class = metadata["_hermes_output_class"]
+    if output_class is OutputClass.SAFE_ERROR:
+        media_files = []
 
     media_files = media_files or []
 
@@ -959,22 +992,23 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 result = {"error": "Slack plugin not registered or missing standalone_sender_fn"}
             else:
                 result = await _slack_entry.standalone_sender_fn(
-                    pconfig, chat_id, chunk, thread_id=thread_id
+                    pconfig, chat_id, chunk, thread_id=thread_id,
+                    metadata=metadata, output_class=output_class,
                 )
         elif platform == Platform.WHATSAPP:
-            result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id)
+            result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id, metadata=metadata, output_class=output_class)
         elif platform == Platform.SIGNAL:
             result = await _send_signal(pconfig.extra, chat_id, chunk)
         elif platform == Platform.EMAIL:
-            result = await _registry_standalone_send("email", pconfig, chat_id, chunk, thread_id)
+            result = await _registry_standalone_send("email", pconfig, chat_id, chunk, thread_id, metadata=metadata, output_class=output_class)
         elif platform == Platform.SMS:
-            result = await _registry_standalone_send("sms", pconfig, chat_id, chunk, thread_id)
+            result = await _registry_standalone_send("sms", pconfig, chat_id, chunk, thread_id, metadata=metadata, output_class=output_class)
         elif platform == Platform.DINGTALK:
-            result = await _registry_standalone_send("dingtalk", pconfig, chat_id, chunk, thread_id)
+            result = await _registry_standalone_send("dingtalk", pconfig, chat_id, chunk, thread_id, metadata=metadata, output_class=output_class)
         elif platform == Platform.FEISHU:
-            result = await _registry_standalone_send("feishu", pconfig, chat_id, chunk, thread_id)
+            result = await _registry_standalone_send("feishu", pconfig, chat_id, chunk, thread_id, metadata=metadata, output_class=output_class)
         elif platform == Platform.WECOM:
-            result = await _registry_standalone_send("wecom", pconfig, chat_id, chunk, thread_id)
+            result = await _registry_standalone_send("wecom", pconfig, chat_id, chunk, thread_id, metadata=metadata, output_class=output_class)
         elif platform == Platform.BLUEBUBBLES:
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
         elif platform == Platform.QQBOT:
@@ -992,6 +1026,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                metadata=metadata, output_class=output_class,
             )
 
         if isinstance(result, dict) and result.get("error"):
@@ -1260,20 +1295,43 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
 # (plugins/platforms/slack/adapter.py), wired via standalone_sender_fn. #41112.
 
 
-async def _registry_standalone_send(platform_name, pconfig, chat_id, message, thread_id=None):
+def _standalone_policy_kwargs(sender, metadata):
+    """Forward policy/routing to capable plugins after the shared guard.
+
+    Older non-Slack plugins retain their contract; their supplied target and
+    prepared content were already checked by this dispatcher.
+    """
+    import inspect
+    parameters = inspect.signature(sender).parameters
+    result = {}
+    if "metadata" in parameters:
+        result["metadata"] = metadata
+    if "output_class" in parameters:
+        result["output_class"] = metadata["_hermes_output_class"]
+    return result
+
+
+async def _registry_standalone_send(platform_name, pconfig, chat_id, message, thread_id=None, *, metadata=None, output_class=None):
     """Dispatch a one-shot send through a migrated platform plugin's
     standalone_sender_fn (registry hook).  Used for platforms whose adapter
     moved out of gateway/platforms/ into plugins/platforms/<name>/ (#41112):
     the legacy inline ``_send_<platform>`` helper now lives in the plugin as
     ``_standalone_send`` and is reached via the platform registry.
     """
+    from gateway.message_failure import check_delivery, DeliveryPolicyDenied, policy_denial, prepare_outbound_text
+    try:
+        bound = check_delivery(pconfig, platform_name, chat_id, metadata=metadata, output_class=output_class)
+    except DeliveryPolicyDenied:
+        return policy_denial()
+    message = prepare_outbound_text(message, bound["_hermes_output_class"])
     from gateway.platform_registry import platform_registry
     from hermes_cli.plugins import discover_plugins
     discover_plugins()  # idempotent — ensure the entry is registered
     entry = platform_registry.get(platform_name)
     if entry is None or entry.standalone_sender_fn is None:
         return {"error": f"{platform_name} plugin not registered or missing standalone_sender_fn"}
-    return await entry.standalone_sender_fn(pconfig, chat_id, message, thread_id=thread_id)
+    return await entry.standalone_sender_fn(pconfig, chat_id, message, thread_id=thread_id,
+        **_standalone_policy_kwargs(entry.standalone_sender_fn, bound))
 
 
 # _send_whatsapp moved to plugins/platforms/whatsapp/adapter.py::_standalone_send,

@@ -154,6 +154,7 @@ class DeliveryTarget:
     thread_id: Optional[str] = None
     is_origin: bool = False
     is_explicit: bool = False  # True if chat_id was explicitly specified
+    scope_id: Optional[str] = None
     
     @classmethod
     def parse(cls, target: str, origin: Optional[SessionSource] = None) -> "DeliveryTarget":
@@ -176,6 +177,7 @@ class DeliveryTarget:
                     chat_id=origin.chat_id,
                     thread_id=origin.thread_id,
                     is_origin=True,
+                    scope_id=getattr(origin, "scope_id", None),
                 )
             else:
                 # Fallback to local if no origin
@@ -298,7 +300,7 @@ class DeliveryRouter:
                         self.dead_targets.clear(target.platform.value, target.chat_id)
                 
                 results[target.to_string()] = {
-                    "success": True,
+                    "success": not _send_result_failed(result),
                     "result": result
                 }
             except Exception as e:
@@ -399,6 +401,20 @@ class DeliveryRouter:
         
         if not target.chat_id:
             raise ValueError(f"No chat ID for {target.platform.value} delivery")
+
+        from gateway.message_failure import check_delivery, DeliveryPolicyDenied, policy_denial, is_terminal_delivery_failure, terminal_failure_result, prepare_outbound_text
+        from gateway.message_audience import OutputClass
+        send_metadata = dict(metadata or {})
+        if target.scope_id:
+            send_metadata["slack_team_id" if target.platform == Platform.SLACK else "scope_id"] = target.scope_id
+        kind = send_metadata.get("_hermes_output_class", OutputClass.FINAL)
+        try:
+            send_metadata = check_delivery(adapter.config, target.platform, target.chat_id,
+                adapter=adapter, metadata=send_metadata, output_class=kind)
+        except DeliveryPolicyDenied:
+            return policy_denial()
+        if kind is OutputClass.SAFE_ERROR:
+            content = prepare_outbound_text(content, kind)
         
         # Guard: handle oversized cron output.
         #
@@ -442,7 +458,7 @@ class DeliveryRouter:
                 # retry it here (a failure now is a real delivery problem).
                 if saved_path is None:
                     saved_path = self._save_full_output(content, job_id)
-                footer = f"\n\n... [truncated, full output saved to {saved_path}]"
+                footer = "\n\n... [truncated]"
                 visible = max(0, MAX_PLATFORM_OUTPUT - len(footer))
                 logger.info(
                     "Cron output truncated (%d chars) — full output: %s",
@@ -471,7 +487,8 @@ class DeliveryRouter:
                 "delivered": False,
             }
 
-        send_metadata = dict(metadata or {})
+        # Last content boundary after router-owned additions, before topic or transport work.
+        content = prepare_outbound_text(content, kind)
         is_named_telegram_private_topic = False
         named_telegram_private_topic_name: Optional[str] = None
         if target.thread_id:
@@ -525,6 +542,8 @@ class DeliveryRouter:
             elif "thread_id" not in send_metadata and "message_thread_id" not in send_metadata and not has_explicit_direct_topic:
                 send_metadata["thread_id"] = target_thread_id
         result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
+        if is_terminal_delivery_failure(result):
+            return terminal_failure_result(result)
         if _send_result_failed(result):
             if (
                 is_named_telegram_private_topic
@@ -548,10 +567,10 @@ class DeliveryRouter:
                 send_metadata["thread_id"] = str(refreshed_thread_id)
                 send_metadata["telegram_dm_topic_created_for_send"] = True
                 result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
+                if is_terminal_delivery_failure(result):
+                    return terminal_failure_result(result)
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
-
-
 
 

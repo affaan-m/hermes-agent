@@ -193,8 +193,11 @@ gateway/delivery.py
 gateway/display_config.py
 gateway/drain_control.py
 gateway/hooks.py
+gateway/host_identity.py
 gateway/kanban_watchers.py
 gateway/memory_monitor.py
+gateway/message_audience.py
+gateway/message_failure.py
 gateway/message_timestamps.py
 gateway/mirror.py
 gateway/pairing.py
@@ -212,6 +215,7 @@ gateway/shutdown_forensics.py
 gateway/slash_access.py
 gateway/slash_commands.py
 gateway/status.py
+gateway/sticker_cache.py
 gateway/stream_consumer.py
 gateway/stream_dispatch.py
 gateway/stream_events.py
@@ -452,6 +456,7 @@ hermes_cli/subcommands/version.py
 hermes_cli/subcommands/webhook.py
 hermes_cli/subcommands/whatsapp.py
 hermes_cli/web_dist/favicon.ico
+hermes_cli/web_dist/favicon.svg
 hermes_cli/web_dist/index.html
 hermes_cli/web_dist/assets/Collapse-Bold-mgICk9-_.woff2
 hermes_cli/web_dist/assets/Collapse-Regular-DysayoTY.woff2
@@ -460,8 +465,8 @@ hermes_cli/web_dist/assets/RulesCompressed-Medium-CA76_CrB.woff2
 hermes_cli/web_dist/assets/RulesCompressed-Regular-BSXFyF4x.woff2
 hermes_cli/web_dist/assets/RulesExpanded-Bold-DZA7s8Pa.woff2
 hermes_cli/web_dist/assets/RulesExpanded-Regular-l8uVympt.woff2
+hermes_cli/web_dist/assets/index-COKpaZgT.js
 hermes_cli/web_dist/assets/index-OT1jQL5E.css
-hermes_cli/web_dist/assets/index-WrAtZQWO.js
 hermes_cli/web_dist/fonts/Collapse-Bold.woff2
 hermes_cli/web_dist/fonts/Collapse-Regular.woff2
 hermes_cli/web_dist/fonts/Mondwest-Regular.woff2
@@ -1194,6 +1199,18 @@ plugins/teams_pipeline/plugin.yaml
 plugins/teams_pipeline/runtime.py
 plugins/teams_pipeline/store.py
 plugins/teams_pipeline/subscriptions.py
+plugins/temporal_knowledge/README.md
+plugins/temporal_knowledge/__init__.py
+plugins/temporal_knowledge/desk_graphiti_service.py
+plugins/temporal_knowledge/desk_service.py
+plugins/temporal_knowledge/ingest_events.py
+plugins/temporal_knowledge/ingest_ledger.py
+plugins/temporal_knowledge/memory_layers.py
+plugins/temporal_knowledge/ontology.py
+plugins/temporal_knowledge/plugin.yaml
+plugins/temporal_knowledge/temporal_graph.py
+plugins/temporal_knowledge/test_desk_graphiti.py
+plugins/temporal_knowledge/test_pluto_timeline.py
 plugins/video_gen/fal/__init__.py
 plugins/video_gen/fal/plugin.yaml
 plugins/video_gen/xai/__init__.py

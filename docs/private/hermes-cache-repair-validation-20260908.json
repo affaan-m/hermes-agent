@@ -1,0 +1,248 @@
+{
+  "source_session": "7000f9ed-0eb9-4da1-b525-b1490771ba24",
+  "head": "330b9f7425c8e137e4f18e288e7520903121c615",
+  "tests_prepared_at": "2026-09-08T15:42:55.700611+00:00",
+  "production_absent_when_tests_prepared": true,
+  "tests_before_restore": {
+    "tests/gateway/test_sticker_cache.py": "e4038a06d4c32124f992c018cc4b7e36c0d1dbf6a9530c0c691d3e9102087ef4",
+    "apps/desktop/src/app/session/hooks/use-session-state-cache.test.tsx": "990941863216885fa4c2334496000b1dff79dd7ab05a184eda3787ef4d1dc6db",
+    "ui-tui/packages/hermes-ink/src/ink/cache-recovery.test.ts": "0876e6523b8bb5ff39ed8966ed1eef23dfddf815a8483f54194e2ba6d2510aa7"
+  },
+  "test_execution": "Accepted: 23 Node tests plus 21 real-SDK Python tests, total 44 focused tests; temporary Ink source bundle passed. Python exit 0, no skips/failures/guard denials.",
+  "python_test_ast": "passed without executing imports",
+  "production_expected_blobs": {
+    "gateway/sticker_cache.py": "c53681730674e252ba770c23f7024d480f245358",
+    "apps/desktop/src/app/session/hooks/use-session-state-cache.ts": "3f8e02c8ca8a24a25996554a798a1634882008b6",
+    "ui-tui/packages/hermes-ink/src/ink/cache-eviction.ts": "f0155eb9b0d2c4d282dbf4d76f874aa11eba30b3",
+    "ui-tui/packages/hermes-ink/src/ink/line-width-cache.ts": "71b02b62268fd2081112bff15ff21479eaa37171",
+    "ui-tui/packages/hermes-ink/src/ink/node-cache.ts": "fe11e067ec1348d05883953aac180ff93c466a58"
+  },
+  "static_checked_at": "2026-09-08T15:48:36.913994+00:00",
+  "production_verified": {
+    "gateway/sticker_cache.py": {
+      "blob": "c53681730674e252ba770c23f7024d480f245358",
+      "mode": "100644",
+      "sha256": "d5688da3d264687f1cb283c0c33fd03c09f2e63d747c321fca77142dcd6a41a3"
+    },
+    "apps/desktop/src/app/session/hooks/use-session-state-cache.ts": {
+      "blob": "3f8e02c8ca8a24a25996554a798a1634882008b6",
+      "mode": "100644",
+      "sha256": "a9b7d1292201709866a15ec506e559cbaceb5fee9b2f0c2fb0e4faad6e6bf5b9"
+    },
+    "ui-tui/packages/hermes-ink/src/ink/cache-eviction.ts": {
+      "blob": "f0155eb9b0d2c4d282dbf4d76f874aa11eba30b3",
+      "mode": "100644",
+      "sha256": "a4dcae372de666769a3022443a05c9a58bd9b59279c681b5b0daea2954b1e9e5"
+    },
+    "ui-tui/packages/hermes-ink/src/ink/line-width-cache.ts": {
+      "blob": "71b02b62268fd2081112bff15ff21479eaa37171",
+      "mode": "100644",
+      "sha256": "9acf76f6d0bcc6b454fbfa21b18e01a32d2a52d12570bd7a3e11c01693719c9e"
+    },
+    "ui-tui/packages/hermes-ink/src/ink/node-cache.ts": {
+      "blob": "fe11e067ec1348d05883953aac180ff93c466a58",
+      "mode": "100644",
+      "sha256": "d12a9ea4f4e7c7ef732296855eb5e92b5ffa0f63ca7b541c3000c39ba8d85147"
+    }
+  },
+  "python_syntax": "AST and compile passed without execution for production cache and test file",
+  "upstream_tests_preserved": {
+    "python_classes_unchanged": [
+      "TestLoadSaveCache",
+      "TestCacheSticker",
+      "TestBuildStickerInjection",
+      "TestBuildAnimatedStickerInjection"
+    ],
+    "desktop_original_cases_unchanged": true
+  },
+  "direct_ts_source_imports_resolved": [
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/cache-recovery.test.ts",
+      "target": "../utils/sliceAnsi.js"
+    },
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/cache-recovery.test.ts",
+      "target": "./cache-eviction.js"
+    },
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/cache-recovery.test.ts",
+      "target": "./dom.js"
+    },
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/cache-recovery.test.ts",
+      "target": "./line-width-cache.js"
+    },
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/cache-recovery.test.ts",
+      "target": "./measure-text.js"
+    },
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/cache-recovery.test.ts",
+      "target": "./node-cache.js"
+    },
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/cache-recovery.test.ts",
+      "target": "./stringWidth.js"
+    },
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/cache-recovery.test.ts",
+      "target": "./wrap-text.js"
+    },
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/cache-eviction.ts",
+      "target": "../utils/sliceAnsi.js"
+    },
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/cache-eviction.ts",
+      "target": "./line-width-cache.js"
+    },
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/cache-eviction.ts",
+      "target": "./stringWidth.js"
+    },
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/cache-eviction.ts",
+      "target": "./wrap-text.js"
+    },
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/node-cache.ts",
+      "target": "./dom.js"
+    },
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/node-cache.ts",
+      "target": "./layout/geometry.js"
+    },
+    {
+      "caller": "apps/desktop/src/app/session/hooks/use-session-state-cache.ts",
+      "target": "@/lib/chat-messages"
+    },
+    {
+      "caller": "apps/desktop/src/app/session/hooks/use-session-state-cache.ts",
+      "target": "@/lib/chat-messages"
+    },
+    {
+      "caller": "apps/desktop/src/app/session/hooks/use-session-state-cache.ts",
+      "target": "@/lib/chat-runtime"
+    },
+    {
+      "caller": "apps/desktop/src/app/session/hooks/use-session-state-cache.ts",
+      "target": "@/lib/mutable-ref"
+    },
+    {
+      "caller": "apps/desktop/src/app/session/hooks/use-session-state-cache.ts",
+      "target": "@/store/session"
+    },
+    {
+      "caller": "apps/desktop/src/app/session/hooks/use-session-state-cache.ts",
+      "target": "../../types"
+    },
+    {
+      "caller": "apps/desktop/src/app/session/hooks/use-session-state-cache.test.tsx",
+      "target": "@/lib/chat-messages"
+    },
+    {
+      "caller": "apps/desktop/src/app/session/hooks/use-session-state-cache.test.tsx",
+      "target": "@/store/session"
+    },
+    {
+      "caller": "apps/desktop/src/app/session/hooks/use-session-state-cache.test.tsx",
+      "target": "@/store/session"
+    },
+    {
+      "caller": "apps/desktop/src/app/session/hooks/use-session-state-cache.test.tsx",
+      "target": "./use-session-state-cache"
+    },
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/line-width-cache.ts",
+      "target": "./lru.js"
+    },
+    {
+      "caller": "ui-tui/packages/hermes-ink/src/ink/line-width-cache.ts",
+      "target": "./stringWidth.js"
+    }
+  ],
+  "typescript_typecheck": "NOT RUN; focused Vitest/esbuild results do not establish full typecheck.",
+  "code_test_paths": [
+    "apps/desktop/src/app/session/hooks/use-session-state-cache.test.tsx",
+    "apps/desktop/src/app/session/hooks/use-session-state-cache.ts",
+    "gateway/sticker_cache.py",
+    "tests/gateway/test_sticker_cache.py",
+    "ui-tui/packages/hermes-ink/src/ink/cache-eviction.ts",
+    "ui-tui/packages/hermes-ink/src/ink/cache-recovery.test.ts",
+    "ui-tui/packages/hermes-ink/src/ink/line-width-cache.ts",
+    "ui-tui/packages/hermes-ink/src/ink/node-cache.ts"
+  ],
+  "tracked_callers_and_license_unchanged": true,
+  "current_file_sha256": {
+    "apps/desktop/src/app/session/hooks/use-session-state-cache.test.tsx": "990941863216885fa4c2334496000b1dff79dd7ab05a184eda3787ef4d1dc6db",
+    "apps/desktop/src/app/session/hooks/use-session-state-cache.ts": "a9b7d1292201709866a15ec506e559cbaceb5fee9b2f0c2fb0e4faad6e6bf5b9",
+    "gateway/sticker_cache.py": "d5688da3d264687f1cb283c0c33fd03c09f2e63d747c321fca77142dcd6a41a3",
+    "tests/gateway/test_sticker_cache.py": "7dbd5837a7271b5185a5ee83d3eb896f41d0e37e14bb13c9eaeab942022d90f4",
+    "ui-tui/packages/hermes-ink/src/ink/cache-eviction.ts": "a4dcae372de666769a3022443a05c9a58bd9b59279c681b5b0daea2954b1e9e5",
+    "ui-tui/packages/hermes-ink/src/ink/cache-recovery.test.ts": "0876e6523b8bb5ff39ed8966ed1eef23dfddf815a8483f54194e2ba6d2510aa7",
+    "ui-tui/packages/hermes-ink/src/ink/line-width-cache.ts": "9acf76f6d0bcc6b454fbfa21b18e01a32d2a52d12570bd7a3e11c01693719c9e",
+    "ui-tui/packages/hermes-ink/src/ink/node-cache.ts": "d12a9ea4f4e7c7ef732296855eb5e92b5ffa0f63ca7b541c3000c39ba8d85147"
+  },
+  "independent_review": {
+    "code": "APPROVED static final patch; SDK mock bypass and cleanup corrected",
+    "security": "APPROVED static final patch; SDK/canonical adapter module and parent-binding cleanup corrected",
+    "runtime_review": "Node focused tests/bundle passed on reviewed manifest; root accepted final Python 21/21 run with no denials. See ROOT-PYTHON-VALIDATION.json."
+  },
+  "patch_manifest_sha256": "d23558fe4bb353681d33de74d9d688929885c5f87fe54be2b2403b2b761e911f",
+  "patch_manifest_format": "SHA256 of sorted UTF-8 records: path + NUL + four-digit octal permissions + NUL + file SHA256 + LF",
+  "review_findings_resolved": [
+    "Gateway conftest SDK mocks cannot satisfy the actual-SDK fixture.",
+    "Fixture restores SDK and canonical Telegram module trees, unique adapter module, sys.path and parent binding even after failure."
+  ],
+  "tests_modified_after_initial_checkpoint": "Python test fixture refined during independent review; current_file_sha256 identifies final reviewed bytes.",
+  "node_validation": {
+    "receipt": "docs/private/hermes-node-lease-20260908.json",
+    "results": {
+      "desktop_tests_passed": 12,
+      "ink_tests_passed": 11,
+      "total_tests_passed": 23,
+      "test_files_passed": 3,
+      "failed_tests": 0,
+      "bundle_passed": true,
+      "python_adapter_import_or_tests": "NOT RUN; root dependency completion and separate lease required",
+      "typecheck": "Not run; Vitest transpilation and esbuild bundling are not full typechecking",
+      "initial_config_attempt": "runner loader failed before test collection on workspace __dirname; supported bundle config loader passed without source edits"
+    },
+    "lease_status": "released",
+    "reviewed_patch_unchanged": true,
+    "lockfile_sha256": "46b0b4a859f63fa257b46087594995fb61f2f35dc31e54e996d7fda9a55e6bb8"
+  },
+  "head_scope": "implementation/static-review base; see committed_head for final state",
+  "committed_head": "53977b7df5faef265d0ecda638f878a7d9cc895e",
+  "final_local_result": "hermes-fork-local-result-20260908.json",
+  "python_validation": {
+    "at": "2026-09-08T17:26:13.101356+00:00",
+    "status": "accepted-local-focused-validation",
+    "lease": "released",
+    "result": {
+      "exit_code": 0,
+      "canonical_exit": 0,
+      "expected": 21,
+      "summary": {
+        "passed": 21
+      },
+      "duration_seconds": 1.662717541999882,
+      "child": {
+        "collected": 21,
+        "passed": 21,
+        "skipped": 0,
+        "failed": 0,
+        "denials": [],
+        "pytest_exit": 0
+      },
+      "output": "/private/tmp/hermes-fork-python-xz9tczkn",
+      "runner_sha256": "338978835b49d96527ca0f562c4e1c2d894513487826bcf894730df3268047a1"
+    },
+    "node_checks": 23,
+    "source_entry_bundle_bytes": 440266,
+    "sdk_checks": 21,
+    "total_focused_tests": 44,
+    "production_verified": false
+  },
+  "all_leases": "released"
+}

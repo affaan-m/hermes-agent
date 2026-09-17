@@ -1,0 +1,61 @@
+{
+  "updated_at": "2026-09-08T17:28:02.515988+00:00",
+  "status": "completed-local-cache-repair",
+  "commit": "53977b7df5faef265d0ecda638f878a7d9cc895e",
+  "parent": "330b9f7425c8e137e4f18e288e7520903121c615",
+  "paths": [
+    "apps/desktop/src/app/session/hooks/use-session-state-cache.test.tsx",
+    "apps/desktop/src/app/session/hooks/use-session-state-cache.ts",
+    "gateway/sticker_cache.py",
+    "tests/gateway/test_sticker_cache.py",
+    "ui-tui/packages/hermes-ink/src/ink/cache-eviction.ts",
+    "ui-tui/packages/hermes-ink/src/ink/cache-recovery.test.ts",
+    "ui-tui/packages/hermes-ink/src/ink/line-width-cache.ts",
+    "ui-tui/packages/hermes-ink/src/ink/node-cache.ts"
+  ],
+  "manifest_sha256": "d23558fe4bb353681d33de74d9d688929885c5f87fe54be2b2403b2b761e911f",
+  "receipt_patch_sha256": "938c84143f496f3b2fd2f4b7effb79b642b01c3e27cacf80c0d591251dc2968d",
+  "receipts": {
+    "ROOT-CACHE-COMMIT.json": {
+      "sha256": "dd1ff18f2d04e52d78cc3ab3400a99eb05c85829067061e8ceb23461c680a4a9"
+    },
+    "ROOT-PYTHON-VALIDATION.json": {
+      "sha256": "6f349dc84d8880a3ce68fc4166ab1d3733244f3fb273ecbebd5d87ebc4774906"
+    },
+    "ROOT-PYTHON-FIRST-RUN.json": {
+      "sha256": "afdbd7d0eb6a1fe1a9fd64e1f4dddfd8373830f857b208e637a7671c2d2506aa"
+    }
+  },
+  "validation": {
+    "python": {
+      "tests": 21,
+      "skips": 0,
+      "failures": 0,
+      "guard_denials": 0,
+      "exit_code": 0,
+      "root_result_directory": "/private/tmp/hermes-fork-python-xz9tczkn"
+    },
+    "node": {
+      "tests": 23,
+      "bundle_bytes": 440266,
+      "bundle_executed": false
+    },
+    "total_focused_tests": 44,
+    "full_typescript_typecheck": "not run",
+    "tests_rerun_for_this_update": false
+  },
+  "all_leases": "released",
+  "private_evidence": "untracked; not committed",
+  "production_changes": "NONE",
+  "push_merge_deploy": false,
+  "verified_now": [
+    "HEAD and exact parent",
+    "exact eight committed paths",
+    "reviewed path/mode/content manifest unchanged",
+    "five exact production blob hashes",
+    "no tracked working tree changes",
+    "no private evidence tracked",
+    "accepted Python receipt matches saved run result"
+  ],
+  "receipt_note": "ROOT-CACHE-COMMIT.json contains a historical nested runtime_review string saying Python pending. ROOT-PYTHON-VALIDATION.json and commit top-level test counts supersede that stale string; original root receipts preserved."
+}

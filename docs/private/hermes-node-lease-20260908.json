@@ -1,0 +1,171 @@
+{
+  "temporary_directory": "/private/tmp/hermes-fork-node-6_q5o_xb",
+  "guard": "/private/tmp/hermes-fork-node-6_q5o_xb/no-network.cjs",
+  "configs": {
+    "desktop": "/private/tmp/hermes-fork-node-6_q5o_xb/desktop.config.mjs",
+    "ink": "/private/tmp/hermes-fork-node-6_q5o_xb/ink.config.mjs"
+  },
+  "runs": [
+    {
+      "name": "desktop",
+      "started_at": "2026-09-08T15:52:55.066548+00:00",
+      "elapsed_seconds": 0.961,
+      "command": [
+        "/Users/affoon/.local/bin/node",
+        "--require",
+        "/private/tmp/hermes-fork-node-6_q5o_xb/no-network.cjs",
+        "/Users/affoon/GitHub/hermes-desk-20260908/03-fork/repo/node_modules/vitest/vitest.mjs",
+        "run",
+        "--config",
+        "/private/tmp/hermes-fork-node-6_q5o_xb/desktop.config.mjs",
+        "--configLoader",
+        "runner",
+        "--maxWorkers=1",
+        "--no-file-parallelism",
+        "--maxConcurrency=1",
+        "--no-cache",
+        "--reporter=verbose",
+        "src/app/session/hooks/use-session-state-cache.test.tsx"
+      ],
+      "exit_code": 1,
+      "log": "/private/tmp/hermes-fork-node-6_q5o_xb/desktop.log",
+      "clean_environment_keys": [
+        "CI",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "TMPDIR",
+        "TZ"
+      ],
+      "log_sha256": "ffb2211e8324e0f5971e49e6d4b323e0aeb234bcae420dd1ce6be2c422096b05",
+      "guard_denial_reported": false
+    },
+    {
+      "name": "desktop-bundle-loader",
+      "started_at": "2026-09-08T15:53:23.647883+00:00",
+      "elapsed_seconds": 1.209,
+      "command": [
+        "/Users/affoon/.local/bin/node",
+        "--require",
+        "/private/tmp/hermes-fork-node-6_q5o_xb/no-network.cjs",
+        "/Users/affoon/GitHub/hermes-desk-20260908/03-fork/repo/node_modules/vitest/vitest.mjs",
+        "run",
+        "--config",
+        "/private/tmp/hermes-fork-node-6_q5o_xb/desktop.config.mjs",
+        "--configLoader",
+        "bundle",
+        "--maxWorkers=1",
+        "--no-file-parallelism",
+        "--maxConcurrency=1",
+        "--no-cache",
+        "--reporter=verbose",
+        "src/app/session/hooks/use-session-state-cache.test.tsx"
+      ],
+      "exit_code": 0,
+      "log": "/private/tmp/hermes-fork-node-6_q5o_xb/desktop-bundle-loader.log",
+      "clean_environment_keys": [
+        "CI",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "TMPDIR",
+        "TZ"
+      ],
+      "log_sha256": "279e8bf4e2cf73065df815f0d7bf3a4c1af806867e4f0cddaf6aef376eadccfd",
+      "guard_denial_reported": false
+    },
+    {
+      "name": "ink",
+      "started_at": "2026-09-08T15:53:50.361792+00:00",
+      "elapsed_seconds": 0.401,
+      "command": [
+        "/Users/affoon/.local/bin/node",
+        "--require",
+        "/private/tmp/hermes-fork-node-6_q5o_xb/no-network.cjs",
+        "/Users/affoon/GitHub/hermes-desk-20260908/03-fork/repo/node_modules/vitest/vitest.mjs",
+        "run",
+        "--config",
+        "/private/tmp/hermes-fork-node-6_q5o_xb/ink.config.mjs",
+        "--configLoader",
+        "bundle",
+        "--maxWorkers=1",
+        "--no-file-parallelism",
+        "--maxConcurrency=1",
+        "--no-cache",
+        "--reporter=verbose",
+        "packages/hermes-ink/src/ink/cache-recovery.test.ts",
+        "packages/hermes-ink/src/ink/hit-test.test.ts"
+      ],
+      "exit_code": 0,
+      "log": "/private/tmp/hermes-fork-node-6_q5o_xb/ink.log",
+      "clean_environment_keys": [
+        "CI",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "TMPDIR",
+        "TZ"
+      ],
+      "log_sha256": "6fd5c539861f6b92798e44b27bea779d3c1b64d9bb39caa9df8b65fd0055ed3f",
+      "guard_denial_reported": false
+    },
+    {
+      "name": "ink-source-bundle",
+      "started_at": "2026-09-08T15:54:21.301883+00:00",
+      "elapsed_seconds": 0.067,
+      "command": [
+        "/Users/affoon/.local/bin/node",
+        "--require",
+        "/private/tmp/hermes-fork-node-6_q5o_xb/no-network.cjs",
+        "/Users/affoon/GitHub/hermes-desk-20260908/03-fork/repo/node_modules/esbuild/bin/esbuild",
+        "ui-tui/packages/hermes-ink/src/entry-exports.ts",
+        "--bundle",
+        "--platform=node",
+        "--format=esm",
+        "--packages=external",
+        "--outfile=/private/tmp/hermes-fork-node-6_q5o_xb/ink-source.mjs",
+        "--metafile=/private/tmp/hermes-fork-node-6_q5o_xb/ink-source.meta.json"
+      ],
+      "exit_code": 0,
+      "log": "/private/tmp/hermes-fork-node-6_q5o_xb/ink-bundle.log",
+      "clean_environment_keys": [
+        "CI",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "TMPDIR",
+        "TZ"
+      ],
+      "log_sha256": "92ab6e2071cdc8c897c313518b84a74310e4705ae9205d7ad558805e3df4fe41",
+      "guard_denial_reported": false
+    }
+  ],
+  "bundle": {
+    "path": "/private/tmp/hermes-fork-node-6_q5o_xb/ink-source.mjs",
+    "sha256": "910d9b49c18043091a886857d3e08d30e9efd7c7639efd25d8a0dfd3dd31310e",
+    "bytes": 440266,
+    "restored_source_inputs": [
+      "ui-tui/packages/hermes-ink/src/ink/cache-eviction.ts",
+      "ui-tui/packages/hermes-ink/src/ink/line-width-cache.ts",
+      "ui-tui/packages/hermes-ink/src/ink/node-cache.ts"
+    ],
+    "executed": false
+  },
+  "results": {
+    "desktop_tests_passed": 12,
+    "ink_tests_passed": 11,
+    "total_tests_passed": 23,
+    "test_files_passed": 3,
+    "failed_tests": 0,
+    "bundle_passed": true,
+    "python_adapter_import_or_tests": "NOT RUN; root dependency completion and separate lease required",
+    "typecheck": "Not run; Vitest transpilation and esbuild bundling are not full typechecking",
+    "initial_config_attempt": "runner loader failed before test collection on workspace __dirname; supported bundle config loader passed without source edits"
+  },
+  "clean_environment": "Only PATH, TZ, LANG, LC_ALL, CI and TMPDIR were supplied; dotenv disabled by envDir:false",
+  "network_control": "Reviewed Node guard preloaded in main and workers; API/HMR/ws disabled. OS sandbox-exec was unavailable. Guard is not OS isolation against native code or child processes.",
+  "lockfile_sha256_after": "46b0b4a859f63fa257b46087594995fb61f2f35dc31e54e996d7fda9a55e6bb8",
+  "reviewed_patch_unchanged": true,
+  "lease_status": "released",
+  "lease_released_at": "2026-09-08T15:55:29.894326+00:00"
+}

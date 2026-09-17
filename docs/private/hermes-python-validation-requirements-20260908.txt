@@ -1,0 +1,17 @@
+# PROPOSAL ONLY. Root installs after environment approval; this lane has not installed.
+# Captured uv.lock; CPython 3.13, macOS arm64, wheels only, no extras.
+# Includes psutil for the existing process-protection fixture.
+anyio==4.12.1 --hash=sha256:d405828884fc140aa80a3c667b8beed277f1dfedec42ba031bd6ac3db606ab6c
+certifi==2026.5.20 --hash=sha256:3c52e209ba0a4ad7aebe60436a4ab349c39e1e602e8c134221e546902ad25897
+h11==0.16.0 --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
+httpcore==1.0.9 --hash=sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55
+httpx==0.28.1 --hash=sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad
+idna==3.15 --hash=sha256:048adeaf8c2d788c40fee287673ccaa74c24ffd8dcf09ffa555a2fbb59f10ac8
+iniconfig==2.3.0 --hash=sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12
+packaging==26.0 --hash=sha256:b36f1fef9334a5588b4166f8bcd26a14e521f2b55e6b9de3aaa80d3ff7a37529
+pluggy==1.6.0 --hash=sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746
+psutil==7.2.2 --hash=sha256:1a7b04c10f32cc88ab39cbf606e117fd74721c831c98a27dc04578deb0c16979
+pygments==2.19.2 --hash=sha256:86540386c03d588bb81d44bc3928634ff26449851e99741617ecb9037ee5ec0b
+pytest==9.0.2 --hash=sha256:711ffd45bf766d5264d487b917733b453d917afd2b0ad65223959f59089f875b
+python-telegram-bot==22.6 --hash=sha256:e598fe171c3dde2dfd0f001619ee9110eece66761a677b34719fb18934935ce0
+pyyaml==6.0.3 --hash=sha256:2283a07e2c21a2aa78d9c4442724ec1eb15f5e42a723b99cb3d822d48f5f7ad1

@@ -48,56 +48,10 @@ logger = logging.getLogger(__name__)
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
-    """Return a compact one-line failure message for chat delivery.
-
-    Full details stay in the cron output directory and the logs. Chat should
-    show the operator what broke without dumping provider JSON, retry noise, or
-    stack traces into the delivery channel.
-    """
-    job_name = job.get("name") or job.get("id") or "cron job"
-    text = (error or "unknown error").strip()
-    lower = text.lower()
-
-    # Provider/API failures are the common noisy path. Keep these short.
-    if "429" in text or "rate limit" in lower or "usage limit" in lower:
-        reason = "rate limit"
-        if "weekly usage limit" in lower:
-            reason = "weekly usage limit"
-        elif "quota" in lower:
-            reason = "quota limit"
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider {reason}. "
-            "Fallback chain was exhausted or unavailable. "
-            "Full details saved in cron output."
-        )
-
-    if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider timeout. "
-            "Fallback chain was exhausted or unavailable. "
-            "Full details saved in cron output."
-        )
-
-    # Match authentication/authorization wording at a word boundary and the
-    # 401/403 status codes as whole tokens, so "oauth", "4015" and similar do
-    # not trip a misleading auth message.
-    if re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text):
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider authentication error. "
-            "Full details saved in cron output."
-        )
-
-    # Strip common exception wrappers and collapse provider payloads. Bound
-    # the input first so a multi-KB provider blob cannot slow the
-    # substitutions.
-    cleaned = re.sub(
-        r"^(RuntimeError|Exception|ValueError|HTTPStatusError):\s*",
-        "", text[:2000],
-    )
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if len(cleaned) > 180:
-        cleaned = cleaned[:177].rstrip() + "..."
-    return f"⚠️ Cron '{job_name}' failed: {cleaned}"
+    """Keep diagnostic details in logs and render a fixed outward failure."""
+    from gateway.message_failure import SAFE_FAILURE_TEXT
+    logger.warning("Scheduled job %s failed: %s", job.get("id"), error)
+    return SAFE_FAILURE_TEXT
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -1158,6 +1112,11 @@ def _send_media_via_adapter(
     from pathlib import Path
 
     from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+    from gateway.message_failure import check_delivery, DeliveryPolicyDenied, DeliveryNotConfirmed, is_policy_denial
+    from gateway.message_audience import OutputClass
+    metadata = check_delivery(adapter.config, platform or adapter.platform, chat_id,
+        adapter=adapter, metadata=metadata,
+        output_class=(metadata or {}).get("_hermes_output_class", OutputClass.FINAL))
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
@@ -1181,19 +1140,21 @@ def _send_media_via_adapter(
                     "Job '%s': cannot send media %s, gateway loop unavailable",
                     job.get("id", "?"), media_path,
                 )
-                return
+                raise DeliveryNotConfirmed("delivery_not_confirmed")
             try:
                 result = future.result(timeout=30)
             except TimeoutError:
                 future.cancel()
                 raise
-            if result and not getattr(result, "success", True):
-                logger.warning(
-                    "Job '%s': media send failed for %s: %s",
-                    job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
-                )
+            if is_policy_denial(result):
+                raise DeliveryPolicyDenied("delivery_not_authorized")
+            if not result or not getattr(result, "success", False):
+                raise DeliveryNotConfirmed("delivery_not_confirmed")
+        except (DeliveryPolicyDenied, DeliveryNotConfirmed):
+            raise
         except Exception as e:
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+            raise DeliveryNotConfirmed("delivery_not_confirmed") from e
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -1217,7 +1178,7 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, output_class=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1264,23 +1225,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
-    else:
-        delivery_content = content
-
-    # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    from gateway.message_audience import OutputClass
+    from gateway.message_failure import (
+        check_delivery, DeliveryPolicyDenied, DeliveryNotConfirmed, is_policy_denial, is_terminal_delivery_failure,
+        destination_output_allowed, prepare_outbound_text,
+    )
+    kind = OutputClass.FINAL if output_class is None else output_class
+    # Classify unsuccessful results before any MEDIA extraction.
+    content = prepare_outbound_text(content, kind)
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
@@ -1354,6 +1307,36 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # Prefer the live adapter when the gateway is running — this supports E2EE
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
+        route_identity = {}
+        scope = target.get("scope_id")
+        if not scope and origin.get("platform") == platform_name and str(origin.get("chat_id")) == str(chat_id):
+            scope = origin.get("scope_id")
+        if scope:
+            route_identity["slack_team_id" if platform == Platform.SLACK else "scope_id"] = scope
+        try:
+            bound_metadata = check_delivery(pconfig, platform, chat_id,
+                adapter=runtime_adapter, metadata=route_identity, output_class=kind)
+        except DeliveryPolicyDenied:
+            delivery_errors.append("delivery_not_authorized")
+            continue
+
+        delivery_kind = kind
+        delivery_content = content
+        # Scheduler controls are operational content. Supplier finals remain
+        # ordinary answers, including independently authorized scheduled work.
+        from types import SimpleNamespace
+        audience_target = runtime_adapter or SimpleNamespace(config=pconfig, platform=platform)
+        if (wrap_response and kind is OutputClass.FINAL
+                and destination_output_allowed(audience_target, chat_id, OutputClass.OPERATIONAL, bound_metadata)):
+            task_name = job.get("name", job["id"])
+            delivery_content = (f"Cronjob Response: {task_name}\n(job_id: {job['id']})\n\n"
+                                f"{content}\n\nTo stop or manage this job, send me a new message.")
+            delivery_kind = OutputClass.OPERATIONAL
+        # Prepare after every scheduler-owned prefix/footer, then extract media.
+        delivery_content = prepare_outbound_text(delivery_content, delivery_kind)
+        media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        bound_metadata["_hermes_output_class"] = delivery_kind
         delivered = False
         target_errors = []
 
@@ -1422,6 +1405,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         opened_thread_id: Optional[str] = None
         if (
             mirror_this_target
+            and destination_output_allowed(audience_target, chat_id, OutputClass.OPERATIONAL, bound_metadata)
             and not in_channel_surface
             and runtime_adapter is not None
             and loop is not None
@@ -1475,6 +1459,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_thread_id = str(thread_id) if thread_id is not None else None
                 route_metadata = {"job_id": job["id"]}
                 media_metadata = {"thread_id": thread_id} if thread_id else None
+
+            route_metadata.update(bound_metadata)
+            media_metadata = {**(media_metadata or {}), **bound_metadata}
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
@@ -1588,6 +1575,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 send_success = _confirm_adapter_delivery(send_result)
                                 send_raw_response = getattr(send_result, "raw_response", None)
 
+                            if is_policy_denial(send_result):
+                                raise DeliveryPolicyDenied("delivery_not_authorized")
+                            if is_terminal_delivery_failure(send_result):
+                                raise DeliveryNotConfirmed("private_delivery_failed")
+                            if isinstance(send_result, dict) and send_result.get("delivered") is False:
+                                raise DeliveryNotConfirmed("delivery_not_confirmed")
                             if not send_success:
                                 if isinstance(send_result, dict):
                                     err = send_result.get("error", "unknown")
@@ -1676,6 +1669,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         thread_id=thread_id, user_id=origin_user_id,
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
+            except DeliveryPolicyDenied:
+                delivery_errors.append("delivery_not_authorized")
+                continue
+            except DeliveryNotConfirmed:
+                delivery_errors.append("delivery_not_confirmed")
+                continue
             except Exception as e:
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
@@ -1687,7 +1686,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         if not delivered:
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, metadata=bound_metadata, output_class=delivery_kind)
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -1707,7 +1706,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, metadata=bound_metadata, output_class=delivery_kind))
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -1724,8 +1723,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
 
-            if result and result.get("error"):
-                msg = f"delivery error: {result['error']}"
+            if (not isinstance(result, dict) or not result.get("success")
+                    or result.get("delivered") is False or result.get("error")):
+                msg = "delivery error: delivery_not_confirmed"
+                if isinstance(result, dict) and result.get("error"):
+                    msg = f"delivery error: {result['error']}"
                 logger.error("Job '%s': %s", job["id"], msg)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
@@ -3141,7 +3143,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         delivery_error = None
         if should_deliver:
             try:
-                delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                from gateway.message_audience import OutputClass
+                delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop,
+                    output_class=OutputClass.FINAL if success else OutputClass.SAFE_ERROR)
             except Exception as de:
                 delivery_error = str(de)
                 logger.error("Delivery failed for job %s: %s", job["id"], de)
