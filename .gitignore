@@ -10,3 +10,6 @@ logs/
 state/
 .DS_Store
 node_modules/
+
+# Desktop release binaries never go into history (175 MB Electron framework blocked every fork push until 2026-09-16)
+apps/desktop/release/
