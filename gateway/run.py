@@ -13269,6 +13269,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 suppress_streaming=_operator_unaddressed_in_quiet(
                     event, source, _load_gateway_config(),
                 ),
+                event=event,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -19142,6 +19143,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         suppress_streaming: bool = False,
+        event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -19161,6 +19163,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 suppress_streaming=suppress_streaming,
+                event=event,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -19173,6 +19176,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 suppress_streaming=suppress_streaming,
+                event=event,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -19295,6 +19299,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         suppress_streaming: bool = False,
+        event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -20413,7 +20418,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             _want_stream_deltas = _streaming_enabled and not suppress_streaming
             _want_interim_messages = interim_assistant_messages_enabled
-            _want_interim_consumer = _want_interim_messages
+            # suppress_streaming (operator unaddressed in a quiet channel)
+            # must hold back interim previews too: the predicate promises
+            # nothing streams into the counterparty-facing channel.
+            _want_interim_consumer = _want_interim_messages and not suppress_streaming
             if _want_stream_deltas or _want_interim_consumer:
                 try:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
@@ -22308,18 +22316,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                         )
                     elif first_response and not _already_streamed:
+                        # Operator bookkeeping reroute: the same predicate the
+                        # completed-turn path applies.  Without it, an
+                        # operator's unaddressed message in a quiet
+                        # (counterparty-facing) channel leaks the first
+                        # response into that channel when a follow-up arrives
+                        # mid-turn; deliver it to the platform home channel
+                        # instead and drop the in-channel copy, exactly as the
+                        # completed-turn path does.  Fail-open: any lookup or
+                        # send problem falls back to in-channel delivery.
+                        _rerouted_home = False
                         try:
-                            logger.info(
-                                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
-                                session_key or "?",
+                            _quiet_reroute = _operator_unaddressed_in_quiet(
+                                event, source, _load_gateway_config(),
                             )
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
-                                metadata=_status_thread_metadata,
-                            )
-                        except Exception as e:
-                            logger.warning("Failed to send first response before queued message: %s", e)
+                        except Exception:
+                            _quiet_reroute = False
+                        if _quiet_reroute:
+                            _home = self.config.get_home_channel(source.platform) if self.config else None
+                            _home_adapter = self._adapter_for_source(source)
+                            if _home and _home.chat_id and _home_adapter:
+                                try:
+                                    await _home_adapter.send(
+                                        _home.chat_id,
+                                        f"<#{source.chat_id}> operator bookkeeping:\n{first_response}",
+                                    )
+                                    logger.info(
+                                        "Routed operator bookkeeping answer from %s to home channel %s",
+                                        source.chat_id, _home.chat_id,
+                                    )
+                                    _rerouted_home = True
+                                except Exception as _home_err:
+                                    logger.warning(
+                                        "Home-channel reroute failed for %s: %s; falling back to in-channel delivery",
+                                        source.chat_id, _home_err,
+                                    )
+                        if not _rerouted_home:
+                            try:
+                                logger.info(
+                                    "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
+                                    session_key or "?",
+                                )
+                                await adapter.send(
+                                    source.chat_id,
+                                    first_response,
+                                    metadata=_status_thread_metadata,
+                                )
+                            except Exception as e:
+                                logger.warning("Failed to send first response before queued message: %s", e)
                     elif first_response:
                         logger.info(
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
@@ -22433,6 +22477,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     suppress_streaming=suppress_streaming,
+                    event=pending_event,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
