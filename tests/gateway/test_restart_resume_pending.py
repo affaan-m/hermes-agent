@@ -53,6 +53,17 @@ from tests.gateway.restart_test_helpers import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _ito_auto_resume_operator_allowlist(monkeypatch):
+    """Ito silent-restart gate: ``_schedule_resume_pending_sessions`` only
+    auto-resumes home channels and operator DMs
+    (``GatewayRunner._ito_auto_resume_allowed``). The helpers in this file
+    build DM sources owned by user ``u1``; allowlist that operator so the
+    tests exercise the resume machinery through the gate instead of being
+    silently skipped by it."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "u1")
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "u1")
+
 
 def test_resume_pending_is_cleared_only_after_successful_turn():
     """Interrupted/failed drain results must keep the restart recovery marker.
@@ -1926,3 +1937,84 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     # No leaked sentinel and no orphaned queued event.
     assert session_key not in runner._running_agents
     assert session_key not in getattr(adapter, "_pending_messages", {})
+
+
+# ---------------------------------------------------------------------------
+# Ito silent-restart gate (_ito_auto_resume_allowed)
+# ---------------------------------------------------------------------------
+
+
+def _pending_entry(session_key: str, source: SessionSource, **overrides) -> SessionEntry:
+    fields = dict(
+        session_key=session_key,
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=source.platform,
+        chat_type=source.chat_type,
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    fields.update(overrides)
+    return SessionEntry(**fields)
+
+
+@pytest.mark.asyncio
+async def test_ito_gate_skips_counterparty_group():
+    """A counterparty group/channel must never receive a synthesized
+    "session restored" turn after a restart — it stays resume_pending
+    until a human writes in that chat again."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="counterparty-chat", chat_type="group")
+    entry = _pending_entry(
+        "agent:main:telegram:group:counterparty-chat", source
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    assert entry.resume_pending is True
+    adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ito_gate_skips_non_operator_dm():
+    """A DM from a user outside the platform operator allowlist is not
+    auto-resumed (the autouse fixture allowlists only u1)."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="stranger-chat", chat_type="dm")
+    source.user_id = "u2-stranger"
+    entry = _pending_entry("agent:main:telegram:dm:stranger-chat", source)
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    assert entry.resume_pending is True
+    adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ito_gate_allows_configured_home_channel():
+    """The platform's configured home channel auto-resumes even as a
+    group/topic — it is operator space, not counterparty space."""
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="home-chat", name="Itô Ops"
+    )
+    source = make_restart_source(chat_id="home-chat", chat_type="group")
+    entry = _pending_entry("agent:main:telegram:group:home-chat", source)
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1

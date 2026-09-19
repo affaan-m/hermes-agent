@@ -27,7 +27,9 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("save", jid))
         return f"/tmp/{jid}.txt"
 
-    def fake_deliver(job, content, adapters=None, loop=None):
+    # Signature mirrors cron.scheduler._deliver_result (full_output_path
+    # added in b2ef2827ec).
+    def fake_deliver(job, content, adapters=None, loop=None, full_output_path=None):
         calls.append(("deliver", job["id"]))
         return None
 
