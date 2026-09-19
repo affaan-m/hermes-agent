@@ -76,12 +76,6 @@ _slash_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     default=None,
 )
 
-# Invocation-local private intent survives expiry/consumption of its response
-# context. It is never inferred from model-supplied delivery metadata.
-_slash_reply_context: contextvars.ContextVar[Optional[tuple]] = contextvars.ContextVar(
-    "_slash_reply_context", default=None,
-)
-
 
 @dataclass
 class _ThreadContextCache:
@@ -119,35 +113,6 @@ def check_slack_requirements() -> bool:
     from tools.lazy_deps import ensure_and_bind
 
     return ensure_and_bind("platform.slack", _import, globals(), prompt=False)
-
-
-def _participation_text(event: dict, fallback: str) -> str:
-    """Use authored content for addressing; quotes and code remain context."""
-    rich = [b for b in (event.get("blocks") or []) if b.get("type") == "rich_text"]
-    if rich:
-        parts = []
-        def visit(element):
-            kind = element.get("type")
-            if kind in {"rich_text_quote", "rich_text_preformatted"}:
-                return
-            if element.get("style", {}).get("code"):
-                return
-            if kind == "text":
-                parts.append(element.get("text", ""))
-            elif kind == "user":
-                parts.append(f"<@{element.get('user_id', '')}>")
-            else:
-                for child in element.get("elements", []):
-                    visit(child)
-        for block in rich:
-            visit(block)
-            parts.append("\n")
-        fallback = "".join(parts)
-    # Older/plain Slack payloads have no rich_text tree. Ignore quoted lines
-    # and fenced/inline code rather than treating their mentions as requests.
-    fallback = re.sub(r"```.*?(?:```|$)|`[^`\n]*(?:`|$)", "", fallback, flags=re.DOTALL)
-    return "\n".join(line for line in fallback.splitlines()
-                     if not line.lstrip().startswith((">", "&gt;"))).strip()
 
 
 def _extract_text_from_slack_blocks(blocks: list) -> str:
@@ -531,7 +496,7 @@ class SlackAdapter(BasePlatformAdapter):
         # can route the first reply ephemerally.  Keyed by
         # (channel_id, user_id) to avoid cross-user collisions.
         # Each value: {"response_url": str, "ts": float}
-        self._slash_command_contexts: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        self._slash_command_contexts: Dict[Tuple[str, str], Dict[str, Any]] = {}
         # Socket Mode resilience: track runtime connection state so we can
         # self-heal when Slack silently drops the websocket.
         self._app_token: Optional[str] = None
@@ -806,14 +771,17 @@ class SlackAdapter(BasePlatformAdapter):
     def _pop_slash_context(
         self,
         chat_id: str,
-        metadata=None,
     ) -> Optional[Dict[str, Any]]:
         """Return and remove the slash-command context for *chat_id*, if fresh.
 
         Contexts older than ``_SLASH_CTX_TTL`` seconds are silently discarded.
 
-        Uses the slash user ContextVar and bound workspace to match the exact
-        channel/user/workspace. Unrelated sends cannot consume private context.
+        Uses the ``_slash_user_id`` ContextVar (set in ``_handle_slash_command``)
+        to match the exact ``(channel_id, user_id)`` key.  This prevents a
+        concurrent slash command from a different user on the same channel from
+        stealing another user's ephemeral context.  Falls back to a
+        channel-only scan when the ContextVar is unset (e.g. send() called
+        from a non-slash code path — should not match anything).
         """
         now = time.monotonic()
         # Clean up stale entries on every lookup — dict is small.
@@ -825,23 +793,21 @@ class SlackAdapter(BasePlatformAdapter):
         for k in stale_keys:
             self._slash_command_contexts.pop(k, None)
 
-        # Precise match includes workspace even when channel/user IDs collide.
+        # Precise match: (channel_id, user_id) from ContextVar.
         uid = _slash_user_id.get()
-        team_id = self._metadata_team_id(metadata)
-        invocation = _slash_reply_context.get()
-        if invocation is not None:
-            key, ctx = invocation
-            if key != (chat_id, uid, team_id):
-                return None
-            if ctx.get("consumed") or now - ctx["ts"] > self._SLASH_CTX_TTL:
-                return None
-            ctx["consumed"] = True
-            if self._slash_command_contexts.get(key) is ctx:
-                self._slash_command_contexts.pop(key, None)
-            return ctx
-        if uid and team_id:
-            return self._slash_command_contexts.pop((chat_id, uid, team_id), None)
-        return None
+        if uid:
+            return self._slash_command_contexts.pop((chat_id, uid), None)
+
+        # Fallback: channel-only scan (only reachable when ContextVar is
+        # unset, i.e. send() called outside a slash-command async context).
+        match_key = None
+        for key in list(self._slash_command_contexts):
+            if key[0] == chat_id:
+                match_key = key
+                break
+        if match_key is None:
+            return None
+        return self._slash_command_contexts.pop(match_key)
 
     async def _send_slash_ephemeral(
         self,
@@ -855,9 +821,11 @@ class SlackAdapter(BasePlatformAdapter):
         lets us swap the "Running /cmd…" placeholder with the real reply,
         and the message stays ephemeral ("Only visible to you").
 
-        Falls back to a simple ``True`` SendResult if the POST fails —
-        the user already saw the initial ack, so a delivery failure here
-        is non-critical.
+        Returns ``success=False`` on delivery failure so the caller
+        (``send()`` / the stream consumer) falls back to normal channel
+        delivery — the reply must never be silently dropped just because
+        the ephemeral swap failed.  The initial "Running /cmd…" ack stays
+        up either way.
         """
         formatted = self.format_message(content)
         # Slack's response_url has the same ~40k char limit as chat_postMessage.
@@ -886,13 +854,18 @@ class SlackAdapter(BasePlatformAdapter):
                         resp.status,
                         body[:200],
                     )
+                    return SendResult(
+                        success=False,
+                        error=f"response_url POST returned {resp.status}",
+                    )
         except Exception as e:
             logger.warning(
                 "[Slack] response_url POST failed: %s",
                 e,
             )
-        # Non-fatal — the user saw the initial ack already.
-        return SendResult(success=True, message_id=None)
+            return SendResult(success=False, error=str(e))
+        # Unreachable in practice (both paths above return), kept explicit.
+        return SendResult(success=False, error="response_url POST failed")
 
     def _warn_if_missing_group_dm_scopes(self, auth_response, team_name: str) -> None:
         """Nudge existing installs to reinstall when group-DM scopes are absent.
@@ -1108,7 +1081,6 @@ class SlackAdapter(BasePlatformAdapter):
             # / ``_team_bot_user_ids`` entries from the prior session.
             self._bot_user_id = None
             self._team_clients = {}
-            self._primary_team_id = None
             self._team_bot_user_ids = {}
 
             # First token is the primary — used for AsyncApp / Socket Mode
@@ -1134,7 +1106,6 @@ class SlackAdapter(BasePlatformAdapter):
                 # token's identity even on reconnect.
                 if self._bot_user_id is None:
                     self._bot_user_id = bot_user_id
-                    self._primary_team_id = team_id
 
                 logger.info(
                     "[Slack] Authenticated as @%s in workspace %s (team: %s)",
@@ -1165,6 +1136,26 @@ class SlackAdapter(BasePlatformAdapter):
             async def handle_app_mention(event, say, body, context):
                 await self._handle_slack_message(
                     event, body, _inventory_intake=self._inventory_callback_receipt(event, context)
+                )
+
+            # /ito-link is NOT a gateway command: it mints a panel identity
+            # bind nonce and answers ephemerally, never entering the
+            # agent-turn pipeline. Slack only delivers it over Socket Mode
+            # once the command is declared in the app manifest.
+            @self._app.command("/ito-link")
+            async def handle_ito_link_command(ack, command):
+                await ack(
+                    response_type="ephemeral",
+                    text="Minting your private Itô identity link…",
+                )
+                channel_id = command.get("channel_id") or ""
+                await self._handle_ito_link_request(
+                    channel_id=channel_id,
+                    user_id=command.get("user_id") or "",
+                    team_id=command.get("team_id") or "",
+                    display_name=command.get("user_name") or None,
+                    is_dm=channel_id.startswith("D"),
+                    reply_to=None,
                 )
 
             @self._app.event("app_home_opened")
@@ -1432,34 +1423,6 @@ class SlackAdapter(BasePlatformAdapter):
             or ""
         )
 
-    def _bind_delivery_metadata(self, chat_id, metadata):
-        """Pin the authorized workspace to the client used by this delivery."""
-        from gateway.message_failure import DeliveryPolicyDenied
-        routed = dict(metadata or {})
-        requested = {routed[key] for key in ("team_id", "team", "slack_team_id") if routed.get(key)}
-        if len(requested) > 1:
-            raise DeliveryPolicyDenied("ambiguous_workspace")
-        team_id = self._metadata_team_id(routed)
-        if team_id and team_id not in self._team_clients:
-            raise DeliveryPolicyDenied("unknown_workspace")
-        team_id = team_id or self._channel_team.get(str(chat_id)) or getattr(self, "_primary_team_id", None)
-        if team_id in self._team_clients:
-            routed["slack_team_id"] = team_id
-        else:
-            routed.pop("slack_team_id", None)
-        return routed
-
-    def _public_delivery_forbidden(self, chat_id, metadata):
-        """Private command replies cannot become public edits or uploads.
-
-        Invocation context survives child tasks and consumed/expired response
-        URLs. Metadata only identifies the already-bound target, never consent.
-        """
-        invocation = _slash_reply_context.get()
-        return invocation is not None and invocation[0] == (
-            chat_id, _slash_user_id.get(), self._metadata_team_id(metadata)
-        )
-
     def _get_client(self, chat_id: str, team_id: Optional[str] = None) -> Any:
         """Return the workspace-specific WebClient for a channel."""
         from gateway.inventory_context import delivery_client
@@ -1610,27 +1573,12 @@ class SlackAdapter(BasePlatformAdapter):
             # a stashed response_url for this channel, replace that ack with
             # the actual command reply ephemerally instead of posting publicly.
             from gateway.inventory_context import has_intake_delivery
-            slash_ctx = None if has_intake_delivery() else self._pop_slash_context(chat_id, metadata=metadata)
-            invocation = _slash_reply_context.get()
-            if not slash_ctx and invocation is not None and invocation[0] == (
-                chat_id, _slash_user_id.get(), self._metadata_team_id(metadata)
-            ):
-                return SendResult(success=False, error="private_delivery_failed",
-                                  retryable=False, error_kind="private_delivery_failed")
+            slash_ctx = None if has_intake_delivery() else self._pop_slash_context(chat_id)
             if slash_ctx:
-                try:
-                    private_result = await self._send_slash_ephemeral(
-                        slash_ctx,
-                        content,
-                    )
-                except Exception:
-                    logger.exception("[Slack] Private reply failed")
-                    return SendResult(success=False, error="private_delivery_failed",
-                                      retryable=False, error_kind="private_delivery_failed")
-                if not private_result.success:
-                    from dataclasses import replace
-                    return replace(private_result, retryable=False, error_kind="private_delivery_failed")
-                return private_result
+                return await self._send_slash_ephemeral(
+                    slash_ctx,
+                    content,
+                )
 
             # Convert standard markdown → Slack mrkdwn
             formatted = self.format_message(content)
@@ -1644,9 +1592,6 @@ class SlackAdapter(BasePlatformAdapter):
             # reply_broadcast: also post thread replies to the main channel.
             # Controlled via platform config: gateway.slack.reply_broadcast
             broadcast = self.config.extra.get("reply_broadcast", False)
-            from gateway.message_failure import active_delivery_attempt
-            if active_delivery_attempt():
-                broadcast = False  # Exact thread consent never includes parent broadcast.
 
             # Block Kit (opt-in): render the primary message as structured
             # blocks. Only applied to a single-chunk message — a >39k response
@@ -1768,6 +1713,74 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("[Slack] Ephemeral send error: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    async def _handle_ito_link_request(
+        self,
+        *,
+        channel_id: str,
+        user_id: str,
+        team_id: str,
+        display_name: Optional[str],
+        is_dm: bool,
+        reply_to: Optional[str],
+    ) -> None:
+        """Answer an /ito-link (or DM `link`) request with a private bind URL.
+
+        Channels get a chat.postEphemeral (only the requester sees the URL);
+        DMs get a normal reply (the conversation is already private). Every
+        outcome answers — never silent — and neither the nonce nor the bind
+        URL is logged.
+        """
+        from .ito_link import (
+            ItoLinkMintError,
+            link_error_message,
+            link_ready_message,
+            mint_link_nonce,
+        )
+
+        if not channel_id or not user_id:
+            logger.warning("[Slack] ito-link request missing channel or user id")
+            return
+        try:
+            minted = await mint_link_nonce(
+                team_id=team_id,
+                member_id=user_id,
+                display_name=display_name,
+            )
+            content = link_ready_message(minted["bind_url"])
+            logger.info(
+                "[Slack] ito-link nonce minted for team=%s member=%s",
+                team_id,
+                user_id,
+            )
+        except ItoLinkMintError as e:
+            content = link_error_message(e)
+            logger.warning(
+                "[Slack] ito-link mint failed kind=%s team=%s member=%s",
+                e.kind,
+                team_id,
+                user_id,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            content = link_error_message(ItoLinkMintError("unavailable"))
+            logger.error(
+                "[Slack] ito-link mint unexpected error: %s", e, exc_info=True,
+            )
+        if is_dm:
+            await self.send(
+                channel_id,
+                content,
+                reply_to=reply_to,
+                metadata={"team_id": team_id} if team_id else None,
+            )
+        else:
+            await self.send_private_notice(
+                channel_id,
+                user_id,
+                content,
+                reply_to=reply_to,
+                metadata={"team_id": team_id} if team_id else None,
+            )
+
     async def edit_message(
         self,
         chat_id: str,
@@ -1790,9 +1803,6 @@ class SlackAdapter(BasePlatformAdapter):
                 "channel": chat_id,
                 "ts": message_id,
                 "text": formatted,
-                # Explicitly remove any previous rich content when replacing
-                # it with plain text, including a safe failure notification.
-                "blocks": [],
             }
             # Only render Block Kit on the FINAL edit. Intermediate streaming
             # edits stay plain mrkdwn — re-deriving a full block layout on every
@@ -2042,11 +2052,6 @@ class SlackAdapter(BasePlatformAdapter):
         from gateway.inventory_context import has_intake_delivery, validate_delivery_metadata, validate_delivery_thread
         validate_delivery_metadata(self, reply_to, metadata)
 
-        from gateway.message_failure import active_delivery_attempt, delivery_thread
-        if active_delivery_attempt():
-            # The boundary already validated this exact route. Config and a
-            # reply anchor cannot widen or flatten the scoped destination.
-            return delivery_thread(metadata or {})
         # When reply_in_thread is disabled (default: True for backward compat),
         # only thread messages that are already part of an existing thread.
         # For top-level channel messages, the inbound handler sets
@@ -3631,6 +3636,23 @@ class SlackAdapter(BasePlatformAdapter):
         # both as DM-style persistent conversations.
         is_one_to_one_dm = channel_type == "im"
 
+        # Identity linking (spec v1): a 1:1 DM whose entire text is the link
+        # keyword mints a bind nonce and answers privately, without entering
+        # the agent-turn pipeline. Channel coverage comes from the /ito-link
+        # slash listener registered in connect().
+        from .ito_link import is_link_keyword as _is_link_keyword
+
+        if is_one_to_one_dm and _is_link_keyword(original_text or ""):
+            await self._handle_ito_link_request(
+                channel_id=channel_id,
+                user_id=str(user_id or ""),
+                team_id=str(team_id or ""),
+                display_name=None,
+                is_dm=True,
+                reply_to=event.get("thread_ts") or ts,
+            )
+            return
+
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
         #   new thread/session (the bot always replies in a thread).
@@ -3676,55 +3698,88 @@ class SlackAdapter(BasePlatformAdapter):
                 # further changes.
                 thread_ts = None
 
-        # Current explicit requests authorize participation. A historical bot
-        # reply, mentioned thread or persisted session is context, not consent.
-        from gateway.message_audience import ParticipationSignals, decide_participation
-        from gateway.message_failure import channel_policy_inputs
-
+        # In channels, respond if:
+        #   0. Channel is in free_response_channels, OR require_mention is
+        #      disabled — always process regardless of mention.
+        #   1. The bot is @mentioned in this message, OR
+        #   2. The message is a reply in a thread the bot started/participated in, OR
+        #   3. The message is in a thread where the bot was previously @mentioned, OR
+        #   4. There's an existing session for this thread (survives restarts)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
-        routing_text = _participation_text(event, original_text or "")
-        mentions = set(re.findall(r"<@([A-Za-z0-9]+)>", routing_text))
-        explicit_bot_mention = bool(bot_uid and bot_uid in mentions)
-        other_human_address = bool(mentions - ({bot_uid} if bot_uid else set()))
-        is_mentioned = bool(explicit_bot_mention or (
-            not other_human_address and self._slack_message_matches_mention_patterns(routing_text)
-        ))
+        routing_text = original_text or ""
+        is_mentioned = bool(
+            (bot_uid and f"<@{bot_uid}>" in routing_text)
+            or self._slack_message_matches_mention_patterns(routing_text)
+        )
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
-        explicit_command = False
-        if routing_text.startswith(("/", "!")):
-            from hermes_cli.commands import is_gateway_known_command
-            command_name, _, suffix = routing_text.split(maxsplit=1)[0][1:].partition("@")
-            aliases = self.config.extra.get("bot_command_aliases", [])
-            aliases = aliases if isinstance(aliases, list) else []
-            directed_here = not suffix or suffix in [bot_uid, *aliases]
-            explicit_command = bool(directed_here and command_name and is_gateway_known_command(command_name.lower()))
-        if not is_one_to_one_dm:
+
+        if not is_one_to_one_dm and bot_uid:
+            # Check allowed channels — if set, only respond in these channels (whitelist)
             allowed_channels = self._slack_allowed_channels()
             if allowed_channels and channel_id not in allowed_channels:
+                logger.debug(
+                    "[Slack] Ignoring message in non-allowed channel: %s", channel_id
+                )
                 return
-        identity, policies = channel_policy_inputs(self.config, self.platform, team_id, channel_id)
-        operator_ids = self.config.extra.get("operator_user_ids", [])
-        sender_is_operator = isinstance(operator_ids, list) and user_id in operator_ids
-        participation = decide_participation(identity, ParticipationSignals(
-            addressed_to_agent=is_mentioned,
-            addressed_to_other_human=other_human_address,
-            explicit_command=explicit_command,
-            direct_message=bool(is_one_to_one_dm),
-            substantive_text=bool(routing_text.strip()),
-            has_attachments=bool(event.get("files") or event.get("attachments")),
-            sender_is_operator=bool(sender_is_operator),
-            sender_is_bot=bool(event.get("bot_id") or event.get("subtype") == "bot_message"),
-            open_question=routing_text.rstrip().endswith("?"),
-            thread_participation=bool(is_thread_reply),
-        ), policies)
-        if not participation.allow_model:
-            logger.debug("Slack participation suppressed: %s", participation.reason)
-            return
+
+            if channel_id in self._slack_free_response_channels():
+                pass  # Free-response channel — always process
+            elif not self._slack_require_mention():
+                pass  # Mention requirement disabled globally for Slack
+            elif self._slack_strict_mention() and not is_mentioned:
+                return  # Strict mode: ignore until @-mentioned again
+            elif not is_mentioned:
+                reply_to_bot_thread = (
+                    is_thread_reply and event_thread_ts in self._bot_message_ts
+                )
+                in_mentioned_thread = (
+                    event_thread_ts is not None
+                    and event_thread_ts in self._mentioned_threads
+                )
+                has_session = is_thread_reply and self._has_active_session_for_thread(
+                    channel_id=channel_id,
+                    thread_ts=event_thread_ts,
+                    user_id=user_id,
+                    team_id=team_id,
+                )
+                if (
+                    not reply_to_bot_thread
+                    and not in_mentioned_thread
+                    and not has_session
+                ):
+                    return
 
         if is_mentioned:
             # Strip the bot mention from the text
             text = text.replace(f"<@{bot_uid}>", "").strip()
+            # The "!"→"/" rewrite above ran on the raw event text BEFORE
+            # mention-stripping, so a natural "<@bot> !approve" never became
+            # a command: it missed the active-session bypass, interrupted the
+            # very turn awaiting approval, and only then reached the resolver
+            # (which found nothing pending).  Re-run command normalization on
+            # the mention-stripped text so mentioned bang/slash commands are
+            # classified as commands.  Mirrors the upstream fix that handles
+            # "@bot !cmd" and "@bot /cmd".
+            mention_stripped = original_text.replace(f"<@{bot_uid}>", "").strip()
+            if mention_stripped.startswith("/"):
+                original_text = mention_stripped
+                text = mention_stripped
+            elif mention_stripped.startswith("!"):
+                try:
+                    from hermes_cli.commands import is_gateway_known_command
+
+                    first_token = mention_stripped[1:].split(maxsplit=1)[0]
+                    cmd_name = first_token.split("@", 1)[0].lower()
+                    if (
+                        cmd_name
+                        and "/" not in cmd_name
+                        and is_gateway_known_command(cmd_name)
+                    ):
+                        original_text = "/" + mention_stripped[1:]
+                        text = original_text
+                except Exception:  # pragma: no cover - defensive
+                    pass
             # Register this thread so all future messages auto-trigger the bot.
             # Skipped in strict mode: strict_mention=true bots must be
             # re-mentioned every turn, so remembering the thread would
@@ -4081,6 +4136,16 @@ class SlackAdapter(BasePlatformAdapter):
             except Exception:  # pragma: no cover - defensive
                 reply_to_text = None
 
+        # Mark direct addresses for the gateway's never-silent ack: 1:1 DMs,
+        # @mentions, and replies inside a thread the bot participates in are
+        # user-initiated conversations where a completed turn must never end
+        # in total silence.  Passive free-response channel traffic is left
+        # unmarked so intentional silence stays available there.
+        _addressed_bot = bool(
+            is_one_to_one_dm
+            or is_mentioned
+            or (is_thread_reply and event_thread_ts in self._bot_message_ts)
+        )
         msg_event = MessageEvent(
             text=text,
             message_type=msg_type,
@@ -4097,6 +4162,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "slack_team_id": team_id,
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
+                "addressed_bot": _addressed_bot,
                 "_inventory_intake": _inventory_intake,
             },
         )
@@ -4105,8 +4171,6 @@ class SlackAdapter(BasePlatformAdapter):
         # MPIMs are shared surfaces: reacting to every group-DM message (even
         # when unmentioned) is visible noise to the whole group, so they must
         # be @mentioned to earn a reaction — same as any channel.
-        msg_event._audience_decision = participation
-
         _should_react = (is_one_to_one_dm or is_mentioned) and self._reactions_enabled()
         if _should_react:
             self._reacting_message_ids.add(ts)
@@ -4123,12 +4187,9 @@ class SlackAdapter(BasePlatformAdapter):
                 f"{msg_event.text}"
             )
 
-        if participation.reason in {"explicit_agent_request", "one_to_one_request"}:
-            await self._handle_requested_event(msg_event, msg_event.message_id)
-        else:
-            from gateway.inventory_context import intake_delivery
-            with intake_delivery(_inventory_intake):
-                await self.handle_message(msg_event)
+        from gateway.inventory_context import intake_delivery
+        with intake_delivery(_inventory_intake):
+            await self.handle_message(msg_event)
 
     # ----- Approval button support (Block Kit) -----
 
@@ -4851,17 +4912,6 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] Failed to fetch thread parent text: %s", exc)
             return ""
 
-    async def _handle_requested_event(self, event, request_id):
-        """Carry an opaque intake ticket; actual user auth still belongs to runner."""
-        from contextlib import ExitStack
-        from gateway.message_failure import intake_request, DeliveryPolicyDenied, fresh_request_intake
-        with fresh_request_intake(), ExitStack() as stack:
-            try:
-                stack.enter_context(intake_request(event.source, request_id, event=event))
-            except DeliveryPolicyDenied:
-                logger.debug("Scoped tool request unavailable; preserve ordinary reply")
-            await self.handle_message(event)
-
     async def _handle_slash_command(self, command: dict) -> None:
         """Handle Slack slash commands.
 
@@ -4942,24 +4992,18 @@ class SlackAdapter(BasePlatformAdapter):
         # questions via "/hermes <question>" must produce public replies so
         # the whole channel can see the agent's answer.
         response_url = command.get("response_url", "")
-        private_context = None
         if response_url and user_id and channel_id and text.startswith("/"):
-            key = (channel_id, user_id, team_id)
-            ctx = {
+            self._slash_command_contexts[(channel_id, user_id)] = {
                 "response_url": response_url,
                 "ts": time.monotonic(),
             }
-            self._slash_command_contexts[key] = ctx
-            private_context = (key, ctx)
 
         # Set the ContextVar so send() can match the correct stashed
         # response_url even when multiple users slash concurrently.
         _slash_user_id_token = _slash_user_id.set(user_id or None)
-        _slash_reply_token = _slash_reply_context.set(private_context)
         try:
-            await self._handle_requested_event(event, command.get("trigger_id"))
+            await self.handle_message(event)
         finally:
-            _slash_reply_context.reset(_slash_reply_token)
             _slash_user_id.reset(_slash_user_id_token)
 
     def _has_active_session_for_thread(
@@ -5277,8 +5321,6 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
-    output_class=None,
-    metadata=None,
 ):
     """Out-of-process Slack delivery via the Web API ``chat.postMessage``.
 
@@ -5291,24 +5333,6 @@ async def _standalone_send(
     throwaway ``SlackAdapter`` instance's ``format_message`` — so cron-delivered
     Slack messages render identically to gateway-delivered ones.
     """
-    from gateway.message_failure import authorized_delivery, destination_output_allowed, prepare_outbound_text
-    from gateway.message_audience import OutputClass
-    from gateway.message_failure import check_delivery, DeliveryPolicyDenied, policy_denial
-    try:
-        metadata = check_delivery(pconfig, "slack", chat_id, metadata=metadata, output_class=output_class)
-    except DeliveryPolicyDenied:
-        return policy_denial()
-    from types import SimpleNamespace
-    extra = getattr(pconfig, "extra", {}) or {}
-    workspace_id = extra.get("workspace_id") or extra.get("scope_id")
-    if not authorized_delivery(pconfig, "slack", workspace_id, chat_id):
-        return {"success": False, "error": "delivery_not_authorized"}
-    kind = metadata["_hermes_output_class"]
-    target = SimpleNamespace(config=pconfig, platform="slack")
-    if not isinstance(kind, OutputClass) or not destination_output_allowed(target, chat_id, kind):
-        return {"success": False, "error": "audience_policy_suppressed"}
-    message = prepare_outbound_text(message, kind)
-
     token = getattr(pconfig, "token", None) or os.getenv("SLACK_BOT_TOKEN", "")
     if not token:
         return {"error": "Slack send failed: SLACK_BOT_TOKEN not configured"}
