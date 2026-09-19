@@ -25,6 +25,9 @@ from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
 
+# Match the existing reviewed failure wording; runtime diagnostics stay in logs.
+SAFE_FAILURE_TEXT = "Sorry, I couldn't complete that request. Please try again."
+
 # Audio file extensions Hermes recognizes for native audio delivery.
 # Kept in sync with tools/send_message_tool.py and cron/scheduler.py via
 # should_send_media_as_audio() below.
