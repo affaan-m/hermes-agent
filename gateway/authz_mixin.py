@@ -34,7 +34,13 @@ logger = logging.getLogger(__name__)
 _ALLOWED_USERS_ENV = {Platform(k): v for k, v in _PLATFORM_ALLOWLIST_ENV.items()}
 _ALLOW_ALL_ENV = {p: v.replace("_ALLOWED_USERS", "_ALLOW_ALL_USERS") for p, v in _ALLOWED_USERS_ENV.items()}
 _GROUP_USER_ENV = {Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS"}
-_GROUP_CHAT_ENV = {Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS", Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS"}
+_GROUP_CHAT_ENV = {Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS", Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
+                 # Slack counterpart of the Telegram chat-scoped allowlist:
+                 # SLACK_GROUP_ALLOWED_CHATS authorizes any member posting in a
+                 # designated channel (supplier-desk channels like
+                 # pluto-itomarkets), so counterparties can talk to the desk
+                 # without being named in SLACK_ALLOWED_USERS.
+                 Platform.SLACK: "SLACK_GROUP_ALLOWED_CHATS"}
 _ALLOW_BOTS_ENV = {
     # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466). Checked before the
     # no-user-id guard below: some platforms deliver bot/automation traffic with no user_id at all -- e.g.
@@ -568,6 +574,7 @@ class GatewayAuthorizationMixin:
         if self._chat_scoped_grant(source, adapter_profile, is_group, allow_adapter_delegation):
             return True
         user_id = source.user_id
+
         if not user_id:
             return False
 
