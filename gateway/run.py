@@ -8712,6 +8712,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         source = event.source
 
+        from gateway.inventory_context import clear_inherited
+        clear_inherited()
+
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
         # context with copy_context(). If a *concurrent* message had already
@@ -10053,7 +10056,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
-            _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            from gateway.inventory_context import admitted_request
+            _inventory_profile = source.profile or self._active_profile_name()
+            _inventory_adapters = (
+                self.adapters if _inventory_profile == self._active_profile_name()
+                else getattr(self, "_profile_adapters", {}).get(_inventory_profile, {})
+            )
+            with admitted_request(event, _inventory_adapters.get(source.platform), _inventory_profile):
+                _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
