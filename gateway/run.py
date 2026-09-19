@@ -7035,6 +7035,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
+    def _ito_recovery_routes(self):
+        """Snapshot trusted recovery origins before entering the ledger lock.
+
+        Reuse the current intake authorization, silent-resume policy and
+        profile routing. A ledger row alone is not permission to speak.
+        Missing or changed session identity remains held for reconciliation.
+        """
+        from copy import copy
+        from gateway.delivery_ledger import compute_source_fingerprint
+        routes = {}
+        with self.session_store._lock:
+            self.session_store._ensure_loaded_locked()
+            sources = [
+                (key, entry.session_key, bool(entry.suspended),
+                 copy(entry.origin) if entry.origin else None)
+                for key, entry in self.session_store._entries.items()
+            ]
+        for key, stored_key, suspended, source in sources:
+            try:
+                if suspended or source is None or key != stored_key:
+                    continue
+                if self._session_key_for_source(source) != key:
+                    continue
+                if not self._ito_auto_resume_allowed(source) or not self._is_user_authorized(source):
+                    continue
+                adapter = self._adapter_for_source(source)
+                if adapter is None:
+                    continue
+                metadata = {"thread_id": source.thread_id} if source.thread_id else {}
+                if source.platform == Platform.SLACK:
+                    # Slack's send helper otherwise falls back to a default
+                    # client when the saved workspace is absent or unknown.
+                    if not source.scope_id or source.scope_id not in getattr(adapter, "_team_clients", {}):
+                        continue
+                    metadata["team_id"] = source.scope_id
+                routes[key] = (
+                    (source.platform.value, str(source.chat_id), str(source.thread_id or ""),
+                     compute_source_fingerprint(source)),
+                    adapter, metadata or None,
+                )
+            except Exception:
+                logger.debug("delivery recovery origin unavailable", exc_info=True)
+        return routes
+
     async def _redeliver_pending_obligations(self) -> int:
         """Redeliver final responses recorded in the delivery ledger by a
         previous (now dead) gateway process.
@@ -7057,19 +7101,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ledger_enabled,
                 mark_delivered,
                 mark_failed,
+                release_unattempted_claim,
                 sweep_recoverable,
             )
 
             if not ledger_enabled():
                 return 0
-            # Only claim rows we can actually send this boot: self.adapters
-            # holds a platform only after its connect() succeeded, and each
-            # claim spends one of the row's three redelivery attempts.
-            _deliverable = {
-                getattr(p, "value", str(p)) for p in self.adapters
-            }
+            routes = self._ito_recovery_routes()
+            def admitted(row):
+                route = routes.get(row.get("session_key"))
+                return route is not None and route[0] == (
+                    row.get("platform"), row.get("chat_id"), str(row.get("thread_id") or ""),
+                    row.get("origin_fingerprint"),
+                )
+            # Only claim authorized routes with their configured adapter;
+            # each claim spends one of the row's three redelivery attempts.
+            _deliverable = {route[0][0] for route in routes.values()}
             claimed = await asyncio.to_thread(
-                sweep_recoverable, None, deliverable_platforms=_deliverable
+                sweep_recoverable, None, deliverable_platforms=_deliverable,
+                admit=admitted,
             )
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
@@ -7087,17 +7137,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     row["obligation_id"], row.get("platform"),
                 )
                 continue
-            adapter = self.adapters.get(platform)
-            if adapter is None:
-                # Platform not connected this boot — leave the row claimed;
-                # attempts cap + stale cutoff bound the retries on later boots.
+            # Claiming runs in a worker thread. Recheck the live origin and
+            # authorization after that await, immediately before dispatch.
+            try:
+                routes = self._ito_recovery_routes()
+            except Exception:
+                routes = {}
+            route = routes.get(row.get("session_key"))
+            if route is None or not admitted(row):
+                try:
+                    release_unattempted_claim(row)
+                except Exception:
+                    logger.debug("delivery recovery claim release failed", exc_info=True)
                 continue
+            _, adapter, metadata = route
             content = row["content"]
             if row.get("needs_marker"):
                 content = RECOVERED_MARKER + content
-            metadata = (
-                {"thread_id": row["thread_id"]} if row.get("thread_id") else None
-            )
             try:
                 result = await adapter.send(
                     chat_id=row["chat_id"],

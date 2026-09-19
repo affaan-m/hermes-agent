@@ -5343,16 +5343,19 @@ class BasePlatformAdapter(ABC):
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,
+                                compute_source_fingerprint,
                                 ledger_enabled,
                                 mark_attempting,
                                 record_obligation,
                             )
 
                             if ledger_enabled():
+                                _origin_fingerprint = compute_source_fingerprint(event.source)
                                 _obligation_id = compute_obligation_id(
                                     session_key,
                                     str(getattr(event, "message_id", "") or ""),
                                     text_content,
+                                    origin_fingerprint=_origin_fingerprint,
                                 )
                                 record_obligation(
                                     obligation_id=_obligation_id,
@@ -5364,6 +5367,7 @@ class BasePlatformAdapter(ABC):
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
+                                    origin_fingerprint=_origin_fingerprint,
                                 )
                                 mark_attempting(_obligation_id)
                         except Exception:
