@@ -1008,11 +1008,6 @@ def run_conversation(
             for idx, pfm in enumerate(agent.prefill_messages):
                 api_messages.insert(sys_offset + idx, pfm.copy())
 
-        # Current audience-scoped table context is request-only. Refresh after
-        # tools/compaction without changing the stable prompt or saved history.
-        from agent.desk_table_context import add_desk_table_context
-        api_messages = add_desk_table_context(agent, api_messages)
-
         # Apply Anthropic prompt caching for Claude models on native
         # Anthropic, OpenRouter, and third-party Anthropic-compatible
         # gateways. Auto-detected: if ``_use_prompt_caching`` is set,

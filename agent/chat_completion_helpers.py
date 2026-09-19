@@ -971,10 +971,6 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             raise InterruptedError("Agent interrupted during API call")
-    # The worker may finish before polling observes an interruption. Keep the
-    # same interruption precedence after polling without closing its client again.
-    if agent._interrupt_requested:
-        raise InterruptedError("Agent interrupted during API call (post-worker)")
     if result["error"] is not None:
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved

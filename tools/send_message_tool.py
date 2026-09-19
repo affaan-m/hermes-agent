@@ -178,9 +178,6 @@ def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
 
 
 async def _send_telegram_message_with_retry(bot, *, attempts: int = 3, **kwargs):
-    from gateway.message_failure import active_delivery_attempt
-    if active_delivery_attempt():
-        attempts = 1
     for attempt in range(attempts):
         try:
             return await bot.send_message(**kwargs)
@@ -332,12 +329,6 @@ def _handle_react(args, remove=False):
             "gateway (not available from cron/standalone contexts)."
         )
     fn_name = "remove_reaction" if remove else "add_reaction"
-    from gateway.message_failure import check_delivery, DeliveryPolicyDenied, policy_denial
-    try:
-        # Reaction mutation has no enrolled operation contract in this increment.
-        check_delivery(adapter.config, platform, chat_id, adapter=adapter, operations=("reaction",))
-    except DeliveryPolicyDenied:
-        return json.dumps(policy_denial())
     react_fn = getattr(adapter, fn_name, None)
     if not callable(react_fn):
         return tool_error(
@@ -470,25 +461,36 @@ def _handle_send(args):
                 f"or set a home channel via: hermes config set {home_env} <channel_id>"
             })
 
-    from gateway.message_failure import check_delivery, DeliveryPolicyDenied, policy_denial
-    try:
-        request_metadata = {"thread_id": thread_id} if thread_id is not None else {}
-        check_delivery(pconfig, platform, chat_id, metadata=request_metadata)
-    except DeliveryPolicyDenied:
-        return json.dumps(policy_denial())
-
     duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
     if duplicate_skip:
         return json.dumps(duplicate_skip)
 
-    # Opening a DM creates a destination that this exact grant cannot name.
+    # Slack: resolve user IDs (U...) to DM channel IDs via conversations.open
     if platform_name == "slack" and chat_id and chat_id.startswith("U"):
-        return json.dumps(policy_denial())
+        try:
+            import aiohttp
+            async def _open_slack_dm(token, user_id):
+                url = "https://slack.com/api/conversations.open"
+                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                    async with session.post(url, headers=headers, json={"users": [user_id]}) as resp:
+                        data = await resp.json()
+                        if data.get("ok"):
+                            return data["channel"]["id"]
+                        return None
+            from model_tools import _run_async
+            dm_channel = _run_async(_open_slack_dm(pconfig.token, chat_id))
+            if dm_channel:
+                chat_id = dm_channel
+            else:
+                return json.dumps({"error": f"Could not open DM with Slack user {chat_id}. Check bot permissions (im:write)."})
+        except Exception as e:
+            return json.dumps({"error": f"Failed to open Slack DM: {e}"})
 
     try:
         from model_tools import _run_async
-        result = _run_async(_bound_delivery_coroutine(
-            lambda: _send_to_platform(
+        result = _run_async(
+            _send_to_platform(
                 platform,
                 pconfig,
                 chat_id,
@@ -497,15 +499,12 @@ def _handle_send(args):
                 media_files=media_files,
                 force_document=force_document_attachments,
             )
-        ))
-        if used_home_channel and isinstance(result, dict) and result.get("success") is True and result.get("delivered") is True:
+        )
+        if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
         # Mirror the sent message into the target's gateway session
-        from gateway.message_failure import active_request_adapter
-        if (isinstance(result, dict) and result.get("success") is True
-                and result.get("delivered") is True and mirror_text
-                and active_request_adapter(platform, chat_id) is None):
+        if isinstance(result, dict) and result.get("success") and mirror_text:
             try:
                 from gateway.mirror import mirror_to_session
                 from gateway.session_context import get_session_env
@@ -671,14 +670,14 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
         target_label += f":{thread_id}"
 
     return {
-        "success": False,
-        "delivered": False,
+        "success": True,
         "skipped": True,
         "reason": "cron_auto_delivery_duplicate_target",
         "target": target_label,
         "note": (
-            f"Skipped redundant send_message to {target_label}. No delivery is confirmed. "
-            "The scheduler separately checks authorization for its final response."
+            f"Skipped send_message to {target_label}. This cron job will already auto-deliver "
+            "its final response to that same target. Put the intended user-facing content in "
+            "your final response instead, or use a different target if you want an additional message."
         ),
     }
 
@@ -692,8 +691,6 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
-    metadata=None,
-    output_class=None,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -706,15 +703,6 @@ async def _send_via_adapter(
          the runner weakref is ``None``).
       3. A descriptive error explaining both options.
     """
-    from gateway.message_failure import check_delivery, DeliveryPolicyDenied, policy_denial, is_terminal_delivery_failure, terminal_failure_result, prepare_outbound_text
-    try:
-        metadata = check_delivery(pconfig, platform, chat_id, metadata=metadata, output_class=output_class)
-    except DeliveryPolicyDenied:
-        return policy_denial()
-    chunk = prepare_outbound_text(chunk, metadata["_hermes_output_class"])
-    from gateway.message_audience import OutputClass
-    if metadata["_hermes_output_class"] is OutputClass.SAFE_ERROR:
-        media_files = []
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     runner = None
     try:
@@ -730,8 +718,7 @@ async def _send_via_adapter(
             adapter = None
         if adapter is not None:
             try:
-                metadata = check_delivery(pconfig, platform, chat_id, adapter=adapter,
-                    metadata=metadata, output_class=metadata["_hermes_output_class"])
+                metadata = {}
                 if thread_id:
                     metadata["thread_id"] = thread_id
                 if platform_name == "ntfy" and chat_id:
@@ -739,16 +726,12 @@ async def _send_via_adapter(
                 if not metadata:
                     metadata = None
                 result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
-            except DeliveryPolicyDenied:
-                return policy_denial()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 return {"error": f"Plugin platform send failed: {e}"}
-            if is_terminal_delivery_failure(result):
-                return terminal_failure_result(result)
             if result.success:
-                return _scoped_delivery_receipt(result)
+                return {"success": True, "message_id": result.message_id}
             return {"error": f"Adapter send failed: {result.error}"}
 
     entry = None
@@ -767,7 +750,6 @@ async def _send_via_adapter(
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
-                **_standalone_policy_kwargs(entry.standalone_sender_fn, metadata),
             )
         except asyncio.CancelledError:
             raise
@@ -795,99 +777,7 @@ async def _send_via_adapter(
     }
 
 
-def _bound_delivery_coroutine(factory):
-    """Carry dispatcher context even if the synchronous bridge uses a fresh thread."""
-    import contextvars
-    context = contextvars.copy_context()
-    async def run():
-        return await asyncio.create_task(context.run(factory), context=context)
-    return run()
-
-
-def _scoped_delivery_receipt(result):
-    from collections.abc import Mapping
-    from gateway.message_failure import is_terminal_delivery_failure, terminal_failure_result
-    if is_terminal_delivery_failure(result):
-        return terminal_failure_result(result)
-    def value(key):
-        return result.get(key) if isinstance(result, Mapping) else getattr(result, key, None)
-    if value("delivered") is False and (value("suppressed") is True or value("silent") is True):
-        return {"success": True, "delivered": False, "suppressed": True}
-    if (value("success") is True and value("delivered") is not False
-            and not value("error") and not value("error_kind") and not value("warnings")):
-        receipt = dict(result) if isinstance(result, Mapping) else {"message_id": value("message_id")}
-        return {**receipt, "success": True, "delivered": True}
-    return {"success": False, "delivered": False, "error_kind": "delivery_unknown", "error": "delivery_not_confirmed"}
-
-
-async def _send_present_request(adapter, chat_id, message, media_files, metadata, force_document=False):
-    """Use the authenticated request's exact live adapter, including private text."""
-    from gateway.platforms.base import should_send_media_as_audio
-    last = {"success": True, "delivered": False, "suppressed": True}
-    if message.strip():
-        last = _scoped_delivery_receipt(await adapter.send(chat_id, message, metadata=metadata))
-        if last.get("success") is not True:
-            return last
-    for path, is_voice in media_files or []:
-        ext = os.path.splitext(path)[1].lower()
-        if should_send_media_as_audio(adapter.platform, ext, is_voice):
-            value = await adapter.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata)
-        elif ext in _VIDEO_EXTS:
-            value = await adapter.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
-        elif ext in _IMAGE_EXTS and not force_document:
-            value = await adapter.send_image_file(chat_id=chat_id, image_path=path, metadata=metadata)
-        else:
-            value = await adapter.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
-        last = _scoped_delivery_receipt(value)
-        if last.get("success") is not True:
-            return last
-    return last
-
-
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, *, metadata=None, output_class=None):
-    """One scoped logical delivery, including nested chunks/media/transport calls."""
-    from gateway.message_failure import (
-        delivery_attempt, active_request_adapter, delivery_thread, DeliveryPolicyDenied,
-        DeliveryNotConfirmed, policy_denial, prepare_outbound_text,
-    )
-    from gateway.message_audience import OutputClass
-    routed = dict(metadata or {})
-    if thread_id is not None:
-        # An explicit thread must agree with all existing routing aliases.
-        if "thread_id" in routed and str(routed["thread_id"]) != str(thread_id):
-            return policy_denial()
-        routed["thread_id"] = thread_id
-    kind = output_class or routed.get("_hermes_output_class", OutputClass.FINAL)
-    if kind is OutputClass.SAFE_ERROR:
-        media_files = []
-    operations = ("text", "media") if media_files and message.strip() else (("media",) if media_files else ("text",))
-    try:
-        adapter = active_request_adapter(platform, chat_id)
-        with delivery_attempt(pconfig, platform, chat_id, metadata=routed, adapter=adapter,
-                              output_class=kind, operations=operations) as attempt:
-            routed = attempt.metadata
-            message = prepare_outbound_text(message, kind)
-            if adapter is not None:
-                result = await _send_present_request(adapter, chat_id, message, media_files, routed, force_document)
-            else:
-                result = await _send_to_platform_authorized(platform, pconfig, chat_id, message,
-                    thread_id=delivery_thread(routed), media_files=media_files, force_document=force_document,
-                    metadata=routed, output_class=kind)
-            result = _scoped_delivery_receipt(result)
-            attempt.finish(result)
-            return result
-    except DeliveryPolicyDenied:
-        return policy_denial()
-    except DeliveryNotConfirmed:
-        return {"success": False, "delivered": False, "error_kind": "delivery_unknown", "error": "delivery_not_confirmed"}
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("Scoped message delivery did not confirm")
-        return {"success": False, "delivered": False, "error_kind": "delivery_unknown", "error": "delivery_not_confirmed"}
-
-
-async def _send_to_platform_authorized(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, *, metadata=None, output_class=None):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -895,26 +785,8 @@ async def _send_to_platform_authorized(platform, pconfig, chat_id, message, thre
     (preserves code-block boundaries, adds part indicators).
     """
     from gateway.config import Platform
-    from gateway.message_failure import check_delivery, DeliveryPolicyDenied, policy_denial, prepare_outbound_text
-    try:
-        metadata = check_delivery(pconfig, platform, chat_id, metadata=metadata, output_class=output_class)
-    except DeliveryPolicyDenied:
-        return policy_denial()
-    message = prepare_outbound_text(message, metadata["_hermes_output_class"])
-    from gateway.message_audience import OutputClass
-    output_class = metadata["_hermes_output_class"]
-    if output_class is OutputClass.SAFE_ERROR:
-        media_files = []
 
     media_files = media_files or []
-
-    if thread_id is not None and platform in {Platform.WEIXIN, Platform.SIGNAL, Platform.YUANBAO,
-                                             Platform.BLUEBUBBLES, Platform.QQBOT}:
-        return policy_denial()  # These owned standalone helpers do not carry a thread.
-    if media_files and platform not in {Platform.TELEGRAM, Platform.DISCORD, Platform.MATRIX,
-                                        Platform.WEIXIN, Platform.SIGNAL, Platform.YUANBAO,
-                                        Platform.FEISHU, Platform.WHATSAPP}:
-        return policy_denial()  # Do not confirm text while silently omitting attachments.
 
     # Weixin handles text/media delivery inside its native helper and does not
     # need the optional platform adapter imports below. Keep this branch early
@@ -1016,8 +888,8 @@ async def _send_to_platform_authorized(platform, pconfig, chat_id, message, thre
                 media_files=media_files,
                 caption=_dc_caption,
             )
-            if _scoped_delivery_receipt(result).get("delivered") is not True:
-                return _scoped_delivery_receipt(result)
+            if isinstance(result, dict) and result.get("error"):
+                return result
             return result
         last_result = None
         for i, chunk in enumerate(chunks):
@@ -1029,8 +901,8 @@ async def _send_to_platform_authorized(platform, pconfig, chat_id, message, thre
                 thread_id=thread_id,
                 media_files=media_files if is_last else [],
             )
-            if _scoped_delivery_receipt(result).get("delivered") is not True:
-                return _scoped_delivery_receipt(result)
+            if isinstance(result, dict) and result.get("error"):
+                return result
             last_result = result
         return last_result
 
@@ -1050,8 +922,8 @@ async def _send_to_platform_authorized(platform, pconfig, chat_id, message, thre
                 media_files=media_files if is_last else [],
                 thread_id=thread_id,
             )
-            if _scoped_delivery_receipt(result).get("delivered") is not True:
-                return _scoped_delivery_receipt(result)
+            if isinstance(result, dict) and result.get("error"):
+                return result
             last_result = result
         return last_result
 
@@ -1066,8 +938,8 @@ async def _send_to_platform_authorized(platform, pconfig, chat_id, message, thre
                 chunk,
                 media_files=media_files if is_last else [],
             )
-            if _scoped_delivery_receipt(result).get("delivered") is not True:
-                return _scoped_delivery_receipt(result)
+            if isinstance(result, dict) and result.get("error"):
+                return result
             last_result = result
         return last_result
 
@@ -1081,8 +953,8 @@ async def _send_to_platform_authorized(platform, pconfig, chat_id, message, thre
                 chunk,
                 media_files=media_files if is_last else None,
             )
-            if _scoped_delivery_receipt(result).get("delivered") is not True:
-                return _scoped_delivery_receipt(result)
+            if isinstance(result, dict) and result.get("error"):
+                return result
             last_result = result
         return last_result
 
@@ -1105,8 +977,8 @@ async def _send_to_platform_authorized(platform, pconfig, chat_id, message, thre
                 media_files=media_files if is_last else None,
                 thread_id=thread_id,
             )
-            if _scoped_delivery_receipt(result).get("delivered") is not True:
-                return _scoped_delivery_receipt(result)
+            if isinstance(result, dict) and result.get("error"):
+                return result
             last_result = result
         return last_result
 
@@ -1142,8 +1014,8 @@ async def _send_to_platform_authorized(platform, pconfig, chat_id, message, thre
                 force_document=force_document,
                 caption=_wa_caption,
             )
-            if _scoped_delivery_receipt(result).get("delivered") is not True:
-                return _scoped_delivery_receipt(result)
+            if isinstance(result, dict) and result.get("error"):
+                return result
             return result
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
@@ -1155,8 +1027,8 @@ async def _send_to_platform_authorized(platform, pconfig, chat_id, message, thre
                 thread_id=thread_id,
                 force_document=force_document,
             )
-            if _scoped_delivery_receipt(result).get("delivered") is not True:
-                return _scoped_delivery_receipt(result)
+            if isinstance(result, dict) and result.get("error"):
+                return result
             last_result = result
         return last_result
 
@@ -1187,23 +1059,22 @@ async def _send_to_platform_authorized(platform, pconfig, chat_id, message, thre
                 result = {"error": "Slack plugin not registered or missing standalone_sender_fn"}
             else:
                 result = await _slack_entry.standalone_sender_fn(
-                    pconfig, chat_id, chunk, thread_id=thread_id,
-                    metadata=metadata, output_class=output_class,
+                    pconfig, chat_id, chunk, thread_id=thread_id
                 )
         elif platform == Platform.WHATSAPP:
-            result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id, metadata=metadata, output_class=output_class)
+            result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.SIGNAL:
             result = await _send_signal(pconfig.extra, chat_id, chunk)
         elif platform == Platform.EMAIL:
-            result = await _registry_standalone_send("email", pconfig, chat_id, chunk, thread_id, metadata=metadata, output_class=output_class)
+            result = await _registry_standalone_send("email", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.SMS:
-            result = await _registry_standalone_send("sms", pconfig, chat_id, chunk, thread_id, metadata=metadata, output_class=output_class)
+            result = await _registry_standalone_send("sms", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.DINGTALK:
-            result = await _registry_standalone_send("dingtalk", pconfig, chat_id, chunk, thread_id, metadata=metadata, output_class=output_class)
+            result = await _registry_standalone_send("dingtalk", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.FEISHU:
-            result = await _registry_standalone_send("feishu", pconfig, chat_id, chunk, thread_id, metadata=metadata, output_class=output_class)
+            result = await _registry_standalone_send("feishu", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.WECOM:
-            result = await _registry_standalone_send("wecom", pconfig, chat_id, chunk, thread_id, metadata=metadata, output_class=output_class)
+            result = await _registry_standalone_send("wecom", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.BLUEBUBBLES:
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
         elif platform == Platform.QQBOT:
@@ -1221,11 +1092,10 @@ async def _send_to_platform_authorized(platform, pconfig, chat_id, message, thre
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
-                metadata=metadata, output_class=output_class,
             )
 
-        if _scoped_delivery_receipt(result).get("delivered") is not True:
-            return _scoped_delivery_receipt(result)
+        if isinstance(result, dict) and result.get("error"):
+            return result
         last_result = result
 
     if warning and isinstance(last_result, dict) and last_result.get("success"):
@@ -1252,8 +1122,6 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
     already contains HTML tags, it is sent with ``parse_mode='HTML'``
     instead, bypassing MarkdownV2 conversion.
     """
-    from gateway.message_failure import active_delivery_attempt
-    scoped = active_delivery_attempt()
     try:
         from telegram import Bot
         from telegram.constants import ParseMode
@@ -1378,8 +1246,6 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         parse_mode=send_parse_mode, **text_kwargs
                     )
                 except Exception as md_error:
-                    if scoped:
-                        raise  # No route-changing or ambiguous retry in a scoped attempt.
                     # Thread not found — retry without message_thread_id so the
                     # message still delivers (matching the gateway adapter's
                     # fallback behaviour, issue #27012).
@@ -1418,8 +1284,6 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
 
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):
-                if scoped:
-                    raise RuntimeError("scoped_media_not_delivered")
                 warning = f"Media file not found, skipping: {media_path}"
                 logger.warning(warning)
                 warnings.append(warning)
@@ -1481,8 +1345,6 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                                 chat_id=int_chat_id, document=f, **media_kwargs
                             )
                     except Exception as media_err:
-                        if scoped:
-                            raise
                         if _is_telegram_thread_not_found(media_err) and media_kwargs.get("message_thread_id"):
                             # Thread not found for media — retry without
                             # message_thread_id (issue #27012).
@@ -1547,8 +1409,6 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         else:
                             raise
             except Exception as e:
-                if scoped:
-                    raise
                 warning = _sanitize_error_text(f"Failed to send media {media_path}: {e}")
                 logger.error(warning)
                 warnings.append(warning)
@@ -1578,43 +1438,20 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
 # (plugins/platforms/slack/adapter.py), wired via standalone_sender_fn. #41112.
 
 
-def _standalone_policy_kwargs(sender, metadata):
-    """Forward policy/routing to capable plugins after the shared guard.
-
-    Older non-Slack plugins retain their contract; their supplied target and
-    prepared content were already checked by this dispatcher.
-    """
-    import inspect
-    parameters = inspect.signature(sender).parameters
-    result = {}
-    if "metadata" in parameters:
-        result["metadata"] = metadata
-    if "output_class" in parameters:
-        result["output_class"] = metadata["_hermes_output_class"]
-    return result
-
-
-async def _registry_standalone_send(platform_name, pconfig, chat_id, message, thread_id=None, *, metadata=None, output_class=None):
+async def _registry_standalone_send(platform_name, pconfig, chat_id, message, thread_id=None):
     """Dispatch a one-shot send through a migrated platform plugin's
     standalone_sender_fn (registry hook).  Used for platforms whose adapter
     moved out of gateway/platforms/ into plugins/platforms/<name>/ (#41112):
     the legacy inline ``_send_<platform>`` helper now lives in the plugin as
     ``_standalone_send`` and is reached via the platform registry.
     """
-    from gateway.message_failure import check_delivery, DeliveryPolicyDenied, policy_denial, prepare_outbound_text
-    try:
-        bound = check_delivery(pconfig, platform_name, chat_id, metadata=metadata, output_class=output_class)
-    except DeliveryPolicyDenied:
-        return policy_denial()
-    message = prepare_outbound_text(message, bound["_hermes_output_class"])
     from gateway.platform_registry import platform_registry
     from hermes_cli.plugins import discover_plugins
     discover_plugins()  # idempotent — ensure the entry is registered
     entry = platform_registry.get(platform_name)
     if entry is None or entry.standalone_sender_fn is None:
         return {"error": f"{platform_name} plugin not registered or missing standalone_sender_fn"}
-    return await entry.standalone_sender_fn(pconfig, chat_id, message, thread_id=thread_id,
-        **_standalone_policy_kwargs(entry.standalone_sender_fn, bound))
+    return await entry.standalone_sender_fn(pconfig, chat_id, message, thread_id=thread_id)
 
 
 # _send_whatsapp moved to plugins/platforms/whatsapp/adapter.py::_standalone_send,

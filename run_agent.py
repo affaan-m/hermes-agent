@@ -570,9 +570,6 @@ class AIAgent:
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
         )
-        # Optional protected host binding; generic CLI remains unconfigured.
-        from agent.desk_table_host import bind_host_context
-        bind_host_context(self)
 
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
@@ -1011,9 +1008,6 @@ class AIAgent:
     def _buffer_vprint(self, message: str) -> None:
         """Buffer a vprint(force=True) retry/fallback line."""
         try:
-            # Print renderers bypass logging formatters. Keep retry details,
-            # but redact credentials before this diagnostic reaches a sink.
-            message = redact_sensitive_text(message, force=True, redact_url_credentials=True)
             buf = getattr(self, "_retry_status_buffer", None)
             if buf is None:
                 buf = []
