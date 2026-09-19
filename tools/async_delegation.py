@@ -133,7 +133,9 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch")
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch",
+                    "routing_platform", "routing_chat_id", "routing_chat_type",
+                    "routing_thread_id")
         if key in record
     }
     with _DB_LOCK, _connect() as conn:
@@ -243,7 +245,12 @@ def recover_abandoned_delegations() -> int:
             task = json.loads(task_json or "{}")
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
-                "session_key": session_key, "origin_ui_session_id": origin_ui,
+                "session_key": session_key,
+                "platform": task.get("routing_platform", ""),
+                "chat_id": task.get("routing_chat_id", ""),
+                "chat_type": task.get("routing_chat_type", ""),
+                "thread_id": task.get("routing_thread_id", ""),
+                "origin_ui_session_id": origin_ui,
                 "parent_session_id": parent_id, "goal": task.get("goal", ""),
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
@@ -443,6 +450,10 @@ def dispatch_async_delegation(
     role: str,
     model: Optional[str],
     session_key: str,
+    routing_platform: str = "",
+    routing_chat_id: str = "",
+    routing_chat_type: str = "",
+    routing_thread_id: str = "",
     parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
@@ -493,6 +504,10 @@ def dispatch_async_delegation(
         "role": role,
         "model": model,
         "session_key": session_key,
+        "routing_platform": routing_platform,
+        "routing_chat_id": routing_chat_id,
+        "routing_chat_type": routing_chat_type,
+        "routing_thread_id": routing_thread_id,
         "origin_ui_session_id": origin_ui_session_id,
         "parent_session_id": parent_session_id,
         "status": "running",
@@ -613,6 +628,10 @@ def _push_completion_event(
         # session_key routes the completion back to the originating gateway
         # session; empty string => CLI (single-session) path.
         "session_key": record.get("session_key", ""),
+        "platform": record.get("routing_platform", ""),
+        "chat_id": record.get("routing_chat_id", ""),
+        "chat_type": record.get("routing_chat_type", ""),
+        "thread_id": record.get("routing_thread_id", ""),
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
         "goal": record.get("goal", ""),
@@ -650,6 +669,10 @@ def dispatch_async_delegation_batch(
     role: str,
     model: Optional[str],
     session_key: str,
+    routing_platform: str = "",
+    routing_chat_id: str = "",
+    routing_chat_type: str = "",
+    routing_thread_id: str = "",
     parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
@@ -693,6 +716,10 @@ def dispatch_async_delegation_batch(
         "role": role,
         "model": model,
         "session_key": session_key,
+        "routing_platform": routing_platform,
+        "routing_chat_id": routing_chat_id,
+        "routing_chat_type": routing_chat_type,
+        "routing_thread_id": routing_thread_id,
         "origin_ui_session_id": origin_ui_session_id,
         "parent_session_id": parent_session_id,
         "status": "running",
@@ -793,6 +820,10 @@ def _finalize_batch(
         "type": "async_delegation",
         "delegation_id": delegation_id,
         "session_key": event_record.get("session_key", ""),
+        "platform": event_record.get("routing_platform", ""),
+        "chat_id": event_record.get("routing_chat_id", ""),
+        "chat_type": event_record.get("routing_chat_type", ""),
+        "thread_id": event_record.get("routing_thread_id", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "parent_session_id": event_record.get("parent_session_id"),
         "goal": event_record.get("goal", ""),

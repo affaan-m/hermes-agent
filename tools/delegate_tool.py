@@ -2934,6 +2934,10 @@ def delegate_task(
             return json.dumps(_sync_result, ensure_ascii=False)
 
         _session_key = get_current_session_key(default="")
+        _routing_platform = ""
+        _routing_chat_id = ""
+        _routing_chat_type = ""
+        _routing_thread_id = ""
         _origin_ui_session_id = ""
         try:
             from gateway.session_context import get_session_env
@@ -2967,6 +2971,15 @@ def delegate_task(
             _agent_session_id = str(getattr(parent_agent, "session_id", "") or "")
             if _agent_session_id:
                 _session_key = _agent_session_id
+        # Capture routing metadata from the parent agent when the session_key
+        # is a task id (bg_*) rather than a parseable gateway session key.
+        # Without this, _parse_session_key fails on restart and the completion
+        # event is dropped as 'Synthetic event source unresolvable'.
+        if _session_key and _session_key.startswith("bg_"):
+            _routing_platform = str(getattr(parent_agent, "platform", "") or "")
+            _routing_chat_id = str(getattr(parent_agent, "_chat_id", "") or "")
+            _routing_chat_type = str(getattr(parent_agent, "_chat_type", "") or "")
+            _routing_thread_id = str(getattr(parent_agent, "_thread_id", "") or "")
         _parent_session_id = getattr(parent_agent, "session_id", None)
         _child_agents = [c for (_, _, c) in children]
 
@@ -3008,6 +3021,10 @@ def delegate_task(
             role=top_role,
             model=creds["model"],
             session_key=_session_key,
+            routing_platform=_routing_platform,
+            routing_chat_id=_routing_chat_id,
+            routing_chat_type=_routing_chat_type,
+            routing_thread_id=_routing_thread_id,
             origin_ui_session_id=_origin_ui_session_id,
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
