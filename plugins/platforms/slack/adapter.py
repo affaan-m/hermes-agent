@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import time
+import threading
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, ClassVar, Dict, Optional, Any, Tuple, List
@@ -56,6 +57,7 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
 
 
 logger = logging.getLogger(__name__)
+_SLACK_DESTINATION_DIAGNOSTIC_LOCK = threading.Lock()
 
 # User-Agent prefix (``HermesAgent/<version>``) for platform-partner attribution of API calls.
 try:
@@ -236,6 +238,7 @@ _slash_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "_slash_user_id", default=None)
 
 
+
 @dataclass
 class _ThreadContextCache:
     """Cache entry for fetched thread context."""
@@ -369,6 +372,7 @@ def _collect_slack_block_mentions(blocks: list) -> list:
     except Exception:  # pragma: no cover - defensive, never break gating
         return []
     return mentions
+
 
 
 def _slack_mention_detection_text(event: dict) -> str:
@@ -1095,6 +1099,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._native_stream_unsupported = False
         # Socket Mode self-healing state for silently dropped websockets; the monotonic
         # start time is the grace window for the first ping/pong.
+
         self._app_token: Optional[str] = None
         self._proxy_url: Optional[str] = None
         self._socket_watchdog_task: Optional[asyncio.Task] = None
@@ -1439,6 +1444,7 @@ class SlackAdapter(BasePlatformAdapter):
         return None
 
     def _purge_stale_slash_contexts(self) -> None:
+
         now = time.monotonic()
         for k in [
             k for k, v in self._slash_command_contexts.items()
@@ -1447,6 +1453,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _format_chunks(self, content: str) -> List[str]:
         """mrkdwn-format ``content`` and split to ``MAX_MESSAGE_LENGTH`` (never empty)."""
+
         formatted = self.format_message(content)
         return self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH) or [formatted]
 
@@ -1490,6 +1497,7 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[Slack] response_url POST failed: %s", e)
             return SendResult(success=False, error=str(e))
+
 
     async def _post_ephemeral_fallback(
         self, chat_id: str, ctx: Dict[str, Any], content: str) -> "SendResult":
@@ -1595,6 +1603,16 @@ class SlackAdapter(BasePlatformAdapter):
 
             return _listener
 
+        def _intake_listener_for(handler):
+            # Bolt's authenticated listeners expose the AuthorizeResult via context;
+            # the intake receipt pins the producer's workspace identity.
+            async def _listener(event, say, body, context):
+                await handler(
+                    event, body,
+                    _inventory_intake=self._inventory_callback_receipt(event, context))
+
+            return _listener
+
         for event_type, handler in (
             ("message", self._handle_slack_message), ("app_mention", self._handle_slack_message),
             ("app_home_opened", self._handle_app_home_opened),
@@ -1604,7 +1622,10 @@ class SlackAdapter(BasePlatformAdapter):
             ("reaction_removed", _reaction(True)),
             ("assistant_thread_started", self._handle_assistant_thread_lifecycle_event),
             ("assistant_thread_context_changed", self._handle_assistant_thread_lifecycle_event)):
-            self._app.event(event_type)(_listener_for(handler))
+            if event_type in ("message", "app_mention"):
+                self._app.event(event_type)(_intake_listener_for(handler))
+            else:
+                self._app.event(event_type)(_listener_for(handler))
         # Catch-all ack: unacked envelopes count as failures and past 95%/60-min Slack disables
         # Event Subscriptions (ALL inbound). Registered AFTER all named handlers (first match wins).
         # Catch-all no-op ack for any other subscribed event type that Hermes has no listener for (e.g.
@@ -1645,6 +1666,26 @@ class SlackAdapter(BasePlatformAdapter):
             slash = (command.get("command") or "").lstrip("/")
             await ack(response_type="ephemeral", text=f"Running `/{slash}`…")
             await self._handle_slash_command(command)
+
+        # /ito-link is NOT a gateway command: it mints a panel identity
+        # bind nonce and answers ephemerally, never entering the
+        # agent-turn pipeline. Slack only delivers it over Socket Mode
+        # once the command is declared in the app manifest.
+        @self._app.command("/ito-link")
+        async def handle_ito_link_command(ack, command):
+            await ack(
+                response_type="ephemeral",
+                text="Minting your private Itô identity link…",
+            )
+            channel_id = command.get("channel_id") or ""
+            await self._handle_ito_link_request(
+                channel_id=channel_id,
+                user_id=command.get("user_id") or "",
+                team_id=command.get("team_id") or "",
+                display_name=command.get("user_name") or None,
+                is_dm=channel_id.startswith("D"),
+                reply_to=None,
+            )
 
         # Approval buttons, slash-confirm buttons (tools/slash_confirm.py), feedback.
         for _action_id in self._APPROVAL_CHOICES:
@@ -1770,12 +1811,14 @@ class SlackAdapter(BasePlatformAdapter):
             self._app = AsyncApp(
                 token=bot_tokens[0], client=self._new_web_client(bot_tokens[0], proxy_url),
                 before_authorize=_slack_per_request_proxy_middleware(proxy_url))
+
             _apply_slack_proxy(self._app.client, proxy_url)
             for token in bot_tokens:
                 await self._authenticate_workspace(token, proxy_url)
             self._register_bolt_handlers()
             # _running=True only once the handler is alive (watchdog needs the live
             # task); on failure keep it False so ``finally`` releases the lock.
+
             try:
                 self._start_socket_mode_handler()
                 self._running = True
@@ -1908,13 +1951,24 @@ class SlackAdapter(BasePlatformAdapter):
         team_id = chat_id and (getattr(self, "_channel_team", None) or {}).get(str(chat_id))
         return str(team_id) if team_id else None
 
+
     def _get_client(self, chat_id: str, team_id: Optional[str] = None) -> Any:
         """Return the workspace-specific WebClient for a channel."""
+        from gateway.inventory_context import delivery_client
+        pinned = delivery_client(self, chat_id, team_id=team_id)
+        if pinned is not None:
+            return pinned
         if team_id:
             client = self._team_clients.get(team_id)
             if client is None:
                 # An explicit workspace must never fall back to another bot,
                 # including after reconnects between chunks of one response.
+                # Slack Connect: a message from an external workspace carries
+                # that workspace's team id; with a single installed workspace
+                # the only correct bot is ours (MAIN fix 2026-09-17).
+                if len(self._team_clients) == 1:
+                    logger.warning("[Slack] team %s has no client; single-workspace fallback for chat %s", team_id, chat_id)
+                    return next(iter(self._team_clients.values()))
                 raise RuntimeError("Slack workspace is unavailable")
             return client
         team_id = self._channel_team.get(chat_id)
@@ -2013,6 +2067,119 @@ class SlackAdapter(BasePlatformAdapter):
             return None
         return self._workspace_thread_key(
             self._metadata_team_id(metadata), chat_id, str(thread_ts))
+
+
+    def _send_retry_is_final(self, result: "SendResult") -> bool:
+        # Slack destination/permission rejections cannot be repaired by
+        # changing formatting. Keep other platforms and unknown failures intact.
+        return result.error_kind in {"not_found", "forbidden"}
+
+    def _inventory_route_denial(self, chat_id, reply_to=None, metadata=None):
+        """Preflight pinned media/status routes before file/network/fallback work."""
+        from gateway.inventory_context import has_intake_delivery, InventoryDeliveryDenied
+        if not has_intake_delivery():
+            return None
+        try:
+            self._resolve_thread_ts(reply_to, metadata)
+            self._get_client(chat_id, team_id=self._metadata_team_id(metadata))
+        except InventoryDeliveryDenied as exc:
+            return self._slack_destination_failure(exc, None)
+        return None
+
+    def _slack_destination_route(self, client, chat_id, thread_ts, requested_team):
+        """Snapshot observed identifiers before awaiting the actual SDK client."""
+        def identifier(value, pattern):
+            return value if isinstance(value, str) and len(value) <= 40 and re.fullmatch(pattern, value) else "unknown"
+        teams = [team for team, registered in self._team_clients.items() if registered is client]
+        selected = teams[0] if len(teams) == 1 else None
+        caller = "unknown"
+        # Code-frame names only. Never inspect frame locals, event flags or
+        # model-supplied producer metadata, and never retain frame references.
+        allowed = {
+            "_send_restart_notification", "_send_home_channel_startup_notifications",
+            "_send_update_notification", "_redeliver_pending_obligations",
+            "_send_with_retry", "_process_message_background",
+        }
+        frame = None
+        try:
+            frame = sys._getframe(1)
+            for _ in range(12):
+                if frame is None:
+                    break
+                name = frame.f_code.co_name
+                filename = frame.f_code.co_filename.replace("\\", "/")
+                if name in allowed and filename.endswith(("/gateway/run.py", "/gateway/platforms/base.py",
+                                          "/gateway/run_notifications.py", "/gateway/run_startup.py")):
+                    caller = name
+                    break
+                frame = frame.f_back
+        except (AttributeError, ValueError):
+            pass
+        finally:
+            del frame
+        return (
+            identifier(requested_team, r"T[A-Z0-9]{2,31}"),
+            identifier(selected, r"T[A-Z0-9]{2,31}"),
+            identifier(chat_id, r"[CDGUW][A-Z0-9]{2,31}"),
+            identifier(thread_ts, r"[0-9]{1,16}\.[0-9]{1,9}"), caller,
+        )
+
+    def _slack_destination_failure(self, exc, route):
+        """Classify exact SDK rejection codes, with no provider text in results."""
+        from gateway.inventory_context import InventoryDeliveryDenied, InventoryDeliveryUnconfirmed
+        if isinstance(exc, InventoryDeliveryUnconfirmed):
+            return SendResult(
+                success=False, error="Slack did not confirm this response. Do not resend it automatically.",
+                error_kind="forbidden", retryable=False,
+            )
+        if isinstance(exc, InventoryDeliveryDenied):
+            return SendResult(
+                success=False, error="This response cannot be delivered to the selected conversation.",
+                error_kind="forbidden", retryable=False,
+            )
+        from slack_sdk.errors import SlackApiError
+        if not isinstance(exc, SlackApiError) or route is None:
+            return None
+        code = exc.response.get("error")
+        categories = {
+            "channel_not_found": "not_found",
+            "not_in_channel": "forbidden", "no_permission": "forbidden",
+            "missing_scope": "forbidden", "is_archived": "forbidden",
+            "restricted_action": "forbidden",
+        }
+        if not isinstance(code, str) or code not in categories:
+            return None
+        # Per-adapter bounded diagnostics: at most 64 route/code entries,
+        # at most one warning per identical tuple per minute. No message text,
+        # provider response, credentials, frame locals or target mutation.
+        emit = False
+        try:
+            now = time.monotonic()
+            key = (code, *route)
+            with _SLACK_DESTINATION_DIAGNOSTIC_LOCK:
+                recent = getattr(self, "_slack_destination_diagnostics", None)
+                if not isinstance(recent, dict):
+                    recent = {}
+                    self._slack_destination_diagnostics = recent
+                for stale in [item for item, seen in recent.items() if now - seen >= 60]:
+                    del recent[stale]
+                if key not in recent and len(recent) < 64:
+                    recent[key] = now
+                    emit = True
+            if emit:
+                logger.warning(
+                    "Slack destination rejected operation=chat.postMessage code=%s "
+                    "requested_workspace=%s selected_workspace=%s channel=%s thread=%s caller=%s",
+                    code, *route,
+                )
+        except Exception:
+            # Diagnostic failure must not expose the original exception or
+            # change the classified terminal outcome.
+            pass
+        return SendResult(
+            success=False, error="Unable to deliver this message to the selected conversation.",
+            error_kind=categories[code], retryable=False,
+        )
 
     def native_task_card_destination_supported(
         self, chat_id: str, *, reply_to: Optional[str] = None,
@@ -2153,9 +2320,16 @@ class SlackAdapter(BasePlatformAdapter):
             return blocked
         chat_id = await self._dm_target(chat_id, metadata)
         thread_ts = None
+        _destination_route = None
         try:
             team_id = self._metadata_team_id(metadata)
-            slash_ctx = self._pop_slash_context(chat_id, team_id)
+            # Check for a pending slash-command context.  When the user ran a
+            # native slash command (e.g. /q, /stop, /model), the initial ack
+            # already showed an ephemeral "Running /cmd…" message.  If we have
+            # a stashed response_url for this channel, replace that ack with
+            # the actual command reply ephemerally instead of posting publicly.
+            from gateway.inventory_context import has_intake_delivery
+            slash_ctx = None if has_intake_delivery() else self._pop_slash_context(chat_id, team_id)
             if slash_ctx:
                 return await self._send_slash_reply(chat_id, slash_ctx, content, metadata)
             # An active native stream that this content finalizes IS the final
@@ -2173,6 +2347,8 @@ class SlackAdapter(BasePlatformAdapter):
                 # stay stuck on "is thinking..." (#24117).
                 return SendResult(success=True)
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            _destination_route = self._slack_destination_route(
+                self._get_client(chat_id, team_id=team_id), chat_id, thread_ts, team_id)
             last_result = await self._post_chunks(chat_id, team_id, content, formatted, thread_ts)
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -2194,6 +2370,13 @@ class SlackAdapter(BasePlatformAdapter):
             # (formatting, slash-context, DM resolution): stop_typing falls back to metadata / the uniquely
             # tracked status for this channel, so a failed turn cannot leave "is thinking..." visible
             # (#24117).
+            from gateway.inventory_context import InventoryDeliveryDenied
+            if isinstance(e, InventoryDeliveryDenied):
+                return self._slack_destination_failure(e, _destination_route)
+            classified = self._slack_destination_failure(e, _destination_route)
+            if classified is not None:
+                return classified
+
             logger.error("[Slack] Send error: %s", e, exc_info=True)
             _retryable = self._is_retryable_upload_error(e)
             return SendResult(
@@ -2221,9 +2404,25 @@ class SlackAdapter(BasePlatformAdapter):
                 kwargs["thread_ts"] = thread_ts
                 if broadcast and i == 0:
                     kwargs["reply_broadcast"] = True
-            client_fn = lambda: self._get_client(chat_id, team_id=team_id)  # noqa: E731
+            _selected_client = self._get_client(chat_id, team_id=team_id)
+            from gateway.inventory_context import reserve_delivery
+            reserve_delivery(self, chat_id, thread_ts, team_id=team_id)
+            client_fn = lambda: _selected_client  # noqa: E731
             last_result = await self._call_with_block_fallback(
                 client_fn, "chat_postMessage", kwargs, "send")
+            # Only acknowledged public posts belong to this intake for edits.
+            # Unknown/ambiguous results and ephemeral IDs grant no ownership.
+            from gateway.inventory_context import (
+                has_intake_delivery, record_delivery, InventoryDeliveryUnconfirmed)
+            if has_intake_delivery():
+                try:
+                    confirmed = last_result.get("ok") is True and last_result.get("channel") == chat_id
+                    acknowledged_id = last_result.get("ts")
+                except Exception:
+                    raise InventoryDeliveryUnconfirmed("Slack response acknowledgment is unavailable") from None
+                if (not confirmed or record_delivery(self, chat_id, acknowledged_id, thread_ts,
+                                                    team_id=team_id) is not True):
+                    raise InventoryDeliveryUnconfirmed("Slack response acknowledgment is unavailable")
         return last_result
 
     @staticmethod
@@ -2264,6 +2463,8 @@ class SlackAdapter(BasePlatformAdapter):
         if not chat_id or not user_id:
             return SendResult(success=False, error="chat_id and user_id are required")
         try:
+            from gateway.inventory_context import validate_private_recipient
+            validate_private_recipient(self, user_id)
             formatted = self.format_message(content)
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             kwargs = {"channel": chat_id, "user": user_id, "text": formatted, "mrkdwn": True}
@@ -2274,8 +2475,79 @@ class SlackAdapter(BasePlatformAdapter):
                 success=True, message_id=result.get("message_ts") or result.get("ts"),
                 raw_response=result)
         except Exception as e:  # pragma: no cover - defensive logging
+            classified = self._slack_destination_failure(e, None)
+            if classified is not None:
+                return classified
             logger.error("[Slack] Ephemeral send error: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
+
+    async def _handle_ito_link_request(
+        self,
+        *,
+        channel_id: str,
+        user_id: str,
+        team_id: str,
+        display_name: Optional[str],
+        is_dm: bool,
+        reply_to: Optional[str],
+    ) -> None:
+        """Answer an /ito-link (or DM `link`) request with a private bind URL.
+
+        Channels get a chat.postEphemeral (only the requester sees the URL);
+        DMs get a normal reply (the conversation is already private). Every
+        outcome answers — never silent — and neither the nonce nor the bind
+        URL is logged.
+        """
+        from .ito_link import (
+            ItoLinkMintError,
+            link_error_message,
+            link_ready_message,
+            mint_link_nonce,
+        )
+
+        if not channel_id or not user_id:
+            logger.warning("[Slack] ito-link request missing channel or user id")
+            return
+        try:
+            minted = await mint_link_nonce(
+                team_id=team_id,
+                member_id=user_id,
+                display_name=display_name,
+            )
+            content = link_ready_message(minted["bind_url"])
+            logger.info(
+                "[Slack] ito-link nonce minted for team=%s member=%s",
+                team_id,
+                user_id,
+            )
+        except ItoLinkMintError as e:
+            content = link_error_message(e)
+            logger.warning(
+                "[Slack] ito-link mint failed kind=%s team=%s member=%s",
+                e.kind,
+                team_id,
+                user_id,
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            content = link_error_message(ItoLinkMintError("unavailable"))
+            logger.error(
+                "[Slack] ito-link mint unexpected error: %s", e, exc_info=True,
+            )
+        if is_dm:
+            await self.send(
+                channel_id,
+                content,
+                reply_to=reply_to,
+                metadata={"team_id": team_id} if team_id else None,
+            )
+        else:
+            await self.send_private_notice(
+                channel_id,
+                user_id,
+                content,
+                reply_to=reply_to,
+                metadata={"team_id": team_id} if team_id else None,
+            )
 
     async def send_or_update_status(
         self, chat_id: str, status_key: str, content: str, *,
@@ -2310,6 +2582,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._status_message_ids[key] = str(result.message_id)
         return result
 
+
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -2318,6 +2591,10 @@ class SlackAdapter(BasePlatformAdapter):
         if blocked:
             return blocked
         try:
+            from gateway.inventory_context import validate_edit
+            validate_edit(self, chat_id, message_id, team_id=self._metadata_team_id(metadata))
+            if metadata and ("thread_id" in metadata or "thread_ts" in metadata):
+                self._resolve_thread_ts(None, metadata)
             formatted = self.format_message(content)
             # chat.update has postMessage's ~40k limit but cannot split, so truncate to fit
             # (an oversized payload fails the whole edit with ``msg_too_long``).
@@ -2327,6 +2604,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "channel": chat_id, "ts": message_id, "text": formatted}
             # Block Kit only on the FINAL edit: re-deriving a layout on every streaming flush
             # would be wasteful and jittery. ``text`` is the fallback either way.
+
             if finalize:
                 blocks = self._maybe_blocks(content)
                 if blocks:
@@ -2337,6 +2615,9 @@ class SlackAdapter(BasePlatformAdapter):
                 await self._clear_thread_status_quietly(chat_id, metadata)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
+            classified = self._slack_destination_failure(e, None)
+            if classified is not None:
+                return classified
             if finalize:
                 await self._clear_thread_status_quietly(chat_id, metadata)
             if _is_transient_transport_error(e):
@@ -2368,6 +2649,7 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug(
                 "[Slack] Failed to delete message %s in channel %s: %s", message_id, chat_id, e)
             return False
+
 
     # Native streaming (chat.startStream/appendStream/stopStream). Unlike Telegram drafts a Slack
     # stream IS the final message: ``send()`` seals it instead of posting a duplicate. Needs the
@@ -2403,6 +2685,14 @@ class SlackAdapter(BasePlatformAdapter):
         ``content`` is the full accumulated text (append-only within one text segment)."""
         if not self._app:
             return SendResult(success=False, error="Not connected")
+        from gateway.inventory_context import has_intake_delivery
+        if has_intake_delivery():
+            _denial = self._inventory_route_denial(chat_id, None, metadata)
+            if _denial is not None:
+                return _denial
+            if self._resolve_thread_ts(None, metadata) is None:
+                return SendResult(success=False, error="intake thread unavailable",
+                                  error_kind="forbidden", retryable=False)
         if self._native_stream_unsupported:
             return SendResult(success=False, error="native streaming unsupported")
         text = self._strip_stream_cursor(content)
@@ -2531,6 +2821,12 @@ class SlackAdapter(BasePlatformAdapter):
             return
         if not self._app:
             return
+        from gateway.inventory_context import has_intake_delivery
+        if has_intake_delivery():
+            if self._inventory_route_denial(chat_id, None, metadata) is not None:
+                return
+            if self._resolve_thread_ts(None, metadata) is None:
+                return
         thread_ts = None
         if metadata:
             # Same synthetic-thread guard as sending: with reply_in_thread=false thread_id is the
@@ -2593,6 +2889,13 @@ class SlackAdapter(BasePlatformAdapter):
             return
         if not self._app:
             return
+        from gateway.inventory_context import has_intake_delivery
+        if has_intake_delivery():
+            if self._inventory_route_denial(chat_id, None, metadata) is not None:
+                return
+            if self._resolve_thread_ts(None, metadata) is None:
+                return
+
         requested_thread_ts = ""
         if metadata:
             requested_thread_ts = str(metadata.get("thread_id") or metadata.get("thread_ts") or "")
@@ -2708,18 +3011,24 @@ class SlackAdapter(BasePlatformAdapter):
         ts). With ``reply_in_thread: false`` top-level messages get flat replies."""
         # Inbound sets metadata.thread_id to the message's own ts for top-level messages
         # (session keying), so thread_id == reply_to means a synthetic thread → reply flat.
+        from gateway.inventory_context import has_intake_delivery, validate_delivery_metadata, validate_delivery_thread
+        validate_delivery_metadata(self, reply_to, metadata)
+
         if not self.config.extra.get("reply_in_thread", True):
             md = metadata or {}
             existing_thread = md.get("thread_id") or md.get("thread_ts")
             if existing_thread and reply_to and existing_thread == reply_to:
-                existing_thread = None
-            return existing_thread or None
+                # The opaque intake distinguishes a genuine root from its
+                # own synthetic key even when a caller replies to the root.
+                existing_thread = validate_delivery_thread(self, existing_thread) if has_intake_delivery() else None
+            return validate_delivery_thread(self, existing_thread or None)
+
         if metadata:
             if metadata.get("thread_id"):
-                return metadata["thread_id"]
+                return validate_delivery_thread(self, metadata["thread_id"])
             if metadata.get("thread_ts"):
-                return metadata["thread_ts"]
-        return reply_to
+                return validate_delivery_thread(self, metadata["thread_ts"])
+        return validate_delivery_thread(self, reply_to)
 
     async def _upload_with_retry(
         self, chat_id: str, file_path: Optional[str], filename: str, caption: Optional[str],
@@ -2783,6 +3092,9 @@ class SlackAdapter(BasePlatformAdapter):
         call, Slack cap) instead of N posts; falls back to the base per-image loop on failure."""
         if self._suppressed_ignored(chat_id, "multi-image upload in"):
             return SendResult(success=False, error="ignored_channel")
+        _pinned_denial = self._inventory_route_denial(chat_id, None, metadata)
+        if _pinned_denial is not None:
+            return _pinned_denial
         if not self._app:
             return SendResult(success=False, error="Not connected")
         if not images:
@@ -2815,6 +3127,9 @@ class SlackAdapter(BasePlatformAdapter):
                 self._record_uploaded_file_thread(chat_id, thread_ts, metadata)
                 delivered = True
             except Exception as e:
+                from gateway.inventory_context import InventoryDeliveryDenied
+                if isinstance(e, InventoryDeliveryDenied):
+                    return self._slack_destination_failure(e, None)
                 logger.warning(
                     "[Slack] Multi-image files_upload_v2 failed (chunk %d/%d), falling back to per-image: %s",
                     chunk_idx + 1, len(chunks), e, exc_info=True)
@@ -2857,6 +3172,9 @@ class SlackAdapter(BasePlatformAdapter):
                         "content": response.content, "filename": f"image_{len(file_uploads)}.{ext}"
                     })
                 except Exception as dl_err:
+                    from gateway.inventory_context import InventoryDeliveryDenied
+                    if isinstance(dl_err, InventoryDeliveryDenied):
+                        raise
                     logger.warning(
                         "[Slack] Download failed for %s: %s", safe_url_for_log(image_url), dl_err)
         return file_uploads, initial_comment_parts
@@ -3251,11 +3569,17 @@ class SlackAdapter(BasePlatformAdapter):
         self, chat_id: str, image_path: str, caption: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a local image file to Slack by uploading it."""
+        _pinned_denial = self._inventory_route_denial(chat_id, reply_to, metadata)
+        if _pinned_denial is not None:
+            return _pinned_denial
         try:
             return await self._upload_file(chat_id, image_path, caption, reply_to, metadata)
         except FileNotFoundError:
             return SendResult(success=False, error=f"Image file not found: {image_path}")
         except Exception as e:  # pragma: no cover - defensive logging
+            from gateway.inventory_context import InventoryDeliveryDenied
+            if isinstance(e, InventoryDeliveryDenied):
+                return self._slack_destination_failure(e, None)
             logger.error(
                 "[%s] Failed to send local Slack image %s: %s", self.name, image_path, e, exc_info=True
             )
@@ -3274,6 +3598,9 @@ class SlackAdapter(BasePlatformAdapter):
         self, chat_id: str, image_url: str, caption: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send an image to Slack by uploading the URL as a file."""
+        _pinned_denial = self._inventory_route_denial(chat_id, reply_to, metadata)
+        if _pinned_denial is not None:
+            return _pinned_denial
         if not self._app:
             return SendResult(success=False, error="Not connected")
         from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
@@ -3302,6 +3629,9 @@ class SlackAdapter(BasePlatformAdapter):
                 chat_id, None, "image.png", caption, thread_ts, metadata, content=response.content,
                 attempts=1)
         except Exception as e:  # pragma: no cover - defensive logging
+            from gateway.inventory_context import InventoryDeliveryDenied
+            if isinstance(e, InventoryDeliveryDenied):
+                return self._slack_destination_failure(e, None)
             logger.warning(
                 "[Slack] Failed to upload image from URL %s, falling back to text: %s",
                 safe_url_for_log(image_url), e, exc_info=True)
@@ -3315,18 +3645,32 @@ class SlackAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs,
     ) -> SendResult:
         """Send an audio file to Slack."""
+        _pinned_denial = self._inventory_route_denial(chat_id, reply_to, metadata)
+        if _pinned_denial is not None:
+            return _pinned_denial
         try:
             return await self._upload_file(chat_id, audio_path, caption, reply_to, metadata)
         except FileNotFoundError:
             return SendResult(success=False, error=f"Audio file not found: {audio_path}")
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[Slack] Failed to send audio file %s: %s", audio_path, e, exc_info=True)
+            from gateway.inventory_context import InventoryDeliveryDenied
+            if isinstance(e, InventoryDeliveryDenied):
+                return self._slack_destination_failure(e, None)
+            logger.error(
+                "[Slack] Failed to send audio file %s: %s",
+                audio_path,
+                e,
+                exc_info=True,
+            )
             return SendResult(success=False, error=str(e))
 
     async def send_video(
         self, chat_id: str, video_path: str, caption: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a video file to Slack."""
+        _pinned_denial = self._inventory_route_denial(chat_id, reply_to, metadata)
+        if _pinned_denial is not None:
+            return _pinned_denial
         return await self._send_local_file(
             chat_id, video_path, caption, reply_to, metadata, "video", os.path.basename(video_path),
             f"Video file not found: {video_path}", "⚠️ Couldn't deliver the video attachment.")
@@ -3342,6 +3686,7 @@ class SlackAdapter(BasePlatformAdapter):
             chat_id, file_path, caption, reply_to, metadata, "document", display_name,
             f"File not found: {file_path}", f"⚠️ Couldn't deliver the file attachment ({display_name}).",
         )
+
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Slack channel."""
@@ -3858,11 +4203,28 @@ class SlackAdapter(BasePlatformAdapter):
             fallback_event["thread_ts"] = thread_ts
         await self._handle_slack_message(fallback_event)
 
+    def _inventory_callback_receipt(self, event, context):
+        """Called only by Bolt's authenticated message listeners; never a tool flag."""
+        from slack_bolt.authorization.authorize_result import AuthorizeResult
+        from gateway.inventory_context import issue_intake
+        authorization = context.get("authorize_result")
+        if type(authorization) is not AuthorizeResult:
+            return None
+        workspace = authorization.team_id
+        if context.get("team_id") not in (None, workspace):
+            return None
+        return issue_intake(
+            self, event, workspace=workspace,
+            client=self._team_clients.get(workspace),
+            bot_user_id=authorization.bot_user_id,
+        )
+
     def _register_mentioned_thread(self, thread_ts: str, team_id: str = "") -> None:
         """Record a thread as bot-mentioned so future replies auto-trigger.
         Markers are workspace-scoped when team_id is known so identical thread ts values in two
         workspaces never wake each other's bot."""
         if not thread_ts:
+
             return
         self._mentioned_threads.add(self._workspace_message_marker(team_id, thread_ts))
         self._trim_mentioned_threads()
@@ -4220,7 +4582,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._reacting_message_ids.add(self._workspace_message_marker(team_id, ts))
         self._evict_oldest_by_ts(self._reacting_message_ids, self._REACTING_MESSAGE_IDS_MAX)
 
-    async def _handle_slack_message(self, event: dict, payload: Optional[dict] = None) -> None:
+    async def _handle_slack_message(self, event: dict, payload: Optional[dict] = None, *, _inventory_intake=None) -> None:
         """Guard around :meth:`_handle_slack_message_impl`: the impl claims the ts early (no second
         turn from a mid-flight unfurl); if THIS call newly claimed it and raises, release the claim
         so a retry/edit can re-drive it. Pre-existing claims stay."""
@@ -4229,7 +4591,7 @@ class SlackAdapter(BasePlatformAdapter):
         _claims = getattr(self, "_processed_message_ts", None)
         _was_claimed = bool(_ts) and _claims is not None and _ts in _claims
         try:
-            return await self._handle_slack_message_impl(event, payload)
+            return await self._handle_slack_message_impl(event, payload, _inventory_intake=_inventory_intake)
         except BaseException:
             _claims = getattr(self, "_processed_message_ts", None)
             if _ts and not _was_claimed and _claims is not None and _ts in _claims:
@@ -4348,7 +4710,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._register_mentioned_thread(thread_ts, team_id=team_id)
         return text, original_text, command_probe_text, is_command_text
 
-    async def _handle_slack_message_impl(self, event: dict, payload: Optional[dict] = None) -> None:
+    async def _handle_slack_message_impl(self, event: dict, payload: Optional[dict] = None, *, _inventory_intake=None) -> None:
         """Handle an incoming Slack message event."""
         accepted = await self._prefilter_inbound(event, payload)
         if accepted is None:
@@ -4371,6 +4733,11 @@ class SlackAdapter(BasePlatformAdapter):
         text = self._append_link_unfurls(text, event.get("attachments") or [])
         ts = event.get("ts", "")
         outer_team_id = dedup_team_id
+        from gateway.inventory_context import intake_workspace
+        _inventory_workspace = intake_workspace(_inventory_intake, self, event)
+        if _inventory_workspace is not None:
+            outer_team_id = _inventory_workspace
+
         assistant_meta = self._lookup_assistant_thread_metadata(
             event, channel_id=channel_id, thread_ts=event.get("thread_ts", ""),
             team_id=outer_team_id, body=payload)
@@ -4395,6 +4762,22 @@ class SlackAdapter(BasePlatformAdapter):
         # Only a 1:1 IM earns DM exemptions (no mention needed, free reactions); an MPIM obeys
         # channel gating, though session/thread scoping treats both as DM-style.
         is_one_to_one_dm = channel_type == "im"
+        # Identity linking (spec v1): a 1:1 DM whose entire text is the link
+        # keyword mints a bind nonce and answers privately, without entering
+        # the agent-turn pipeline. Channel coverage comes from the /ito-link
+        # slash listener registered in connect().
+        from .ito_link import is_link_keyword as _is_link_keyword
+
+        if is_one_to_one_dm and _is_link_keyword(original_text or ""):
+            await self._handle_ito_link_request(
+                channel_id=channel_id,
+                user_id=str(user_id or ""),
+                team_id=str(team_id or ""),
+                display_name=None,
+                is_dm=True,
+                reply_to=event.get("thread_ts") or ts,
+            )
+            return
         # Reject unauthorized users before the expensive lookups/downloads;
         # the runner's own auth check only runs after MessageEvent is built.
         if self._early_reject_unauthorized(user_id, channel_id, is_dm):
@@ -4442,11 +4825,17 @@ class SlackAdapter(BasePlatformAdapter):
         # Thread-root media is delivered ahead of the trigger message's own files.
         media_urls, media_types, text = await self._collect_inbound_media(
             event, channel_id, team_id, text, thread_root_media_urls, thread_root_media_types)
+        _addressed_bot = bool(
+            is_one_to_one_dm
+            or is_mentioned
+            or (is_thread_reply and event_thread_ts in self._bot_message_ts)
+        )
         msg_event = await self._build_message_event(
             event, text=text, original_text=original_text, command_probe_text=command_probe_text,
             is_command_text=is_command_text, channel_id=channel_id, team_id=team_id, ts=ts,
             user_id=user_id, thread_ts=thread_ts, is_dm=is_dm, media_urls=media_urls,
-            media_types=media_types, channel_context=channel_context)
+            media_types=media_types, channel_context=channel_context,
+            _addressed_bot=_addressed_bot, _inventory_intake=_inventory_intake)
         # React only when directly addressed; MPIMs are shared, so they need a
         # mention like any channel.
         if (is_one_to_one_dm or is_mentioned) and self._reactions_enabled():
@@ -4460,13 +4849,16 @@ class SlackAdapter(BasePlatformAdapter):
                 f"{msg_event.text}")
         if ts:
             self._remember_processed_message_ts(ts)
-        await self.handle_message(msg_event)
+        from gateway.inventory_context import intake_delivery
+        with intake_delivery(_inventory_intake):
+            await self.handle_message(msg_event)
 
     async def _build_message_event(
         self, event: dict, *, text: str, original_text: str, command_probe_text: str,
         is_command_text: bool, channel_id: str, team_id: str, ts: str, user_id: str,
         thread_ts: Optional[str], is_dm: bool, media_urls: List[str], media_types: List[str],
-        channel_context: Optional[str]) -> MessageEvent:
+        channel_context: Optional[str], _addressed_bot: bool = False,
+        _inventory_intake=None) -> MessageEvent:
         """Resolve names, title the DM thread, and build the ``MessageEvent``. Commands are restored
         from canonical input: the parser needs the token at char zero and enrichment (blocks,
         unfurls, file text, history) must never mutate arguments."""
@@ -4476,6 +4868,7 @@ class SlackAdapter(BasePlatformAdapter):
         user_name = await self._resolve_user_name(user_id, chat_id=channel_id, team_id=team_id)
         channel_name = await self._resolve_channel_name(channel_id, team_id=team_id)
         # Best-effort: title the DM thread from the prompt for Slack's AI Agent Messages tab.
+
         if is_dm and thread_ts and msg_type != MessageType.COMMAND:
             await self._set_assistant_thread_title(
                 channel_id, thread_ts, original_text or text, team_id=team_id)
@@ -4497,6 +4890,7 @@ class SlackAdapter(BasePlatformAdapter):
         text = await self._humanize_user_mentions(text, chat_id=channel_id, team_id=team_id)
         return MessageEvent(
             text=(command_probe_text if is_command_text else text),
+
             message_type=msg_type,
             source=source,
             raw_message=event,
@@ -4510,8 +4904,13 @@ class SlackAdapter(BasePlatformAdapter):
             reply_to_text=None,
             auto_skill=resolve_channel_skills(self.config.extra, channel_id, None),
             metadata={
-                "slack_team_id": team_id, "slack_channel_id": channel_id,
-                "slack_thread_ts": thread_ts})
+                "slack_team_id": team_id,
+                "slack_channel_id": channel_id,
+                "slack_thread_ts": thread_ts,
+                "addressed_bot": _addressed_bot,
+                "_inventory_intake": _inventory_intake,
+            },
+        )
 
     def _note_attachment_failure(
         self, notices: List[str], detail: Optional[str], fallback_msg: str, *fallback_args: Any,
@@ -4696,6 +5095,10 @@ class SlackAdapter(BasePlatformAdapter):
         """Shared body of the Block Kit prompt senders: DM-resolve, ``build()`` -> ``(fallback
         text, blocks)``, post, then mark the message unresolved in ``resolved`` (double-click
         guard). Any failure is logged as ``<label> failed`` and returned, never raised."""
+        _pinned_denial = self._inventory_route_denial(chat_id, None, metadata)
+        if _pinned_denial is not None:
+            return _pinned_denial
+
         if not self._app:
             return SendResult(success=False, error="Not connected")
         chat_id = await self._dm_target(chat_id, metadata)
@@ -4712,6 +5115,9 @@ class SlackAdapter(BasePlatformAdapter):
                 self._trim_oldest_dict_entries(resolved, resolved_max)
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
         except Exception as e:
+            from gateway.inventory_context import InventoryDeliveryDenied
+            if isinstance(e, InventoryDeliveryDenied):
+                return self._slack_destination_failure(e, None)
             logger.error("[Slack] %s failed: %s", label, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
@@ -4878,6 +5284,7 @@ class SlackAdapter(BasePlatformAdapter):
             {"type": "actions", "elements": elements},
         ]
 
+
     async def send_model_picker(
         self,
         chat_id: str,
@@ -4895,6 +5302,7 @@ class SlackAdapter(BasePlatformAdapter):
         ``_handle_model_picker_action``, which calls ``on_model_selected`` on
         a model choice.
         """
+
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
@@ -4953,6 +5361,7 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
         except Exception as e:
             logger.error("[Slack] send_model_picker failed: %s", e, exc_info=True)
+
             return SendResult(success=False, error=str(e))
 
     async def _update_picker_message(
@@ -5770,6 +6179,7 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] Thread-root image recovery failed: %s", exc)
         return media_urls, media_types
 
+
     async def _handle_slash_command(self, command: dict) -> None:
         """Slash commands: native ``/<command> [args]`` for every COMMAND_REGISTRY entry, or
         ``/hermes <subcommand> [args]``; other text after ``/hermes`` is a regular message."""
@@ -5800,6 +6210,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._stash_slash_context(team_id, channel_id, user_id, response_url)
         # ContextVar lets send() match the right response_url under
         # concurrent slashes from multiple users.
+
         _slash_user_id_token = _slash_user_id.set(user_id or None)
         try:
             await self.handle_message(event)
@@ -6224,6 +6635,7 @@ def _standalone_proxy_kwargs() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """``(session_kwargs, request_kwargs)`` for aiohttp honoring the configured proxy."""
     from gateway.platforms.base import proxy_kwargs_for_aiohttp
     return proxy_kwargs_for_aiohttp(resolve_proxy_url())
+
 
 
 async def _slack_json_post(session, token: str, method: str, payload: dict, req_kw: dict) -> dict:

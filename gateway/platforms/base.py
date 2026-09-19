@@ -3376,6 +3376,11 @@ class BasePlatformAdapter(ABC):
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
+
+        # A transient attempt may have transitioned to a definitive Slack
+        # destination rejection. Do not turn it into another transport call.
+        if self.platform == Platform.SLACK and result.error_kind in {"not_found", "forbidden"}:
+            return result
         # Non-network / post-retry formatting failure: try plain text as fallback. A
         # rate-limited error never reaches here: it classifies as network above and the
         # loop only breaks on a non-transient, non-rate-limited error.
