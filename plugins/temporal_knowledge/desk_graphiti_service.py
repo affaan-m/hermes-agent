@@ -47,7 +47,7 @@ from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.driver.kuzu_driver import KuzuDriver
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
-from graphiti_core.llm_client import RateLimitError
+from graphiti_core.llm_client import LLMConfig, OpenAIClient, RateLimitError
 
 try:
     from .ontology import ENTITY_TYPES, EDGE_TYPES, EDGE_TYPE_MAP
