@@ -3346,11 +3346,14 @@ class GatewayRunner(
     _platform_lock_takeover_on_start: bool = False
     _reconnect_watcher_task: Optional["asyncio.Task"] = None
 
-    def __init__(self, config: Optional[GatewayConfig] = None):
+    def __init__(self, config: Optional[GatewayConfig] = None, *, context_tool_factory=None):
         global _gateway_runner_ref
+        # Trusted host injection only; no profile/environment activation.
+        self._context_tool_factory = context_tool_factory
         # With multiplex_profiles on, load under the default profile secret scope so bot tokens in its
         # .env resolve as secondary profiles' do; explicit config= injection (tests) is left untouched.
         # See #64674.
+
         self.config = config if config is not None else load_gateway_config_for_runner()
         # Multiplexer flag flips agent.secret_scope.get_secret() to fail-closed on unscoped credential
         # reads, so a missed migration crashes loudly instead of leaking a cross-profile value.
@@ -4357,6 +4360,7 @@ class GatewayRunner(
         timeout_fired: Any = None
         cleanup_lock: Any = None
         is_current: Any = None
+
 
 
 def _run_planned_stop_watcher(

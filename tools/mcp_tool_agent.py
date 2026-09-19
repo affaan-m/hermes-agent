@@ -4,6 +4,7 @@ and re-injecting post-build tools."""
 
 import logging
 import json
+import sys
 import threading
 from typing import Optional
 from tools.mcp_tool_common import _core
@@ -68,6 +69,14 @@ def _publish_tool_snapshot(
         current = {_def_name(t) for t in current_defs}
         if prefix_registered is not None:
             new_defs, new_names = _merge_preserving_prefix(current_defs, new_defs, prefix_registered)
+        # The default path never imports or enables the optional cloud tool.
+        # Its trusted foreground owner uses this same publication lock.
+        context_tool = sys.modules.get("gateway.context_tool")
+        if context_tool is not None:
+            from tools.registry import registry as _registry
+            new_defs, new_names = context_tool.project_context_tool(
+                agent, new_defs, new_names, registry=_registry
+            )
         # Record the generation even when unchanged so an in-flight older caller can't clobber.
         agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
         # Same NAME set: no change for MCP-reload callers. Content-aware callers

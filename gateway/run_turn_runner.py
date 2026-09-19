@@ -1592,7 +1592,20 @@ class TurnRunner:
             # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
             if ctx.inbound_message_id is not None:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
-            return agent.run_conversation(api_message, **kwargs)
+            from contextlib import nullcontext
+            from gateway.run import _gateway_runner_ref
+            _context_tool_scope = nullcontext()
+            _context_tool_factory = getattr(_gateway_runner_ref(), "_context_tool_factory", None)
+            if _context_tool_factory is not None:
+                from gateway.context_tool import bind_context_tool
+                from tools.registry import registry as _context_tool_registry
+                from tools.mcp_tool_agent import _agent_tools_lock
+                _context_tool_scope = bind_context_tool(
+                    agent, factory=_context_tool_factory,
+                    registry=_context_tool_registry, snapshot_lock=_agent_tools_lock,
+                )
+            with _context_tool_scope:
+                return agent.run_conversation(api_message, **kwargs)
         finally:
             unregister_gateway_notify(session_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
