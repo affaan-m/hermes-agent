@@ -47,6 +47,7 @@ class _Intake:
     routing: tuple
     session_thread: object
     delivery_thread: object
+    question_claim: object = None
     consumed: bool = False
     post_attempts: int = 0
     posted_messages: set = field(default_factory=set)
@@ -161,6 +162,7 @@ def _intake_valid(intake):
         and _snapshot(intake.raw) == intake.snapshot
         and getattr(intake.adapter, "_team_clients", {}).get(intake.workspace) is intake.client
         and getattr(intake.adapter, "_team_bot_user_ids", {}).get(intake.workspace) == intake.bot_user_id
+        and (intake.question_claim is None or _question_valid(intake.question_claim,intake.raw,intake.workspace,intake.bot_user_id))
     )
 
 
@@ -171,11 +173,16 @@ def issue_intake(adapter, event, *, workspace, client, bot_user_id):
     if not workspace or not bot_user_id or client is None or snapshot is None:
         return None
     user, _channel, _message, _thread, text, channel_type = snapshot
-    if user == bot_user_id or (channel_type != "im" and f"<@{bot_user_id}>" not in text):
+    if user == bot_user_id:
         return None
     if (getattr(adapter, "_team_clients", {}).get(workspace) is not client
             or getattr(adapter, "_team_bot_user_ids", {}).get(workspace) != bot_user_id):
         return None
+    question_claim = None
+    if channel_type != "im" and f"<@{bot_user_id}>" not in text:
+        question_claim = _claim_question(event,workspace,bot_user_id)
+        if question_claim is None:
+            return None
     routing = _routing(adapter)
     threads = _threads(event, snapshot, routing) if routing is not None else None
     if threads is None:
@@ -183,7 +190,7 @@ def issue_intake(adapter, event, *, workspace, client, bot_user_id):
     receipt = _Receipt()
     with _LOCK:
         candidate = _Intake(adapter, event, workspace, client, bot_user_id,
-                            snapshot, time.monotonic() + _TTL_SECONDS, routing, *threads)
+                            snapshot, time.monotonic() + _TTL_SECONDS, routing, *threads, question_claim=question_claim)
         if not _intake_valid(candidate):
             return None
         _INTAKES[receipt] = candidate
@@ -240,7 +247,8 @@ def admitted_request(event, adapter, profile):
         if intake is not None and not intake.consumed:
             intake.consumed = True
             candidate = _Lease(receipt, intake, event)
-            if intake.adapter is adapter and _string(profile) and _normalized_matches(candidate):
+            if (intake.adapter is adapter and _string(profile) and _normalized_matches(candidate)
+                    and (intake.question_claim is None or intake.question_claim.authorization.profile_id==profile)):
                 lease = candidate
                 user, channel, _message, thread, _text, _channel_type = intake.snapshot
                 lease.request = InventoryRequest((profile, user, "slack", intake.workspace, channel, thread), lease)
@@ -406,3 +414,156 @@ def validate_private_recipient(adapter, user_id):
         if _intake_valid(intake) and intake.adapter is adapter and user_id == intake.snapshot[0]:
             return
     raise InventoryDeliveryDenied("Inventory intake delivery is unavailable")
+
+
+# Additive request-evidence ABI; no change to inventory_request_v1.
+EVIDENCE_ABI_VERSION = "inventory_source_evidence_v2"
+_EVIDENCE_HANDLES = weakref.WeakKeyDictionary()
+
+
+@dataclass(frozen=True)
+class InventorySourceEvidence:
+    identity: tuple
+    bot_user_id: str
+    event_id: str
+    message_id: str
+    reply_to_message_id: object
+    reference_kind: str
+    text: str
+    observed: str
+
+
+@dataclass(frozen=True, eq=False)
+class InventoryEvidenceHandle:
+    _request: object = field(repr=False, compare=False)
+
+    def read(self):
+        """Revalidate the owning admitted worker before exposing original fields.
+
+        Slack thread_ts is a thread root, never proof of an arbitrary reply's
+        parent. A caller must also match a durable, confirmed outgoing question.
+        """
+        from datetime import datetime, timezone
+        import hashlib
+        import json
+        with _LOCK:
+            request = _EVIDENCE_HANDLES.get(self)
+            if request is not self._request or type(request) is not InventoryRequest or not request.validate():
+                return None
+            intake = request._lease.intake
+            user, channel, message, _thread, text, _channel_type = intake.snapshot
+            if (not re.fullmatch(r"[0-9]{1,16}\.[0-9]{1,9}",message)
+                    or len(text.encode("utf-8")) > 65536):
+                return None
+            raw_thread = intake.raw.get("thread_ts")
+            root = raw_thread if raw_thread and raw_thread != message else None
+            if root is not None and re.fullmatch(r"[0-9]{1,16}\.[0-9]{1,9}",root) is None:
+                return None
+            try:
+                observed = datetime.fromtimestamp(float(message),timezone.utc).isoformat().replace("+00:00","Z")
+            except (ValueError,OverflowError,OSError):
+                return None
+            digest = hashlib.sha256(json.dumps([*request.identity[:5],message],separators=(",",":")).encode()).hexdigest()
+            evidence = InventorySourceEvidence(request.identity,intake.bot_user_id,"slack-"+digest,message,root,
+                                               "thread_root" if root is not None else "none",text,observed)
+            return evidence if request.validate() else None
+
+
+def capture_inventory_evidence():
+    """Return an opaque, worker-bound handle; tool arguments cannot issue one."""
+    with _LOCK:
+        request = capture_inventory_request()
+        if type(request) is not InventoryRequest or not request.validate():
+            return None
+        handle = InventoryEvidenceHandle(request)
+        _EVIDENCE_HANDLES[handle] = request
+        return handle
+
+
+ACTIVE_QUESTION_ABI_VERSION = "inventory_active_question_v1"
+_QUESTION_RESOLVER = None
+_QUESTION_GENERATION = 0
+
+
+@dataclass(frozen=True)
+class ActiveQuestionAuthorization:
+    """Trusted host result of a read-only protected grant/question lookup."""
+    profile_id: str
+    question_id: str
+    expires_at: float
+    revalidate: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class _QuestionClaim:
+    authorization: ActiveQuestionAuthorization
+    identity: tuple
+    generation: int
+
+
+def bind_active_question_resolver(resolver):
+    """Trusted startup only. Rebinding revokes claims made by the prior resolver."""
+    global _QUESTION_RESOLVER, _QUESTION_GENERATION
+    if resolver is not None and not callable(resolver):
+        raise ValueError("invalid question resolver")
+    with _LOCK:
+        _QUESTION_RESOLVER = resolver
+        _QUESTION_GENERATION += 1
+
+
+def _question_identity(raw, workspace, bot_user_id):
+    snapshot = _snapshot(raw)
+    if snapshot is None:
+        return None
+    user,channel,message,_thread,_text,_kind = snapshot
+    root = raw.get("thread_ts")
+    if (not root or root==message or not isinstance(root,str)
+            or re.fullmatch(r"[0-9]{1,16}\.[0-9]{1,9}",root) is None):
+        return None
+    return (workspace,bot_user_id,channel,user,root,message)
+
+
+def _question_valid(claim, raw, workspace, bot_user_id):
+    import math
+    try:
+        if (type(claim) is not _QuestionClaim or claim.generation != _QUESTION_GENERATION
+                or _QUESTION_RESOLVER is None
+                or claim.identity != _question_identity(raw,workspace,bot_user_id)):
+            return False
+        resolver, generation = _QUESTION_RESOLVER, _QUESTION_GENERATION
+        auth = claim.authorization
+        return bool(type(auth) is ActiveQuestionAuthorization
+                    and _string(auth.profile_id) and _string(auth.question_id)
+                    and type(auth.expires_at) in (int,float) and math.isfinite(auth.expires_at)
+                    and time.time() < auth.expires_at and callable(auth.revalidate)
+                    and auth.revalidate() is True
+                    and resolver is _QUESTION_RESOLVER
+                    and generation == _QUESTION_GENERATION
+                    and time.time() < auth.expires_at)
+    except Exception:
+        return False
+
+
+def _claim_question(raw,workspace,bot_user_id):
+    identity = _question_identity(raw,workspace,bot_user_id)
+    with _LOCK:
+        resolver, generation = _QUESTION_RESOLVER, _QUESTION_GENERATION
+    if identity is None or resolver is None:
+        return None
+    try:
+        authorization = resolver(identity)
+        with _LOCK:
+            if resolver is not _QUESTION_RESOLVER or generation != _QUESTION_GENERATION:
+                return None
+            claim = _QuestionClaim(authorization,identity,generation)
+            return claim if _question_valid(claim,raw,workspace,bot_user_id) else None
+    except Exception:
+        return None
+
+
+def active_question_reply(receipt,adapter,raw):
+    """Same-event read-only gate; it never records a reply or issues authority."""
+    with _LOCK:
+        intake = _record(receipt)
+        return bool(intake is not None and intake.adapter is adapter and intake.raw is raw
+                    and intake.question_claim is not None and _intake_valid(intake))
