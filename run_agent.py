@@ -570,6 +570,9 @@ class AIAgent:
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
         )
+        # Optional protected host binding; generic CLI remains unconfigured.
+        from agent.desk_table_host import bind_host_context
+        bind_host_context(self)
 
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
