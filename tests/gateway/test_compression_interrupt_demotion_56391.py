@@ -177,7 +177,9 @@ class TestBusyHandlerDemotesInterruptForCompression:
         with patch("gateway.run.merge_pending_message_event"):
             await runner._handle_active_session_busy_message(event, sk)
 
-        parent.interrupt.assert_called_once_with("please stop")
+        # Since a0b4d89a91 the busy handler interrupts with None (control
+        # flow only; the queued event owns the user turn).
+        parent.interrupt.assert_called_once_with(None)
 
     @pytest.mark.asyncio
     async def test_pending_sentinel_does_not_trigger_false_positive(self) -> None:

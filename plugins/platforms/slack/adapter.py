@@ -1388,9 +1388,20 @@ class SlackAdapter(BasePlatformAdapter):
             # the actual command reply ephemerally instead of posting publicly.
             slash_ctx = self._pop_slash_context(chat_id)
             if slash_ctx:
-                return await self._send_slash_ephemeral(
+                ephemeral_result = await self._send_slash_ephemeral(
                     slash_ctx,
                     content,
+                )
+                if ephemeral_result.success:
+                    return ephemeral_result
+                # Ephemeral swap failed — fall through to normal channel
+                # delivery so the reply is never silently dropped (the
+                # contract documented on _send_slash_ephemeral). The
+                # initial "Running /cmd…" ack stays up either way.
+                logger.warning(
+                    "[Slack] ephemeral slash reply failed (%s); "
+                    "falling back to channel delivery",
+                    ephemeral_result.error,
                 )
 
             # Convert standard markdown → Slack mrkdwn
