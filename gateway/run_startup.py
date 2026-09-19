@@ -588,14 +588,24 @@ class GatewayStartupMixin:
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
-                candidates = [
-                    entry for entry in self.session_store._entries.values()  # noqa: SLF001
-                    if entry.resume_pending
-                    and not entry.suspended
-                    and entry.origin is not None
-                    and entry.resume_reason in self._AUTO_RESUME_REASONS
-                    and (platform is None or entry.origin.platform == platform)
-                ]
+                candidates = []
+                for entry in self.session_store._entries.values():  # noqa: SLF001
+                    if not (entry.resume_pending and not entry.suspended
+                            and entry.origin is not None
+                            and entry.resume_reason in self._AUTO_RESUME_REASONS
+                            and (platform is None or entry.origin.platform == platform)):
+                        continue
+                    # Ito: auto-resume only in home channels and operator DMs. In
+                    # counterparty groups/channels a restart must be silent: the
+                    # synthesized continuation turn otherwise posts "session restored"
+                    # noise where customers and suppliers can see it.
+                    if not self._ito_auto_resume_allowed(entry.origin):
+                        logger.info(
+                            "Skipping auto-resume for %s: non-home group/channel or non-operator DM",
+                            entry.session_key,
+                        )
+                        continue
+                    candidates.append(entry)
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return None
@@ -1100,6 +1110,32 @@ class GatewayStartupMixin:
                 return True, enabled_platform_count, _multiplex_skipped_platforms, _pending_connects
             if not platform_config.enabled:
                 continue
+            # Cross-host single-owner gate for shared bot credentials (see
+            # gateway/host_identity.py). Two tailnet hosts running the same
+            # profile + telegram token spent days in a 409 getUpdates conflict
+            # storm; a local PID lock cannot see the other host. When
+            # ``gateway.telegram_owner`` names a different host, this gateway
+            # skips loading telegram and runs as a standby — the owner host is
+            # the only getUpdates consumer. Skipped platforms are NOT counted
+            # as enabled or failed, so the gateway stays up on the others.
+            if platform.value == "telegram":
+                try:
+                    from gateway.run import _load_gateway_config
+                    from gateway.host_identity import telegram_owner_permits_local
+                    _owner_ok, _owner_reason = telegram_owner_permits_local(
+                        _load_gateway_config()
+                    )
+                except Exception:
+                    _owner_ok, _owner_reason = True, ""
+                if not _owner_ok:
+                    logger.warning("%s", _owner_reason)
+                    self._update_platform_runtime_status(
+                        platform.value,
+                        platform_state="disabled_not_owner",
+                        error_code=None,
+                        error_message=_owner_reason,
+                    )
+                    continue
             # Multiplex: a platform enabled in the shared config.yaml may hold its token only in a
             # secondary profile's .env; an empty primary would queue a reconnect loop that never heals.
             # Starting that primary adapter with an empty token fails immediately and queues an infinite

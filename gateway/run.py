@@ -1127,6 +1127,168 @@ def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool
     return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
 
 
+def _event_addressed_bot(event: Any, source: Any) -> bool:
+    """Return whether the inbound event was a direct address to the bot.
+
+    Adapters that distinguish direct addresses from passive traffic (Slack:
+    1:1 DMs, @mentions, replies inside bot-participated threads) mark the
+    event with ``metadata["addressed_bot"]``.  When no mark exists, DMs count
+    as direct addresses and group messages do not — the conservative fallback
+    that keeps passive free-response ingestion eligible for intentional
+    silence.
+    """
+    metadata = getattr(event, "metadata", None) or {}
+    if "addressed_bot" in metadata:
+        return bool(metadata["addressed_bot"])
+    return getattr(source, "chat_type", "") == "dm"
+
+
+def _internal_channel_ids(user_config: Optional[dict]) -> set:
+    """Channels that are INTERNAL surfaces (home, approvals, jobs, desk-log,
+    telegram ops).  Everything else is treated as counterparty-facing for
+    display purposes.  Config: display.internal_channels; the platform home
+    channel is always internal."""
+    ids: set = set()
+    try:
+        disp = (user_config or {}).get("display") or {}
+        raw = disp.get("internal_channels") or []
+        if isinstance(raw, (list, tuple, set)):
+            ids |= {str(c).strip() for c in raw if str(c).strip()}
+    except Exception:
+        pass
+    try:
+        gw = (user_config or {}).get("gateway") or {}
+        for key in ("jobs_channel", "desk_log_channel"):
+            val = str(gw.get(key) or "").strip()
+            if val:
+                ids.add(val)
+    except Exception:
+        pass
+    return ids
+
+
+def _is_quiet_channel(user_config: Optional[dict], chat_id: Any) -> bool:
+    """Whether the channel gets the counterparty display surface (no reasoning,
+    progress, status, or bookkeeping traces).
+
+    True when the channel is in display.quiet_channels explicitly, OR when it
+    is not a known internal channel — external channels are quiet by default
+    so a brand-new supplier/customer channel never shows internal traces
+    before being enrolled.  display.internal_channels pins the internal set;
+    home channel ids (Slack home + telegram home) are always internal.
+    """
+    cid = str(chat_id or "")
+    if not cid:
+        return False
+    if cid in _quiet_channel_ids(user_config):
+        return True
+    internal = _internal_channel_ids(user_config)
+    # The not-internal default is opt-in: it only applies when the operator
+    # pins an internal set via display.internal_channels.  Without that
+    # config, behavior stays exactly the legacy explicit-list semantics.
+    if not internal:
+        return False
+    # Home channels are always internal regardless of the list.
+    try:
+        home = (user_config or {}).get("gateway", {}).get("home_channel") or {}
+        if isinstance(home, dict) and home.get("chat_id"):
+            internal.add(str(home["chat_id"]))
+    except Exception:
+        pass
+    return cid not in internal
+
+
+def _quiet_channel_ids(user_config: Optional[dict]) -> set:
+    """Channel IDs whose working display surface is muted (``display.quiet_channels``).
+
+    Final answers still land in these channels; only the working surface —
+    reasoning prepends, tool-progress bubbles, and status/self-improvement
+    notices — is suppressed.  Used for counterparty-facing channels (supplier
+    desks) where internal bookkeeping and emoji progress must never leak,
+    while the answer itself still streams in normally.
+    """
+    try:
+        disp = (user_config or {}).get("display") or {}
+        raw = disp.get("quiet_channels") or []
+        if isinstance(raw, (list, tuple, set)):
+            return {str(c).strip() for c in raw if str(c).strip()}
+    except Exception:
+        pass
+    return set()
+
+
+def _jobs_notice_chat(user_config: Optional[dict], source: Any) -> str:
+    """Channel that receives background-job lifecycle notices.
+
+    For internal chats, when ``gateway.jobs_channel`` is set, completion and
+    failure notices go there instead of the origin chat (the #ito-jobs
+    split).  Counterparty-facing (quiet) channels keep in-channel delivery
+    so desk answers stay with the conversation.
+    """
+    origin = getattr(source, "chat_id", "") or ""
+    if _is_quiet_channel(user_config, origin):
+        return origin
+    try:
+        gw = (user_config or {}).get("gateway") or {}
+        target = str(gw.get("jobs_channel") or "").strip()
+    except Exception:
+        target = ""
+    return target or origin
+
+
+def _trace_notice_chat(user_config: Optional[dict], source: Any) -> str:
+    """Channel that receives self-improvement / background-review traces.
+
+    These are internal bookkeeping: in counterparty-facing (quiet) channels
+    they are suppressed entirely (handled at the caller); for internal chats
+    they route to ``gateway.desk_log_channel`` when set (the #ito-desk-log
+    split) so the home channel stays a clean ops summary.
+    """
+    try:
+        gw = (user_config or {}).get("gateway") or {}
+        target = str(gw.get("desk_log_channel") or "").strip()
+    except Exception:
+        target = ""
+    return target or (getattr(source, "chat_id", "") or "")
+
+
+def _is_operator_source(source: Any) -> bool:
+    """Whether the source user is an operator on the platform user allowlist
+    (e.g. SLACK_ALLOWED_USERS), as opposed to a counterparty admitted through
+    a chat-scoped allowlist (SLACK_GROUP_ALLOWED_CHATS)."""
+    plat = getattr(source, "platform", None)
+    env_name = {
+        "slack": "SLACK_ALLOWED_USERS",
+        "telegram": "TELEGRAM_ALLOWED_USERS",
+    }.get(str(getattr(plat, "value", plat) or "").lower(), "")
+    if not env_name:
+        return False
+    raw = os.getenv(env_name, "")
+    allowed = {p.strip().lower() for p in raw.replace(",", " ").split() if p.strip()}
+    if not allowed:
+        return False
+    uid = str(getattr(source, "user_id", "") or "").lower()
+    uname = str(getattr(source, "user_name", "") or "").lower()
+    return bool((uid and uid in allowed) or (uname and uname in allowed))
+
+
+def _operator_unaddressed_in_quiet(event: Any, source: Any, user_config: Optional[dict]) -> bool:
+    """True when an operator sent a message NOT addressed to the bot in a
+    display.quiet_channels channel (e.g. answering the counterparty directly
+    in a supplier-desk channel).
+
+    Those turns are operator bookkeeping (draft internals, status chatter):
+    the response is rerouted to the platform home channel and nothing is
+    streamed into the counterparty-facing channel.  Counterparty messages
+    and bot-addressed messages keep normal in-channel behavior.
+    """
+    if not _is_quiet_channel(user_config, getattr(source, "chat_id", "")):
+        return False
+    if _event_addressed_bot(event, source):
+        return False
+    return _is_operator_source(source)
+
+
 def _csv_or_list_to_set(raw: Any) -> set[str]:
     """Normalize a config list or comma-separated scalar into a string set."""
     if raw is None:

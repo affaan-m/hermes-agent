@@ -1447,8 +1447,10 @@ class GatewayTurnMixin:
             _show_reasoning_effective = (
                 False if source.platform == Platform.MATTERMOST else getattr(self, "_show_reasoning", False)
             )
+        from gateway.run import _is_quiet_channel
         last_reasoning = agent_result.get("last_reasoning")
-        if not (_show_reasoning_effective and response and not _intentional_silence and last_reasoning):
+        if not (_show_reasoning_effective and response and not _intentional_silence and last_reasoning
+                and not _is_quiet_channel(_load_gateway_config(), source.chat_id)):
             return response
         from gateway.stream_consumer_fences import escape_code_fences_for_display
         # Collapse long reasoning to keep messages readable
@@ -1797,6 +1799,36 @@ class GatewayTurnMixin:
 
         return response
 
+
+        # Operator bookkeeping reroute: an operator's unaddressed message
+        # in a quiet (counterparty-facing) channel gets its answer in the
+        # platform home channel — draft internals and status chatter never
+        # land in front of the supplier.  Fail-open: any lookup/send
+        # problem falls back to normal in-channel delivery.
+        from gateway.run import _load_gateway_config
+        from gateway.run import _operator_unaddressed_in_quiet
+        if response and _operator_unaddressed_in_quiet(
+            event, source, _load_gateway_config(),
+        ):
+            _home = self.config.get_home_channel(source.platform) if self.config else None
+            _home_adapter = self._adapter_for_source(source)
+            if _home and _home.chat_id and _home_adapter:
+                try:
+                    await _home_adapter.send(
+                        _home.chat_id,
+                        f"<#{source.chat_id}> operator bookkeeping:\n{response}",
+                    )
+                    logger.info(
+                        "Routed operator bookkeeping answer from %s to home channel %s",
+                        source.chat_id, _home.chat_id,
+                    )
+                    return None
+                except Exception as _home_err:
+                    logger.warning(
+                        "Home-channel reroute failed for %s: %s — falling back to in-channel delivery",
+                        source.chat_id, _home_err,
+                    )
+
     _STATUS_HINTS = {
         401: " Check your API key or run `claude /login` to refresh OAuth credentials.",
         402: " Your API balance or quota is exhausted. Check your provider dashboard.",
@@ -1942,6 +1974,7 @@ class GatewayTurnMixin:
         message_text = await self._prepare_profile_scoped_inbound_message_text(
             event=event, source=source, history=history, session_key=session_key,
         )
+        from gateway.run import _operator_unaddressed_in_quiet, _load_gateway_config
         if message_text is None:
             return None, _session_env_tokens
 
@@ -1974,6 +2007,7 @@ class GatewayTurnMixin:
         from gateway.inventory_context import clear_inherited
         clear_inherited()
 
+        from gateway.run import _operator_unaddressed_in_quiet, _load_gateway_config
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
@@ -2028,6 +2062,9 @@ class GatewayTurnMixin:
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 persist_user_display_metadata={"gateway_input_owner": prepared.persistence_owner},
                 message_type=event.message_type,
+                suppress_streaming=_operator_unaddressed_in_quiet(
+                    event, source, _load_gateway_config(),
+                ),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -2195,10 +2232,15 @@ class GatewayTurnMixin:
 
         try:
             user_config = _load_gateway_config()
+            # gateway.jobs_channel: background-job lifecycle notices for
+            # internal chats route to the jobs channel; quiet (counterparty)
+            # channels keep in-channel delivery.
+            from gateway.run import _jobs_notice_chat
+            _job_chat_id = _jobs_notice_chat(user_config, source)
             model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, user_config=user_config)
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
-                    source.chat_id,
+                    _job_chat_id,
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
                     metadata=_thread_metadata,
                 )
@@ -2276,15 +2318,15 @@ class GatewayTurnMixin:
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
             if text_content:
-                await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
+                await adapter.send(chat_id=_job_chat_id, content=header + text_content, metadata=_thread_metadata)
             elif not images and not media_files:
                 await adapter.send(
-                    chat_id=source.chat_id, content=header + "(No response generated)", metadata=_thread_metadata,
+                    chat_id=_job_chat_id, content=header + "(No response generated)", metadata=_thread_metadata,
                 )
             for image_url, alt_text in (images or []):
                 with suppress(Exception):
                     await adapter.send_image(
-                        chat_id=source.chat_id, image_url=image_url, caption=alt_text, metadata=_thread_metadata,
+                        chat_id=_job_chat_id, image_url=image_url, caption=alt_text, metadata=_thread_metadata,
                     )
             # Route each media file by type (voice bubble / video / image / document), as the
             # streaming + kanban paths do.
@@ -2295,7 +2337,7 @@ class GatewayTurnMixin:
                 with suppress(Exception):
                     if _should_send_media_as_audio(source.platform, _ext, _is_voice):
                         await adapter.send_voice(
-                            chat_id=source.chat_id, audio_path=media_path, metadata=_thread_metadata,
+                            chat_id=_job_chat_id, audio_path=media_path, metadata=_thread_metadata,
                             is_voice=_is_voice,
                         )
                     else:
@@ -2304,13 +2346,13 @@ class GatewayTurnMixin:
                             else (adapter.send_image_file, "image_path") if _ext in _IMAGE_EXTS
                             else (adapter.send_document, "file_path")
                         )
-                        await sender(chat_id=source.chat_id, metadata=_thread_metadata, **{key: media_path})
+                        await sender(chat_id=_job_chat_id, metadata=_thread_metadata, **{key: media_path})
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
             with suppress(Exception):
                 await adapter.send(
-                    chat_id=source.chat_id, content=f"❌ Background task {task_id} failed: {e}",
+                    chat_id=_job_chat_id, content=f"❌ Background task {task_id} failed: {e}",
                     metadata=_thread_metadata,
                 )
 
@@ -3956,6 +3998,7 @@ class GatewayTurnMixin:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
+        from gateway.run import _is_quiet_channel, _load_gateway_config
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
@@ -3995,7 +4038,13 @@ class GatewayTurnMixin:
         interrupt_monitor = spawn(self._run_agent_monitor_for_interrupt(turn_ctx, _interrupt_detected))
         # Periodic "still working" notifications so the user knows the agent hasn't died.
         _executor_task_holder: list = [None]  # bound once the executor future exists (see below)
-        _notify_task = spawn(self._run_agent_notify_long_running(disp, turn_ctx, _executor_task_holder))
+        # display.quiet_channels: no "⏳ Working — N min" heartbeat bubbles in
+        # counterparty-facing channels.  The desk works quietly there; the
+        # only working indicator is the assistant typing status.
+        if _is_quiet_channel(_load_gateway_config(), source.chat_id):
+            _notify_task = None
+        else:
+            _notify_task = spawn(self._run_agent_notify_long_running(disp, turn_ctx, _executor_task_holder))
 
         try:
             # run_sync is TurnRunner.run_sync (bound method; executor call unchanged).

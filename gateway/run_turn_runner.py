@@ -578,6 +578,13 @@ class TurnRunner:
 
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
+        # display.quiet_channels: no tool-progress bubbles in
+        # counterparty-facing channels (the "working" surface stays
+        # the typing indicator + the streamed answer itself).
+        from gateway.run import _is_quiet_channel, _load_gateway_config
+        if _is_quiet_channel(_load_gateway_config(), ctx.source.chat_id):
+            from gateway.platforms.base import SendResult
+            return SendResult(success=False, error="quiet_channel", retryable=False)
         result = await st.adapter.send(
             chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
         )
@@ -719,6 +726,16 @@ class TurnRunner:
                 if self._agent_interrupted():
                     await asyncio.sleep(0)
                     continue
+                # display.quiet_channels: drop tool-progress events at the
+                # queue for counterparty-facing channels, so no bubble is
+                # ever created.  Covers first sends, edits, overflow
+                # splits, and flood-control fallbacks alike — the
+                # per-send guard alone left the direct-send branches
+                # open (and could return None into result.success).
+                from gateway.run import _is_quiet_channel, _load_gateway_config
+                if _is_quiet_channel(_load_gateway_config(), ctx.source.chat_id):
+                    await asyncio.sleep(0)
+                    continue
                 if self._is_reset_marker(raw):
                     self._reset_progress_bubble(st)
                     continue
@@ -834,9 +851,9 @@ class TurnRunner:
         """Status adapter present and this run is still the current generation."""
         return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
 
-    def _send_status_text(self, text: str, metadata, log_message: str) -> None:
+    def _send_status_text(self, text: str, metadata, log_message: str, chat_id_override: str = "") -> None:
         ctx = self._ctx
-        self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
+        self._schedule(ctx._status_adapter.send(chat_id_override or ctx._status_chat_id, text, metadata=metadata), log_message)
 
     def _attach_session_title_callback(self, agent, ctx) -> None:
         """Wire the platform thread-rename lane onto the agent as `_on_session_title`.
@@ -874,6 +891,12 @@ class TurnRunner:
         ctx = self._ctx
         if not self._status_live():
             return
+        # display.quiet_channels: counterparty-facing channels get the
+        # final answer only — status notices (self-improvement reviews,
+        # auxiliary errors, lifecycle chatter) never surface there.
+        from gateway.run import _is_quiet_channel, _load_gateway_config
+        if _is_quiet_channel(_load_gateway_config(), ctx._status_chat_id):
+            return
         prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message)
         if prepared is None:
             logger.debug(
@@ -903,6 +926,11 @@ class TurnRunner:
             scfg = StreamingConfig()
         # display.platforms.<plat>.streaming may disable streaming per platform; None = follow global.
         plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming")
+        # Operator bookkeeping reroute (display.quiet_channels): when this
+        # turn's answer is rerouted to the home channel, nothing may stream
+        # into the counterparty-facing origin channel.
+        if getattr(ctx, "suppress_streaming", False):
+            plat_streaming = False
         want_stream_deltas = (
             scfg.enabled and scfg.transport != "off" if plat_streaming is None else bool(plat_streaming)
         )
@@ -1159,10 +1187,20 @@ class TurnRunner:
 
         def deliver(message: str) -> None:
             if self._status_live():
+                # display.quiet_channels: self-improvement/memory notices are
+                # internal bookkeeping — never in counterparty channels.
+                # gateway.desk_log_channel: in internal channels they route to
+                # the desk-log channel instead of the origin chat.
+                from gateway.run import _is_quiet_channel, _load_gateway_config, _trace_notice_chat
+                _bg_cfg = _load_gateway_config()
+                if _is_quiet_channel(_bg_cfg, ctx._status_chat_id):
+                    return
+                _trace_chat_id = _trace_notice_chat(_bg_cfg, ctx.source)
                 self._send_status_text(
                     message,
                     _interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)),
                     "background_review_callback scheduling error",
+                    chat_id_override=_trace_chat_id,
                 )
 
         def release() -> None:

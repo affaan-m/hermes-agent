@@ -542,17 +542,11 @@ class GatewayBusySessionMixin:
 
     async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> None:
         """Interrupt mode: abort in-flight tool calls; the agent loop exits at its next check point."""
-        from gateway.run import _build_media_placeholder
         try:
-            _interrupt_text = event.text
-            _media_urls = getattr(event, "media_urls", None) or []
-            if self._pending_event_audio_paths(event):
-                _interrupt_text, _ = await self._transcribe_and_echo_pending_voice(
-                    event, adapter, event.source, event.text or "", log_context="Voice-busy-interrupt",
-                )
-            elif not _interrupt_text and _media_urls:
-                _interrupt_text = _build_media_placeholder(event)
-            running_agent.interrupt(_interrupt_text)
+            # The complete MessageEvent is already durable in the pending FIFO,
+            # so the interrupt carries no copy of its text; the queued event
+            # owns the next user turn and its media/transcription.
+            running_agent.interrupt(None)
         except Exception:
             pass  # don't let interrupt failure block the ack
 
@@ -718,6 +712,14 @@ class GatewayBusySessionMixin:
         # messages sent while the agent was busy (interrupt mode, or a steer that fell back to queue)
         # arrived as one mashed-together turn (#43066 sub-bug 2). The FIFO path gives each text its own turn
         # in arrival order while still preserving photo-burst / album merge semantics for media.
+        # display.quiet_channels: follow-ups in counterparty-facing channels
+        # queue silently.  The desk's live turn is never interrupted and no
+        # "Interrupting current task" ack is ever shown to a supplier; the
+        # queued message is answered in order when the current turn ends.
+        from gateway.run import _is_quiet_channel, _load_gateway_config
+        if _is_quiet_channel(_load_gateway_config(), event.source.chat_id):
+            return True
+
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
         is_redirect_mode = effective_mode == "interrupt" and redirected
