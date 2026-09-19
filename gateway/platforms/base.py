@@ -4391,6 +4391,11 @@ class BasePlatformAdapter(ABC):
         if result.success or is_terminal_delivery_failure(result):
             return result
 
+        # Slack destination/permission rejections cannot be repaired by
+        # changing formatting. Keep other platforms and unknown failures intact.
+        if self.platform == Platform.SLACK and result.error_kind in {"not_found", "forbidden"}:
+            return result
+
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
@@ -4443,6 +4448,11 @@ class BasePlatformAdapter(ABC):
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
+
+        # A transient attempt may have transitioned to a definitive Slack
+        # destination rejection. Do not turn it into another transport call.
+        if self.platform == Platform.SLACK and result.error_kind in {"not_found", "forbidden"}:
+            return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
