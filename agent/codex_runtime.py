@@ -865,6 +865,7 @@ _TERMINAL_EVENT_TYPES = frozenset({
     "response.completed",
     "response.incomplete",
     "response.failed",
+    "response.cancelled",
 })
 
 
@@ -882,6 +883,60 @@ def _item_field(item: Any, name: str, default: Any = None) -> Any:
     if value is None and isinstance(item, dict):
         value = item.get(name, default)
     return value if value is not None else default
+
+
+def _coerce_codex_output_item(item: Any) -> Any:
+    """Adapt raw JSON item fields consumed via attributes by the Responses adapter.
+
+    Arguments/input remain their original JSON values: recursively wrapping them
+    would change the adapter's serialization and executable tool input.
+    """
+    if not isinstance(item, dict):
+        return item
+    fields = dict(item)
+    for name in ("content", "summary"):
+        parts = fields.get(name)
+        if isinstance(parts, list):
+            fields[name] = [SimpleNamespace(**part) if isinstance(part, dict) else part for part in parts]
+    return SimpleNamespace(**fields)
+
+
+def _codex_tool_item_identity(item: Any):
+    """Only explicit client-tool identities support deduplication; never guess."""
+    kind = _item_field(item, "type")
+    if kind not in ("function_call", "custom_tool_call"):
+        return None
+    for field in ("id", "call_id"):
+        value = _item_field(item, field)
+        if isinstance(value, str) and value.strip():
+            return (kind, field, value)
+    return None
+
+
+def _merge_codex_tool_snapshot(previous: Any, incoming: Any) -> Any:
+    """Keep completion monotonic and reject conflicting executable snapshots."""
+    for field in ("name", "call_id"):
+        old = _item_field(previous, field)
+        if isinstance(old, str) and old.strip() and _item_field(incoming, field) != old:
+            raise RuntimeError("Conflicting Codex tool item identity")
+    pending = {"queued", "in_progress", "incomplete"}
+    old_pending = str(_item_field(previous, "status", "")).strip().lower() in pending
+    new_pending = str(_item_field(incoming, "status", "")).strip().lower() in pending
+    if not old_pending:
+        if new_pending:
+            return previous  # A late partial snapshot cannot undo completed input.
+        field = "input" if _item_field(previous, "type") == "custom_tool_call" else "arguments"
+        # Compare the exact executable text the adapter emits. Python equality
+        # alone conflates JSON-distinct values such as True/1 and 1/1.0.
+        old_input = getattr(previous, field, "{}")
+        new_input = getattr(incoming, field, "{}")
+        if not isinstance(old_input, str):
+            old_input = json.dumps(old_input, ensure_ascii=False)
+        if not isinstance(new_input, str):
+            new_input = json.dumps(new_input, ensure_ascii=False)
+        if old_input != new_input:
+            raise RuntimeError("Conflicting Codex tool item input")
+    return incoming
 
 
 def _raise_stream_error(event: Any) -> None:
@@ -943,11 +998,12 @@ def _consume_codex_event_stream(
       if no message item was emitted directly.
     * ``output_text``: assembled text from ``response.output_text.delta`` deltas.
     * ``usage``: copied from the terminal event's ``response.usage`` (when present).
-    * ``status``: ``completed`` / ``incomplete`` / ``failed`` (or ``completed`` if
+    * ``status``: supported nested status, falling back to terminal event kind
+      (or ``completed`` if
       the stream ended without a terminal frame but produced content).
     * ``id``: ``response.id`` when present.
     * ``incomplete_details``: passed through for ``response.incomplete`` frames.
-    * ``error``: passed through for ``response.failed`` frames.
+    * ``error``: passed through for ``response.failed`` / ``response.cancelled`` frames.
     * ``model``: from kwargs (the wire model name is not authoritative).
 
     Critically, we never read ``response.output`` from the terminal event for
@@ -970,6 +1026,7 @@ def _consume_codex_event_stream(
     * ``interrupt_check()`` — returns True to break the loop early.
     """
     collected_output_items: List[Any] = []
+    tool_item_positions: dict[tuple, int] = {}
     collected_text_deltas: List[str] = []
     has_tool_calls = False
     first_delta_fired = False
@@ -1077,6 +1134,16 @@ def _consume_codex_event_stream(
         if event_type == "response.output_item.done":
             done_item = _event_field(event, "item")
             if done_item is not None:
+                done_item = _coerce_codex_output_item(done_item)
+                identity = _codex_tool_item_identity(done_item)
+                if identity is not None and identity in tool_item_positions:
+                    position = tool_item_positions[identity]
+                    collected_output_items[position] = _merge_codex_tool_snapshot(
+                        collected_output_items[position], done_item,
+                    )
+                    continue
+                if identity is not None:
+                    tool_item_positions[identity] = len(collected_output_items)
                 collected_output_items.append(done_item)
                 done_phase = _item_field(done_item, "phase", None)
                 done_phase = done_phase.strip().lower() if isinstance(done_phase, str) else None
@@ -1103,6 +1170,9 @@ def _consume_codex_event_stream(
 
         if event_type in _TERMINAL_EVENT_TYPES:
             saw_terminal = True
+            # The event kind is authoritative when nested status is absent or
+            # malformed; the initial EOF default must not mask terminal failure.
+            terminal_status = event_type.removeprefix("response.")
             resp_obj = _event_field(event, "response")
             if resp_obj is not None:
                 terminal_usage = getattr(resp_obj, "usage", None)
@@ -1115,22 +1185,18 @@ def _consume_codex_event_stream(
                 rstatus = getattr(resp_obj, "status", None)
                 if rstatus is None and isinstance(resp_obj, dict):
                     rstatus = resp_obj.get("status")
-                if isinstance(rstatus, str):
-                    terminal_status = rstatus
+                if isinstance(rstatus, str) and rstatus.strip().lower() in {
+                    "completed", "incomplete", "failed", "cancelled", "queued", "in_progress",
+                }:
+                    terminal_status = rstatus.strip().lower()
                 if event_type == "response.incomplete":
                     terminal_incomplete_details = getattr(resp_obj, "incomplete_details", None)
                     if terminal_incomplete_details is None and isinstance(resp_obj, dict):
                         terminal_incomplete_details = resp_obj.get("incomplete_details")
-                if event_type == "response.failed":
+                if event_type in {"response.failed", "response.cancelled"}:
                     terminal_error = getattr(resp_obj, "error", None)
                     if terminal_error is None and isinstance(resp_obj, dict):
                         terminal_error = resp_obj.get("error")
-            if event_type == "response.completed":
-                terminal_status = terminal_status or "completed"
-            elif event_type == "response.incomplete":
-                terminal_status = terminal_status or "incomplete"
-            elif event_type == "response.failed":
-                terminal_status = terminal_status or "failed"
             # Stop on terminal event.
             break
 
