@@ -11,7 +11,15 @@ import unittest
 import weakref
 
 ROOT = Path(__file__).resolve().parents[1]
+# Pinned harness keeps the repo under a source/ sibling plus a captured copy at
+# native-caller-map/source; repo CI has plain repo-root paths. Prefer the pinned
+# layout when present, otherwise fall back to this checkout.
+SOURCE = ROOT / 'source'
+if not SOURCE.exists():
+    SOURCE = ROOT
 MAP = ROOT.parent / 'native-caller-map' / 'source'
+if not MAP.exists():
+    MAP = SOURCE
 
 
 def _load(name, path):
@@ -23,7 +31,7 @@ def _load(name, path):
 
 
 def load_context_tool():
-    return _load('context_tool_under_test', ROOT / 'source/gateway/context_tool.py')
+    return _load('context_tool_under_test', SOURCE / 'gateway/context_tool.py')
 
 
 def load_registry():

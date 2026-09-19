@@ -21,7 +21,14 @@ import unittest
 from unittest.mock import patch
 
 BASE = Path(__file__).resolve().parents[1]
+# Pinned harness keeps the repo under a source/ sibling plus a captured copy at
+# native-caller-map/source; repo CI has plain repo-root paths.
+SOURCE = BASE / "source"
+if not SOURCE.exists():
+    SOURCE = BASE
 CAPTURE = BASE.parent / "native-caller-map/source"
+if not CAPTURE.exists():
+    CAPTURE = SOURCE
 
 
 def module(name, path):
@@ -42,6 +49,24 @@ def functions(path, names, namespace):
     return namespace
 
 
+def _capture_defines(relative, names):
+    candidate = CAPTURE / relative
+    if not candidate.exists():
+        return False
+    tree = ast.parse(candidate.read_text(), filename=str(candidate))
+    found = {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    return set(names) <= found
+
+
+# The segmented executor and batch planner exist only in the pinned capture
+# (main-line tree); this branch's base predates them. Tests driving those real
+# entry points run in the pinned harness and skip under repo CI.
+CAPTURE_HAS_SEGMENTED_EXECUTOR = _capture_defines(
+    "agent/tool_executor.py", ["execute_tool_calls_sequential", "execute_tool_calls_segmented"]) and _capture_defines(
+    "agent/tool_dispatch_helpers.py", ["_plan_tool_batch_segments"])
+SEGMENTED_UNAVAILABLE = "captured segmented executor unavailable on this base"
+
+
 def package(name):
     value = types.ModuleType(name)
     value.__path__ = []
@@ -57,7 +82,7 @@ class CallerTests(unittest.TestCase):
             sys.modules[name] = package(name)
         self.registry_module = module("tools.registry", CAPTURE / "tools/registry.py")
         self.registry = self.registry_module.registry
-        self.helper = module("gateway.context_tool", BASE / "source/gateway/context_tool.py")
+        self.helper = module("gateway.context_tool", SOURCE / "gateway/context_tool.py")
         self.lock = threading.Lock()
         self.mcp = types.ModuleType("tools.mcp_tool")
         self.mcp._agent_tools_lock = self.lock
@@ -65,7 +90,7 @@ class CallerTests(unittest.TestCase):
         self.mcp.MCP_TOOL_NAME_PREFIX = "mcp__"
         functions(CAPTURE / "tools/mcp_tool.py", ["is_mcp_tool_parallel_safe"], self.mcp.__dict__)
         self.mcp._reinject_post_build_tools = lambda *a: set()
-        functions(BASE / "source/tools/mcp_tool.py", ["refresh_agent_mcp_tools"], self.mcp.__dict__)
+        functions(SOURCE / "tools/mcp_tool.py", ["refresh_agent_mcp_tools"], self.mcp.__dict__)
         sys.modules["tools.mcp_tool"] = self.mcp
         self.calls = []
         self.wall = [100.0]
@@ -159,7 +184,7 @@ class CallerTests(unittest.TestCase):
             self.assertNotIn(self.helper.TOOL_NAME, self.names())
 
     def _foreground(self):
-        path = BASE / "source/gateway/run.py"
+        path = SOURCE / "gateway/run.py"
         tree = ast.parse(path.read_text())
         scopes = [n for n in ast.walk(tree) if isinstance(n, ast.With)
                   and any(isinstance(i.context_expr, ast.Call) and isinstance(i.context_expr.func, ast.Name)
@@ -235,6 +260,7 @@ class CallerTests(unittest.TestCase):
             setattr(self.agent, key, value)
         return ns
 
+    @unittest.skipUnless(CAPTURE_HAS_SEGMENTED_EXECUTOR, SEGMENTED_UNAVAILABLE)
     def test_actual_sequential_registry_dispatch_quiet_and_nonquiet(self):
         for quiet in [True, False]:
             with self.subTest(quiet=quiet), self.binding():
@@ -246,6 +272,7 @@ class CallerTests(unittest.TestCase):
                 self.assertIn("B300 inventory", messages[0]["content"])
         self.assertEqual(self.calls, [threading.current_thread(), threading.current_thread()])
 
+    @unittest.skipUnless(CAPTURE_HAS_SEGMENTED_EXECUTOR, SEGMENTED_UNAVAILABLE)
     def test_actual_mixed_planner_keeps_cloud_call_on_original_owner(self):
         ns = self._executor(True)
         ns.update(_NEVER_PARALLEL_TOOLS=frozenset({"clarify"}), _PARALLEL_SAFE_TOOLS=frozenset({"web_search"}),
@@ -262,6 +289,7 @@ class CallerTests(unittest.TestCase):
         self.assertEqual([m["tool_call_id"] for m in messages], ["0", "1", "2", "3", "4"])
         self.assertIn("B300 inventory", messages[2]["content"])
 
+    @unittest.skipUnless(CAPTURE_HAS_SEGMENTED_EXECUTOR, SEGMENTED_UNAVAILABLE)
     def test_actual_sequential_copied_context_cannot_invoke_provider(self):
         ns = self._executor(True)
         call = types.SimpleNamespace(id="copied", function=types.SimpleNamespace(name=self.helper.TOOL_NAME, arguments="{}"))
@@ -276,6 +304,7 @@ class CallerTests(unittest.TestCase):
             self.assertEqual(json.loads(original[0]["content"])["status"], "completed")
         self.assertEqual(self.calls, [threading.current_thread()])
 
+    @unittest.skipUnless(CAPTURE_HAS_SEGMENTED_EXECUTOR, SEGMENTED_UNAVAILABLE)
     def test_unknown_result_through_actual_dispatch_never_retries(self):
         ns = self._executor(False)
         def factory(**kw):
