@@ -25,6 +25,7 @@ Env:
 from __future__ import annotations
 
 import asyncio
+import random
 import hashlib
 import hmac
 import json
@@ -45,9 +46,8 @@ from pydantic import BaseModel
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.driver.kuzu_driver import KuzuDriver
-from graphiti_core.llm_client.openai_client import OpenAIClient
-from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+from graphiti_core.llm_client import RateLimitError
 
 try:
     from .ontology import ENTITY_TYPES, EDGE_TYPES, EDGE_TYPE_MAP
@@ -57,8 +57,23 @@ except ImportError:  # running as a script from the plugin dir
     import memory_layers as ml
 
 STATE = {"graphiti": None, "queue": None, "workers": [], "ingested": 0, "failed": 0,
-         "llm": None, "dedup_merged": 0, "evolution": {}, "communities": 0}
+         "llm": None, "dedup_merged": 0, "evolution": {}, "communities": 0,
+         "dead_lettered": 0}
 GROUP_LOCKS: dict[str, asyncio.Lock] = {}
+
+# Extraction resilience (MEMORY-CHECKPOINT-FIX): a RateLimitError holds the
+# job and retries with bounded, jittered backoff; it never skips-and-advances.
+# A job that exhausts its inline retries goes to a durable dead-letter file
+# and replays from there with backoff, so no event is lost and no cursor
+# stalls forever behind one poison episode. Injectable for tests.
+RATE_LIMIT_ATTEMPTS = 3          # inline tries per job before dead-lettering
+RATE_LIMIT_BACKOFF_S = 5.0       # base seconds; doubled per attempt, then jittered
+DLQ_MAX_ATTEMPTS = 6             # total extraction attempts before a job parks
+DLQ_BATCH = 50                   # max dead-letter replays per freshness tick
+RETRY_SLEEP = asyncio.sleep      # patched by tests; production is asyncio.sleep
+_DLQ_PATH = Path(os.environ.get(
+    "TEMPORAL_DLQ_FILE", "~/.hermes/profiles/ito/state/temporal-dlq.jsonl"
+)).expanduser()
 
 
 def _group_lock(gid: str) -> asyncio.Lock:
@@ -160,17 +175,17 @@ def _write_freshness_marker(group_id: str, now: float | None = None) -> Path:
 async def _ingest_worker(g: Graphiti, queue: asyncio.Queue):
     while True:
         job = await queue.get()
-        succeeded = False
+        outcome: object = False
         completion = job.pop("_completion", None)
         try:
             async with _graph_lock():
                 async with _group_lock(job["group_id"]):
-                    succeeded = await _apply(g, job)
+                    outcome = await _apply(g, job)
         finally:
             # Queue drainage is not extraction success. Cancellation also
             # resolves false, leaving checkpointed producers free to retry.
             if completion is not None and not completion.done():
-                completion.set_result(succeeded)
+                completion.set_result(outcome)
             queue.task_done()
 
 
@@ -182,7 +197,80 @@ async def _queue_confirmed(job: dict) -> bool:
     return await asyncio.shield(completion)
 
 
-async def _apply(g: Graphiti, job: dict):
+def _read_dlq(path: Path | None = None) -> list[dict]:
+    path = path or _DLQ_PATH
+    try:
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    except (OSError, ValueError):
+        return []
+
+
+def _write_dlq(entries: list[dict], path: Path | None = None) -> None:
+    path = path or _DLQ_PATH
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("".join(json.dumps(e, sort_keys=True) + "\n" for e in entries))
+    os.replace(tmp, path)
+
+
+def _dead_letter(job: dict, error: str, attempts: int, *, now: float | None = None) -> None:
+    """Persist one exhausted job with its retry schedule; never loses an event."""
+    now = time.time() if now is None else now
+    entry = {
+        "job": {k: v for k, v in job.items() if not k.startswith("_")},
+        "error": str(error)[:300],
+        "attempts": int(attempts),
+        "failed_at": int(now),
+        "next_retry_at": int(now + RATE_LIMIT_BACKOFF_S * (2 ** min(attempts, 6))),
+    }
+    _write_dlq([*_read_dlq(), entry])
+    STATE["dead_lettered"] += 1
+    print(f"[graphiti-desk] dead-lettered {job.get('name')}: {entry['error']}"
+          f" (attempts={attempts}, next retry at {entry['next_retry_at']})")
+
+
+async def _dlq_replay(g: Graphiti, *, now: float | None = None, limit: int = DLQ_BATCH) -> dict:
+    """Replay due dead-lettered jobs with backoff; outcomes rewrite the file
+    atomically: ingested jobs drop out, exhausted ones park."""
+    now = time.time() if now is None else now
+    entries = _read_dlq()
+    if not entries:
+        return {"replayed": 0, "remaining": 0}
+    survivors: list[dict] = []
+    replayed = 0
+    for entry in entries:
+        if replayed >= limit or float(entry.get("next_retry_at", 0)) > now:
+            survivors.append(entry)
+            continue
+        replayed += 1
+        outcome = await _queue_confirmed(entry["job"])
+        if outcome is True:
+            continue  # extracted: event is safe, drop from the dead-letter file
+        entry["attempts"] = int(entry.get("attempts", 0)) + 1
+        entry["next_retry_at"] = int(now + RATE_LIMIT_BACKOFF_S * (2 ** min(entry["attempts"], 6)))
+        if outcome != "dead":
+            entry["next_retry_at"] = int(now + RATE_LIMIT_BACKOFF_S)
+        survivors.append(entry)
+    _write_dlq(survivors)
+    parked = [e for e in survivors if int(e.get("attempts", 0)) >= DLQ_MAX_ATTEMPTS]
+    if parked:
+        print(f"[graphiti-desk] {len(parked)} dead-letter job(s) parked after"
+              f" {DLQ_MAX_ATTEMPTS} attempts; manual review needed")
+    return {"replayed": replayed, "remaining": len(survivors)}
+
+async def _queue_confirmed(job: dict) -> bool:
+    completion = asyncio.get_running_loop().create_future()
+    STATE["queue"].put_nowait({**job, "_completion": completion})
+    # Canceling a producer must not advance its cursor or cancel the worker's
+    # receipt. A later retry can duplicate completed extraction (at-least-once).
+    return await asyncio.shield(completion)
+
+
+async def _apply(g: Graphiti, job: dict, *, attempt: int = 1):
+    """One extraction attempt chain. Returns True on durable extraction,
+    "dead" when a rate limit exhausted the bounded retry budget (the job is
+    safe in the dead-letter file), False for any other failure (producers
+    hold their cursor and retry the event themselves)."""
     try:
         # "message" must stay EpisodeType.message: text-type extraction of
         # channel traffic returns ZERO edges on this model (proven 2026-09-01:
@@ -228,13 +316,25 @@ async def _apply(g: Graphiti, job: dict):
         except Exception as exc:
             print(f"[graphiti-desk] memory-layer pass failed (non-fatal): {exc}")
         return True
+    except RateLimitError as exc:
+        # Hold and retry with bounded, jittered backoff: a 429 never advances
+        # a cursor and never drops the event. Exhaustion dead-letters the job
+        # (retry continues from the file on later ticks); it is never skipped.
+        if attempt < RATE_LIMIT_ATTEMPTS:
+            delay = RATE_LIMIT_BACKOFF_S * (2 ** (attempt - 1))
+            print(f"[graphiti-desk] rate limited on {job.get('name')}"
+                  f" (attempt {attempt}/{RATE_LIMIT_ATTEMPTS}); retrying in ~{delay:.0f}s")
+            await RETRY_SLEEP(delay * (0.5 + random.random()))
+            return await _apply(g, job, attempt=attempt + 1)
+        STATE["failed"] += 1
+        _dead_letter(job, f"rate_limit_exhausted: {exc}", attempt)
+        return "dead"
     except Exception as exc:
         STATE["failed"] += 1
         import traceback
         print(f"[graphiti-desk] ingest failed for group={job.get('group_id')}: {exc}")
         traceback.print_exc()
         return False
-
 
 async def _ensure_fts_indexes(driver: KuzuDriver) -> None:
     """graphiti-core 0.29's deprecated Kuzu driver never executes the FTS index
@@ -436,7 +536,8 @@ async def health():
         "backend": f"graphiti-core+{STATE.get('backend', 'kuzu')}",
         "ingested": STATE["ingested"],
         "failed": STATE["failed"],
-        "pending": q.qsize() if q else None,
+        "dead_lettered": STATE["dead_lettered"],
+        "dlq_pending": len(_read_dlq()),
         "ingest_reconciliation": _ingest_reconciliation(),
         "memory_layers": {
             "dedup_merged": STATE["dedup_merged"],
@@ -1053,6 +1154,7 @@ async def _freshness_loop():
         try:
             await _ingest_obligations_incremental()
             await _ingest_events_incremental()
+            await _dlq_replay(STATE["graphiti"])
         except Exception as exc:
             print(f"[graphiti-desk] freshness tick failed: {exc}")
 
@@ -1097,7 +1199,10 @@ async def _ingest_obligations_incremental():
                 "name": f"obligation-{row['id']}-{row.get('status') or 'open'}", "source": "json",
                 "source_description": "ito-ledger", "reference_time": reference,
             })
-            if not succeeded:
+            if succeeded == "dead":
+                print(f"[graphiti-desk] obligation {row['id']} dead-lettered;"
+                      " cursor advances, retry continues from the file")
+            elif not succeeded:
                 break
             if row["change_ts"] > cursor["last_ts"]:
                 cursor["boundary_fingerprints"] = {}
@@ -1171,7 +1276,7 @@ async def ingest_events(group_id: str = "desk",
         with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as conn:
             conn.row_factory = sqlite3.Row
             rows = [dict(r) for r in conn.execute(sql, params)]
-        queued = skipped = failed = 0
+        queued = skipped = failed = dead_lettered = 0
         max_id = acknowledged = cp_id
         for row in rows:
             max_id = row["id"]
@@ -1191,7 +1296,10 @@ async def ingest_events(group_id: str = "desk",
                 }
                 queued += 1
                 if flush:
-                    if not await _queue_confirmed(job):
+                    outcome = await _queue_confirmed(job)
+                    if outcome == "dead":
+                        dead_lettered += 1
+                    elif not outcome:
                         failed += 1
                         break
                 else:
@@ -1199,7 +1307,8 @@ async def ingest_events(group_id: str = "desk",
             if flush or queued == 0:
                 _set_checkpoint(key, row["id"], int(time.time()))
                 acknowledged = row["id"]
-        return {"queued": queued, "failed": failed, "skipped_irrelevant": skipped,
+        return {"queued": queued, "failed": failed, "dead_lettered": dead_lettered,
+                "skipped_irrelevant": skipped,
                 "last_event_id": max_id, "last_acknowledged_event_id": acknowledged,
                 "checkpoint_advanced": acknowledged > cp_id, "pending": STATE["queue"].qsize()}
 

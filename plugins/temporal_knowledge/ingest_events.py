@@ -143,16 +143,19 @@ def main() -> int:
     posted = 0
     skipped_noise = 0
     last_id = after_id
+    last_ok_id = after_id
     failures = 0
     for row in rows:
         last_id = row["id"]
         text = (row["text"] or "").strip()
         if any(text.startswith(prefix) for prefix in EXCLUDE_PREFIXES):
             skipped_noise += 1
+            last_ok_id = row["id"]
             continue
         try:
             post_episode(row)
             posted += 1
+            last_ok_id = row["id"]
         except requests.RequestException as exc:
             failures += 1
             print(f"[events-ingest] POST failed for event {row['id']}: {exc}", flush=True)
@@ -160,9 +163,11 @@ def main() -> int:
 
     if args.backfill_days == 0 or after_id == 0:
         # Only advance the incremental checkpoint when we are not in a bounded
-        # replay (or when seeding from scratch).
-        if last_id > after_id:
-            save_checkpoint(last_id)
+        # replay (or when seeding from scratch). The checkpoint covers only
+        # durably posted (or deliberately skipped) rows: a failed POST holds
+        # the cursor so the event replays next run instead of being lost.
+        if last_ok_id > after_id:
+            save_checkpoint(last_ok_id)
 
     pending = None
     try:
