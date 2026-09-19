@@ -457,11 +457,11 @@ class HostBundle:
     """
     def __init__(self,*,modules,create_owner,policy,provider_call,mqtt_config,
                  approval_resolver,receipt_reader,request_deadline,clock=time.time,
-                 monotonic=time.monotonic,mqtt_builder=None,mqtt5=None):
+                 monotonic=time.monotonic,mqtt_builder=None,mqtt5=None,approval_factory=None):
         self.modules=modules;self.create_owner=create_owner;self.policy=policy;self.call=provider_call
         self.config=dict(mqtt_config);self.deadline=number(request_deadline)
         self.clock=clock;self.mono=monotonic;self.budget=Budget(self.deadline+60,clock,monotonic)
-        self.approval=ExistingApproval(resolve=approval_resolver,clock=clock,monotonic=monotonic)
+        self.approval=(approval_factory or ExistingApproval)(resolve=approval_resolver,clock=clock,monotonic=monotonic)
         self.receipt_reader=receipt_reader;self.transport=None;self.observer=None;self.terminal_port=None
         self.mqtt_builder=mqtt_builder;self.mqtt5=mqtt5;self._opened=False
     def open_transport(self,offer,coordinates,*,deadline_at):

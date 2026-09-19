@@ -4,7 +4,8 @@ Default disabled. Importing this module has no SDK, provider, filesystem or
 network effect. The host assembles one factory per process by calling
 build_context_tool_factory(...) with every protected port and passes the
 result as GatewayRunner(context_tool_factory=...). Omitting the call leaves
-the gateway exactly as before; there is no profile or environment activation.
+the gateway exactly as before. gateway.caller_activation adds explicit profile
+opt-in with authenticated request binding and typed result approval.
 
 Reviewed bytes this composition binds (SHA-256):
   gateway/context_tool.py      c19576b0 (caller helper; manifest a6cf953e,
@@ -66,6 +67,7 @@ def build_context_tool_factory(
     validate_request,
     project_context,
     modules=None,
+    approval_factory=None,
     clock=time.time,
     monotonic=time.monotonic,
 ):
@@ -119,6 +121,7 @@ def build_context_tool_factory(
             provider_call=provider_call,
             mqtt_config=mqtt_config,
             approval_resolver=approval_resolver,
+            approval_factory=approval_factory,
             receipt_reader=receipt_reader,
             request_deadline=request["expires_at"],
             clock=clock,
