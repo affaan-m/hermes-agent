@@ -206,9 +206,39 @@ def _file_content_hash(path: Path) -> str:
     """First 16 hex chars of SHA-256 of *path* ("" if unreadable); bridge.js reports its own as ``/health`` ``scriptHash``."""
     import hashlib
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        data = path.read_bytes()
     except OSError:
         return ""
+    # Generation-wrapper aware: ``bin/install-whatsapp-ingest-bridge.py``
+    # replaces bridge.js with a one-line wrapper that imports
+    # ``./.hermes-generations/<id>/bridge.js``.  The running bridge hashes the
+    # module at its own ``import.meta.url`` — the generation file, not the
+    # wrapper — so the disk side of the handshake must resolve the same
+    # target or every reconnect would flap a healthy launchd-managed bridge.
+    if b".hermes-generations/" in data and len(data) < 4096:
+        for line in data.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if line.startswith("import ") and ".hermes-generations/" in line:
+                try:
+                    target = line.split("'")[1]
+                    gen = (path.parent / target).resolve()
+                    return hashlib.sha256(gen.read_bytes()).hexdigest()[:16]
+                except (IndexError, OSError):
+                    break
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def _bridge_externally_managed() -> bool:
+    """True when a launchd/systemd supervisor owns the bridge lifecycle.
+
+    Set ``WHATSAPP_BRIDGE_MANAGED=external`` (profile .env or service
+    environment) when the bridge is supervised outside the gateway (e.g.
+    the ito-desk ``whatsapp-bridge`` launchd job).  The adapter then never
+    kills the port listener, never spawns its own child, and treats a
+    healthy-but-hash-mismatched bridge as attachable — the external
+    supervisor and the ingest contract check own code freshness.
+    """
+    return str(os.getenv("WHATSAPP_BRIDGE_MANAGED", "")).strip().lower() == "external"
 
 
 def check_whatsapp_requirements() -> bool:
@@ -359,6 +389,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 return False
             bridge_status = data.get("status", "unknown")
             if bridge_status != "connected":
+                if _bridge_externally_managed():
+                    print(
+                        f"[{self.name}] Externally managed bridge not connected "
+                        f"(status: {bridge_status}) — waiting for supervisor, not spawning"
+                    )
+                    return False
                 print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
                 return False
             running_hash, disk_hash = data.get("scriptHash", ""), _file_content_hash(bridge_path)
@@ -368,9 +404,33 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 self._attach_to_bridge(None)  # Not managed by us
                 self._wire_plugin_handlers(None)
                 return True
+            if _bridge_externally_managed():
+                # launchd owns the bridge lifecycle — a
+                # hash drift means the supervisor is about
+                # to restart it, not a license for us to
+                # kill it. Attach and let the ingest
+                # contract check police code freshness.
+                print(
+                    f"[{self.name}] Bridge hash drift "
+                    f"(running={running_hash or 'unversioned'}, disk={disk_hash}) "
+                    f"— externally managed, attaching anyway"
+                )
+                self._mark_connected()
+                self._attach_to_bridge(None)  # Not managed by us
+                self._wire_plugin_handlers(None)
+                return True
             stale_reason = f"running={running_hash or 'unversioned'}, disk={disk_hash}" if running_hash != disk_hash else "send_read_receipts config changed"
             print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
         except Exception:
+            if _bridge_externally_managed():
+                # Never kill the port listener or spawn a competing child:
+                # the launchd supervisor owns the bridge and will restore
+                # it. Report connect failure so the platform is queued
+                # for a retry instead.
+                logger.info(
+                    "[%s] Externally managed bridge unreachable; not spawning (supervisor owns lifecycle)",
+                    self.name,
+                )
             pass  # Bridge not running, start a new one
         return False
 
@@ -486,6 +546,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             self._session_path.mkdir(parents=True, exist_ok=True)
             if await self._reuse_running_bridge(bridge_path):
                 return True
+            if _bridge_externally_managed():
+                # Never kill the port listener or spawn a competing child:
+                # the launchd supervisor owns the bridge and will restore
+                # it. Report connect failure so the platform is queued
+                # for a retry instead.
+                logger.info(
+                    "[%s] Externally managed bridge unreachable; not spawning (supervisor owns lifecycle)",
+                    self.name,
+                )
+                return False
             _kill_stale_bridge_by_pidfile(self._session_path)
             _kill_port_process(self._bridge_port)
             await asyncio.sleep(1)
