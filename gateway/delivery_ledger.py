@@ -46,7 +46,7 @@ import os
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from hermes_constants import get_hermes_home
 
@@ -93,9 +93,19 @@ def _connect() -> sqlite3.Connection:
             updated_at REAL NOT NULL,
             owner_pid INTEGER,
             owner_started_at INTEGER,
-            last_error TEXT
+            last_error TEXT,
+            origin_fingerprint TEXT
         )"""
     )
+    # Additive migration: legacy rows deliberately retain NULL provenance.
+    # Concurrent initializers may race; accept only a verified added column.
+    if "origin_fingerprint" not in {r[1] for r in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+        try:
+            conn.execute("ALTER TABLE delivery_obligations ADD COLUMN origin_fingerprint TEXT")
+        except sqlite3.OperationalError:
+            if "origin_fingerprint" not in {r[1] for r in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+                conn.close()
+                raise
     return conn
 
 
@@ -143,12 +153,30 @@ def _owner_alive(pid: Any, started_at: Any) -> bool:
         return True
 
 
-def compute_obligation_id(session_key: str, message_ref: str, content: str) -> str:
+def compute_source_fingerprint(source: Any) -> str:
+    """Bind the producer's original routing and authorization identity.
+
+    Labels and message content confer no authority. Versioning keeps unknown
+    future formats held instead of implicitly reinterpreting them.
+    """
+    fields = ("chat_id", "thread_id", "scope_id", "profile", "user_id",
+              "user_id_alt", "chat_type", "is_bot", "delivered_via_upstream_relay")
+    identity = {key: getattr(source, key, None) for key in fields}
+    platform = getattr(source, "platform", None)
+    identity["platform"] = getattr(platform, "value", platform)
+    payload = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return "v1:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_obligation_id(session_key: str, message_ref: str, content: str,
+                          origin_fingerprint: Optional[str] = None) -> str:
     """Stable id: same turn + same content re-records idempotently, while
     distinct threads/topics on the same chat can never collide (the
     session_key carries platform, chat and thread; ``message_ref`` is the
     triggering inbound message id, distinguishing turns in one session)."""
     payload = f"{session_key}|{message_ref}|{content}"
+    if origin_fingerprint is not None:
+        payload += "|" + origin_fingerprint
     return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()[:24]
 
 
@@ -160,6 +188,7 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
+    origin_fingerprint: Optional[str] = None,
 ) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
@@ -169,11 +198,11 @@ def record_obligation(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, origin_fingerprint)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
-             pid, started),
+             pid, started, origin_fingerprint),
         )
     _prune()
 
@@ -204,6 +233,7 @@ def sweep_recoverable(
     now: Optional[float] = None,
     *,
     deliverable_platforms: Optional[set] = None,
+    admit: Optional[Callable[[Dict[str, Any]], bool]] = None,
 ) -> List[Dict[str, Any]]:
     """Claim undelivered rows owned by dead processes; return them for
     redelivery.
@@ -220,6 +250,11 @@ def sweep_recoverable(
     that failed to connect would otherwise burn one attempt per boot and hit
     the cap having never been sent once.  Rows for absent platforms are left
     untouched for a later boot; the stale cutoff still bounds them.
+
+    ``admit`` optionally checks destination metadata before any claim or expiry.
+    False, non-boolean or failed decisions preserve the row unchanged. The
+    callback must be read-only and must not acquire the session-store lock;
+    the gateway supplies an already-authorized immutable routing snapshot.
     """
     now = now if now is not None else time.time()
     pid, started = _owner_stamp()
@@ -227,15 +262,29 @@ def sweep_recoverable(
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      content, state, attempts, created_at,
-                      owner_pid, owner_started_at
+                      content, state, attempts, created_at, updated_at,
+                      owner_pid, owner_started_at, origin_fingerprint
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at) in rows:
+             attempts, created_at, updated_at, owner_pid, owner_started_at, origin_fingerprint) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
+            # Admission precedes every mutation, including expiry. A held
+            # reply remains available for explicit operator reconciliation.
+            if admit is not None:
+                destination = {
+                    "session_key": session_key, "platform": platform,
+                    "chat_id": chat_id, "thread_id": thread_id,
+                    "origin_fingerprint": origin_fingerprint,
+                }
+                try:
+                    if admit(destination) is not True:
+                        continue
+                except Exception:
+                    logger.debug("delivery recovery admission failed", exc_info=True)
+                    continue
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
                 conn.execute(
                     """UPDATE delivery_obligations
@@ -265,12 +314,39 @@ def sweep_recoverable(
                     "chat_id": chat_id,
                     "thread_id": thread_id,
                     "content": content,
+                    "origin_fingerprint": origin_fingerprint,
                     # pending = send never started, redeliver plainly;
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
                     "attempts": attempts + 1,
+                    "_claim": {
+                        "pid": pid, "started": started, "claimed_at": now,
+                        "previous_pid": owner_pid, "previous_started": owner_started_at,
+                        "previous_updated_at": updated_at, "previous_state": state,
+                    },
                 })
     return claimed
+
+
+
+def release_unattempted_claim(row: Dict[str, Any]) -> bool:
+    """Restore a claim if policy changed before dispatch, without spending a retry.
+
+    Compare the exact claim stamp so a concurrent delivery/update is never
+    overwritten. This is not used after a transport call may have begun.
+    """
+    claim = row["_claim"]
+    with _DB_LOCK, _connect() as conn:
+        changed = conn.execute(
+            """UPDATE delivery_obligations
+               SET owner_pid=?, owner_started_at=?, attempts=attempts-1, updated_at=?
+               WHERE obligation_id=? AND owner_pid=? AND owner_started_at IS ?
+                 AND attempts=? AND updated_at=? AND state=? AND origin_fingerprint IS ?""",
+            (claim["previous_pid"], claim["previous_started"], claim["previous_updated_at"],
+             row["obligation_id"], claim["pid"], claim["started"], row["attempts"],
+             claim["claimed_at"], claim["previous_state"], row.get("origin_fingerprint")),
+        )
+        return changed.rowcount == 1
 
 
 def _prune(now: Optional[float] = None) -> None:
@@ -291,6 +367,7 @@ def _prune(now: Optional[float] = None) -> None:
                 conn.execute(
                     """DELETE FROM delivery_obligations WHERE obligation_id IN (
                          SELECT obligation_id FROM delivery_obligations
+                         WHERE state IN ('delivered', 'abandoned')
                          ORDER BY CASE state
                                     WHEN 'delivered' THEN 0
                                     WHEN 'abandoned' THEN 1
