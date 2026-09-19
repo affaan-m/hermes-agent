@@ -154,6 +154,7 @@ class DeliveryTarget:
     thread_id: Optional[str] = None
     is_origin: bool = False
     is_explicit: bool = False  # True if chat_id was explicitly specified
+    scope_id: Optional[str] = None
     
     @classmethod
     def parse(cls, target: str, origin: Optional[SessionSource] = None) -> "DeliveryTarget":
@@ -176,6 +177,7 @@ class DeliveryTarget:
                     chat_id=origin.chat_id,
                     thread_id=origin.thread_id,
                     is_origin=True,
+                    scope_id=getattr(origin, "scope_id", None),
                 )
             else:
                 # Fallback to local if no origin
@@ -298,7 +300,7 @@ class DeliveryRouter:
                         self.dead_targets.clear(target.platform.value, target.chat_id)
                 
                 results[target.to_string()] = {
-                    "success": True,
+                    "success": not _send_result_failed(result),
                     "result": result
                 }
             except Exception as e:
@@ -391,6 +393,47 @@ class DeliveryRouter:
         content: str,
         metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
+        """Claim one exact scoped operation before any router side effect."""
+        from gateway.message_failure import delivery_attempt, DeliveryPolicyDenied, DeliveryNotConfirmed, policy_denial
+        adapter = self.adapters.get(target.platform)
+        if adapter is None or not target.chat_id:
+            return policy_denial()
+        routed = dict(metadata or {})
+        if (target.platform == Platform.TELEGRAM and target.thread_id
+                and looks_like_telegram_private_chat_id(target.chat_id)
+                and not _looks_like_int(str(target.thread_id))):
+            # Exact grants cannot authorize creation of an as-yet unknown topic.
+            return policy_denial()
+        if target.scope_id:
+            key = "slack_team_id" if target.platform == Platform.SLACK else "scope_id"
+            if key in routed and routed[key] != target.scope_id:
+                return policy_denial()
+            routed[key] = target.scope_id
+        if target.thread_id is not None:
+            if "thread_id" in routed and str(routed["thread_id"]) != str(target.thread_id):
+                return policy_denial()
+            # Validate identity before the original topic-routing code runs.
+            routed["thread_id"] = target.thread_id
+        try:
+            with delivery_attempt(adapter.config, target.platform, target.chat_id,
+                                  metadata=routed, adapter=adapter) as attempt:
+                result = await self._deliver_to_platform_authorized(target, content, attempt.metadata)
+                attempt.finish(result)
+                return result
+        except DeliveryPolicyDenied:
+            return policy_denial()
+        except DeliveryNotConfirmed:
+            return {"success": False, "delivered": False, "error_kind": "delivery_unknown", "error": "delivery_not_confirmed"}
+        except Exception:
+            logger.exception("Scoped router delivery did not confirm")
+            return {"success": False, "delivered": False, "error_kind": "delivery_unknown", "error": "delivery_not_confirmed"}
+
+    async def _deliver_to_platform_authorized(
+        self,
+        target: DeliveryTarget,
+        content: str,
+        metadata: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
         """Deliver content to a messaging platform."""
         adapter = self.adapters.get(target.platform)
         
@@ -399,6 +442,20 @@ class DeliveryRouter:
         
         if not target.chat_id:
             raise ValueError(f"No chat ID for {target.platform.value} delivery")
+
+        from gateway.message_failure import check_delivery, DeliveryPolicyDenied, policy_denial, is_terminal_delivery_failure, terminal_failure_result, prepare_outbound_text
+        from gateway.message_audience import OutputClass
+        send_metadata = dict(metadata or {})
+        if target.scope_id:
+            send_metadata["slack_team_id" if target.platform == Platform.SLACK else "scope_id"] = target.scope_id
+        kind = send_metadata.get("_hermes_output_class", OutputClass.FINAL)
+        try:
+            send_metadata = check_delivery(adapter.config, target.platform, target.chat_id,
+                adapter=adapter, metadata=send_metadata, output_class=kind)
+        except DeliveryPolicyDenied:
+            return policy_denial()
+        if kind is OutputClass.SAFE_ERROR:
+            content = prepare_outbound_text(content, kind)
         
         # Guard: handle oversized cron output.
         #
@@ -442,7 +499,7 @@ class DeliveryRouter:
                 # retry it here (a failure now is a real delivery problem).
                 if saved_path is None:
                     saved_path = self._save_full_output(content, job_id)
-                footer = f"\n\n... [truncated, full output saved to {saved_path}]"
+                footer = "\n\n... [truncated]"
                 visible = max(0, MAX_PLATFORM_OUTPUT - len(footer))
                 logger.info(
                     "Cron output truncated (%d chars) — full output: %s",
@@ -469,11 +526,11 @@ class DeliveryRouter:
                 "success": True,
                 "filtered": "silence_narration",
                 "delivered": False,
+                "suppressed": True,
             }
 
-        send_metadata = dict(metadata or {})
-        is_named_telegram_private_topic = False
-        named_telegram_private_topic_name: Optional[str] = None
+        # Last content boundary after router-owned additions, before topic or transport work.
+        content = prepare_outbound_text(content, kind)
         if target.thread_id:
             has_explicit_direct_topic = (
                 "direct_messages_topic_id" in send_metadata
@@ -489,20 +546,7 @@ class DeliveryRouter:
                 and not has_explicit_direct_topic
             )
             if is_named_telegram_private_topic:
-                named_telegram_private_topic_name = target_thread_id
-                ensure_dm_topic = getattr(adapter, "ensure_dm_topic", None)
-                if ensure_dm_topic is None:
-                    raise RuntimeError(
-                        "Telegram adapter cannot create named private DM topics"
-                    )
-                created_thread_id = await ensure_dm_topic(target.chat_id, target_thread_id)
-                if not created_thread_id:
-                    raise RuntimeError(
-                        f"Failed to create Telegram private DM topic '{target_thread_id}'"
-                    )
-                target_thread_id = str(created_thread_id)
-                send_metadata["thread_id"] = target_thread_id
-                send_metadata["telegram_dm_topic_created_for_send"] = True
+                raise DeliveryPolicyDenied("thread_creation_not_authorized")
             elif (
                 target.platform == Platform.TELEGRAM
                 and looks_like_telegram_private_chat_id(target.chat_id)
@@ -525,33 +569,9 @@ class DeliveryRouter:
             elif "thread_id" not in send_metadata and "message_thread_id" not in send_metadata and not has_explicit_direct_topic:
                 send_metadata["thread_id"] = target_thread_id
         result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
+        if is_terminal_delivery_failure(result):
+            return terminal_failure_result(result)
         if _send_result_failed(result):
-            if (
-                is_named_telegram_private_topic
-                and named_telegram_private_topic_name
-                and _is_thread_not_found_delivery_error(result)
-            ):
-                ensure_dm_topic = getattr(adapter, "ensure_dm_topic", None)
-                if ensure_dm_topic is None:
-                    raise RuntimeError(
-                        "Telegram adapter cannot refresh named private DM topics"
-                    )
-                refreshed_thread_id = await ensure_dm_topic(
-                    target.chat_id,
-                    named_telegram_private_topic_name,
-                    force_create=True,
-                )
-                if not refreshed_thread_id:
-                    raise RuntimeError(
-                        f"Failed to refresh Telegram private DM topic '{named_telegram_private_topic_name}'"
-                    )
-                send_metadata["thread_id"] = str(refreshed_thread_id)
-                send_metadata["telegram_dm_topic_created_for_send"] = True
-                result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
-
-
-
-

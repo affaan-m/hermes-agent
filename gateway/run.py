@@ -57,6 +57,8 @@ from agent.async_utils import consume_detached_task_result, safe_schedule_thread
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from hermes_cli.config import cfg_get
+from gateway.message_failure import SAFE_FAILURE_TEXT, requires_safe_failure, destination_output_allowed, isolated_delivery_turn, activate_request_async
+from gateway.message_audience import OutputClass
 from hermes_cli.fallback_config import get_fallback_chain
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -437,6 +439,35 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     if len(body) > 400 or body.count("\n") > 4:
         return False
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
+
+
+def _gateway_output_allowed(runner, source, output_class) -> bool:
+    """Resolve output audience for the current target, never inherited DM trust."""
+    adapter = runner._adapter_for_source(source)
+    return bool(adapter and destination_output_allowed(
+        adapter, source.chat_id, output_class,
+        workspace_id=getattr(source, "scope_id", None),
+    ))
+
+
+def _gateway_output_metadata(source, metadata, output_class):
+    """Keep exact source workspace and output class through working notices."""
+    routed = dict(metadata or {})
+    if source.platform == Platform.SLACK and getattr(source, "scope_id", None):
+        routed["slack_team_id"] = str(source.scope_id)
+    routed["_hermes_output_class"] = output_class
+    return routed
+
+
+async def _edit_gateway_working_message(adapter, chat_id, message_id, content, metadata):
+    """Preserve legacy edit signatures while binding metadata where supported."""
+    parameters = inspect.signature(adapter.edit_message).parameters
+    if "metadata" in parameters or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return await adapter.edit_message(chat_id, message_id, content, metadata=metadata)
+    if not destination_output_allowed(adapter, chat_id, OutputClass.PROGRESS, metadata):
+        from gateway.platforms.base import SendResult
+        return SendResult(success=False, error="audience_policy_suppressed")
+    return await adapter.edit_message(chat_id, message_id, content)
 
 
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
@@ -2819,26 +2850,17 @@ def _normalize_empty_agent_response(
     message hits a stale generation token and returns an empty result,
     leaving the platform with nothing to send. (#31884)
     """
-    if response:
-        return response
-
+    if agent_result.get("error"):
+        logger.error("Agent result reported a failure: %s", agent_result["error"])
+    hidden_reasoning = _is_gateway_hidden_reasoning_incomplete_turn(agent_result)
     if agent_result.get("failed"):
-        error_detail = agent_result.get("error", "unknown error")
-        error_str = str(error_detail).lower()
-        is_context_failure = any(
-            p in error_str
-            for p in ("context", "token", "too large", "too long", "exceed", "payload")
-        ) or ("400" in error_str and history_len > 50)
-        if is_context_failure:
-            return (
-                "⚠️ Session too large for the model's context window.\n"
-                "Use /compact to compress the conversation, or "
-                "/reset to start fresh."
-            )
-        return (
-            f"The request failed: {str(error_detail)[:300]}\n"
-            "Try again or use /reset to start a fresh session."
-        )
+        return SAFE_FAILURE_TEXT
+    if agent_result.get("interrupted") and response:
+        return SAFE_FAILURE_TEXT
+    if not agent_result.get("interrupted") and not hidden_reasoning and requires_safe_failure(agent_result):
+        return SAFE_FAILURE_TEXT
+    if response and not hidden_reasoning:
+        return response
 
     api_calls = int(agent_result.get("api_calls", 0) or 0)
     if agent_result.get("interrupted"):
@@ -2853,7 +2875,7 @@ def _normalize_empty_agent_response(
         if api_calls == 0:
             return (
                 "⚠️ Your message was interrupted before processing started "
-                "(likely by a recent /stop). Please send it again."
+                "Please send it again."
             )
         return response
     if api_calls > 0:
@@ -2861,7 +2883,7 @@ def _normalize_empty_agent_response(
             return ""
         if agent_result.get("partial"):
             err = agent_result.get("error", "processing incomplete")
-            return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."
+            return SAFE_FAILURE_TEXT
         return (
             "⚠️ Processing completed but no response was generated. "
             "This may be a transient error — try sending your message again."
@@ -3075,6 +3097,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        # Root provisions this private store explicitly. Missing/corrupt state
+        # holds scoped tool delivery while ordinary authorized replies survive.
+        from gateway.delivery_registry import Registry, RegistryError, report_registry_failure
+        self._delivery_registry = None
+        try:
+            self._delivery_registry = Registry(_hermes_home)
+        except RegistryError as error:
+            report_registry_failure(error)
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -9307,7 +9337,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.info("Gateway stopped (total teardown %.2fs)", _phase_elapsed())
 
         self._stop_task = asyncio.create_task(_stop_impl())
-        await self._stop_task
+        try:
+            await self._stop_task
+        finally:
+            registry = getattr(self, "_delivery_registry", None)
+            if registry is not None:
+                registry.close()
 
     async def wait_for_shutdown(self) -> None:
         """Wait for shutdown signal."""
@@ -9915,6 +9950,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
+        if not _gateway_output_allowed(self, source, OutputClass.OPERATIONAL):
+            return
+        content = _sanitize_gateway_final_response(source.platform, content)
         adapter = self._adapter_for_source(source)
         if not adapter:
             return
@@ -9944,6 +9982,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    @isolated_delivery_turn
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -9958,6 +9997,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+        from gateway.message_audience import ParticipationDecision
+        from gateway.message_failure import authorized_delivery
+        decision = getattr(event, "_audience_decision", None)
+        if isinstance(decision, ParticipationDecision) and not decision.allow_model:
+            return None
+        if event.internal:
+            adapter = self._adapter_for_source(source)
+            if not adapter:
+                return None
+            extra = getattr(adapter.config, "extra", {}) or {}
+            workspace = getattr(source, "scope_id", None) or (getattr(adapter, "_channel_team", {}) or {}).get(source.chat_id)
+            workspace = workspace or extra.get("workspace_id") or extra.get("scope_id")
+            if not authorized_delivery(adapter.config, source.platform, workspace, source.chat_id,
+                    producer="gateway.synthetic", thread_id=getattr(source, "thread_id", None)):
+                logger.debug("Synthetic turn suppressed: no scoped delivery authorization")
+                return None
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
@@ -10091,6 +10146,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
+        if not is_internal:
+            from gateway.message_failure import DeliveryPolicyDenied
+            try:
+                # Pending capability came from authenticated adapter intake;
+                # activate only after this handler's existing user-auth gate.
+                await activate_request_async(self._adapter_for_source(source), source,
+                    event.message_id, event=event,
+                    registry=getattr(self, "_delivery_registry", None))
+            except DeliveryPolicyDenied:
+                # Unsupported/missing request provenance holds tool egress,
+                # while the existing normal reply path remains available.
+                logger.debug("No scoped present-turn tool delivery capability")
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
@@ -10459,7 +10527,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         accepted = running_agent.steer(steer_text)
                     except Exception as exc:
                         logger.warning("Steer failed for session %s: %s", _quick_key, exc)
-                        return f"⚠️ Steer failed: {exc}"
+                        return SAFE_FAILURE_TEXT
                     if accepted:
                         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
                         return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
@@ -11167,7 +11235,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except asyncio.TimeoutError:
                             return "Quick command timed out (30s)."
                         except Exception as e:
-                            return f"Quick command error: {e}"
+                            logger.error("Quick command failed", exc_info=True)
+                            return SAFE_FAILURE_TEXT
                     else:
                         return f"Quick command '/{command}' has no command defined."
                 elif qcmd.get("type") == "alias":
@@ -12656,16 +12725,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         from agent.redact import redact_sensitive_text
                                         _err = redact_sensitive_text(_err, force=True)
                                         _warn_msg = (
-                                            "⚠️ Context compression aborted "
-                                            f"({_err}). No messages were dropped — "
-                                            "conversation is unchanged. Run /compress "
-                                            "to retry, /reset for a clean session, or "
-                                            "check your auxiliary.compression model "
-                                            "configuration."
+                                            "Conversation maintenance could not finish. "
+                                            "Your messages are unchanged."
                                         )
+                                        logger.warning("Compression aborted: %s", _err)
                                         try:
                                             _adapter = self._adapter_for_source(source)
-                                            if _adapter and source.chat_id:
+                                            if (_adapter and source.chat_id
+                                                    and _gateway_output_allowed(self, source, OutputClass.OPERATIONAL)):
                                                 await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
                                         except Exception as _werr:
                                             logger.warning(
@@ -12682,14 +12749,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         _aux_model = getattr(_comp, "_last_aux_model_failure_model", "")
                                         _aux_err = getattr(_comp, "_last_aux_model_failure_error", None) or "unknown error"
                                         _aux_msg = (
-                                            f"ℹ️ Configured compression model `{_aux_model}` "
-                                            f"failed ({_aux_err}). Recovered using your main "
-                                            "model — context is intact — but you may want to "
-                                            "check `auxiliary.compression.model` in config.yaml."
+                                            "Conversation maintenance recovered successfully. "
+                                            "Your messages are intact."
                                         )
+                                        logger.warning("Compression model %s fallback: %s", _aux_model, _aux_err)
                                         try:
                                             _adapter = self._adapter_for_source(source)
-                                            if _adapter and source.chat_id:
+                                            if (_adapter and source.chat_id
+                                                    and _gateway_output_allowed(self, source, OutputClass.OPERATIONAL)):
                                                 await _adapter.send(source.chat_id, _aux_msg, metadata=_hyg_meta)
                                         except Exception as _werr:
                                             logger.warning(
@@ -13140,6 +13207,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
                 _footer_line = ""
+            if not _gateway_output_allowed(self, source, OutputClass.RUNTIME_INTERNALS):
+                _footer_line = ""
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
 
@@ -13486,7 +13555,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # content the user hasn't seen (streaming only sent earlier
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
-            if agent_result.get("already_sent") and not agent_result.get("failed"):
+            if (agent_result.get("already_sent") and not requires_safe_failure(agent_result)
+                    and response != SAFE_FAILURE_TEXT):
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
@@ -14714,7 +14784,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         media_types: Optional[List[str]] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
-        from run_agent import AIAgent
+        from gateway.message_failure import (
+            check_delivery, DeliveryPolicyDenied, is_terminal_delivery_failure,
+        )
 
         media_urls = media_urls or []
         media_types = media_types or []
@@ -14724,7 +14796,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
             return
 
-        _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        _thread_metadata = _gateway_output_metadata(
+            source, self._thread_metadata_for_source(source, event_message_id), OutputClass.FINAL,
+        )
+        _job_chat_id = source.chat_id
+        _job_metadata = dict(_thread_metadata)
 
         try:
             user_config = _load_gateway_config()
@@ -14815,8 +14891,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             result = await self._run_in_executor_with_context(run_sync)
 
             response = result.get("final_response", "") if result else ""
-            if not response and result and result.get("error"):
-                response = f"Error: {result['error']}"
+            if (result and result.get("interrupted") and not response
+                    and result.get("api_calls", 0) > 0
+                    and not result.get("failed") and not result.get("partial")
+                    and not result.get("error") and result.get("completed") is not False):
+                return  # Preserve intentional interruption silence after work.
+            if result and requires_safe_failure(result):
+                logger.warning("Background task returned unsuccessful result: %r", result.get("error"))
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=SAFE_FAILURE_TEXT,
+                    metadata={**(_thread_metadata or {}), "_hermes_output_class": OutputClass.SAFE_ERROR},
+                )
+                return
 
             # Extract media files from the response
             if response:
@@ -15663,9 +15750,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is ``None`` (buttons are self-explanatory); if we fell back to
         text the message itself IS the ack.
         """
+        source = event.source
+        if (source.platform == Platform.SLACK
+                and not _gateway_output_allowed(self, source, OutputClass.OPERATIONAL)):
+            return None
         from tools import slash_confirm as _slash_confirm_mod
 
-        source = event.source
         session_key = self._session_key_for_source(source)
         # Bare-runner test harnesses (object.__new__(GatewayRunner)) skip
         # __init__ and don't have the counter attribute — fall back to a
@@ -18538,7 +18628,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
-        if _streaming_enabled:
+        if _streaming_enabled and _gateway_output_allowed(self, source, OutputClass.PROGRESS):
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                 _adapter = self._adapter_for_source(source)
@@ -18618,7 +18708,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             resp.status, proxy_url, error_text[:500],
                         )
                         return {
-                            "final_response": f"⚠️ Proxy error ({resp.status}): {error_text[:300]}",
+                            "final_response": SAFE_FAILURE_TEXT,
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
@@ -18678,7 +18768,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.error("Proxy connection error to %s: %s", proxy_url, e)
             if not full_response:
                 return {
-                    "final_response": f"⚠️ Proxy connection error: {e}",
+                    "final_response": SAFE_FAILURE_TEXT,
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
@@ -19187,7 +19277,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
                 if not progress_queue:
                     return
-            if not progress_queue or not _run_still_current():
+            if (not progress_queue or not _run_still_current()
+                    or not _gateway_output_allowed(self, source, OutputClass.PROGRESS)):
                 return
 
             # First-touch onboarding: the first time a tool takes longer than
@@ -19408,6 +19499,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else {"thread_id": _progress_thread_id}
         ) if _progress_thread_id else None
         _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
+        _progress_metadata = _gateway_output_metadata(source, _progress_metadata, OutputClass.PROGRESS)
         _progress_reply_to = (
             event_message_id
             if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
@@ -19470,6 +19562,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pass
 
         async def send_progress_messages():
+            if not _gateway_output_allowed(self, source, OutputClass.PROGRESS):
+                return
             if not progress_queue:
                 return
 
@@ -19879,7 +19973,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             _fut = safe_schedule_threadsafe(
-                _send_or_update_status_coro(_status_adapter, _status_chat_id, event_type, prepared_message, _status_thread_metadata),
+                _send_or_update_status_coro(_status_adapter, _status_chat_id, event_type, prepared_message,
+                                           _gateway_output_metadata(source, _status_thread_metadata, OutputClass.PROGRESS)),
                 _loop_for_step,
                 logger=logger,
                 log_message=f"status_callback ({event_type}) scheduling error",
@@ -19954,8 +20049,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     model, runtime_kwargs.get("provider"), session_key or "",
                 )
             except Exception as exc:
+                logger.error("Provider authentication failed", exc_info=True)
                 return {
-                    "final_response": f"⚠️ Provider authentication failed: {exc}",
+                    "final_response": SAFE_FAILURE_TEXT,
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
@@ -20044,7 +20140,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             adapter=_adapter,
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
-                            metadata=_status_thread_metadata,
+                            metadata=_gateway_output_metadata(source, _status_thread_metadata, OutputClass.PROGRESS),
                             on_new_message=(
                                 (lambda: progress_queue.put(("__reset__",)))
                                 if progress_queue is not None
@@ -20063,6 +20159,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+                if not _gateway_output_allowed(self, source, OutputClass.PROGRESS):
+                    return
                 if not _run_still_current():
                     return
                 display_text = text
@@ -20078,7 +20176,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _status_adapter.send(
                         _status_chat_id,
                         display_text,
-                        metadata=_status_thread_metadata,
+                        metadata=_gateway_output_metadata(source, _status_thread_metadata, OutputClass.PROGRESS),
                     ),
                     _loop_for_step,
                     logger=logger,
@@ -20429,7 +20527,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _status_adapter.send(
                         _status_chat_id,
                         message,
-                        metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
+                        metadata=_gateway_output_metadata(source, _non_conversational_metadata(_status_thread_metadata, platform=source.platform), OutputClass.OPERATIONAL),
                     ),
                     _loop_for_step,
                     logger=logger,
@@ -20634,6 +20732,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 UX.  Otherwise fall back to a plain text message with
                 ``/approve`` instructions.
                 """
+                if (source.platform == Platform.SLACK
+                        and not _gateway_output_allowed(self, source, OutputClass.OPERATIONAL)):
+                    return
                 # Pause the typing indicator while the agent waits for
                 # user approval.  Critical for Slack's Assistant API where
                 # assistant_threads_setStatus disables the compose box — the
@@ -20665,7 +20766,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata=_gateway_output_metadata(source, _status_thread_metadata, OutputClass.OPERATIONAL),
                                 allow_permanent=approval_data.get("allow_permanent", True),
                                 smart_denied=approval_data.get("smart_denied", False),
                             ),
@@ -20704,7 +20805,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _status_adapter.send(
                             _status_chat_id,
                             msg,
-                            metadata=_status_thread_metadata,
+                            metadata=_gateway_output_metadata(source, _status_thread_metadata, OutputClass.OPERATIONAL),
                         ),
                         _loop_for_step,
                         logger=logger,
@@ -21048,8 +21149,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result, final_response or "", history_len=len(agent_history),
                 )
                 final_response = _sanitize_gateway_final_response(source.platform, final_response)
-                if not final_response:
-                    final_response = f"⚠️ {result['error']}" if result.get("error") else ""
                 return {
                     "final_response": final_response,
                     "messages": result.get("messages", []),
@@ -21174,6 +21273,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "completed": result_holder[0].get("completed") if result_holder[0] else None,
+                "failed": result_holder[0].get("failed", False) if result_holder[0] else False,
                 "interrupted": result_holder[0].get("interrupted", False) if result_holder[0] else False,
                 "partial": result_holder[0].get("partial", False) if result_holder[0] else False,
                 "error": result_holder[0].get("error") if result_holder[0] else None,
@@ -21337,6 +21437,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _notify_start = time.time()
 
         async def _notify_long_running():
+            if not _gateway_output_allowed(self, source, OutputClass.PROGRESS):
+                return
             if _NOTIFY_INTERVAL is None:
                 return  # Notifications disabled (gateway_notify_interval: 0)
             _notify_adapter = self._adapter_for_source(source)
@@ -21403,10 +21505,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _notify_res = None
                     if _heartbeat_msg_id:
                         try:
-                            _notify_res = await _notify_adapter.edit_message(
+                            _notify_res = await _edit_gateway_working_message(
+                                _notify_adapter,
                                 source.chat_id,
                                 _heartbeat_msg_id,
                                 _heartbeat_text,
+                                _gateway_output_metadata(source, _status_thread_metadata, OutputClass.PROGRESS),
                             )
                         except Exception as _ee:
                             logger.debug("Heartbeat edit failed: %s", _ee)
@@ -21415,7 +21519,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _notify_res = await _notify_adapter.send(
                             source.chat_id,
                             _heartbeat_text,
-                            metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
+                            metadata=_gateway_output_metadata(source, _non_conversational_metadata(_status_thread_metadata, platform=source.platform), OutputClass.PROGRESS),
                         )
                         if getattr(_notify_res, "success", False) and getattr(
                             _notify_res, "message_id", None
@@ -22047,7 +22151,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # final answer.  Suppressing delivery here leaves the user staring
         # at silence.  (#10xxx — "agent stops after web search")
         _sc = stream_consumer_holder[0]
-        if isinstance(response, dict) and not response.get("failed"):
+        if isinstance(response, dict) and not requires_safe_failure(response):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
             # response_previewed means the interim_assistant_callback already

@@ -7,6 +7,7 @@ and implement the required methods.
 
 import asyncio
 import inspect
+from functools import wraps
 import ipaddress
 import logging
 import os
@@ -2435,6 +2436,117 @@ class BasePlatformAdapter(ABC):
     # routing is platform-generic instead of Discord-only.
     gateway_runner = None  # type: ignore[assignment]  # set by gateway/run.py
 
+    def __init_subclass__(cls, **kwargs):
+        """Keep subclass transport overrides inside the shared text boundary."""
+        super().__init_subclass__(**kwargs)
+        text_methods = {"send", "edit_message", "send_draft", "send_private_notice"}
+        slack_direct_methods = {"send_image_file", "send_image", "send_voice", "send_video",
+                                "send_document", "send_multiple_images", "send_exec_approval", "send_slash_confirm"}
+        for name in text_methods | slack_direct_methods:
+            method = cls.__dict__.get(name)
+            if method is None or getattr(method, "_audience_guarded", False):
+                continue
+            signature = inspect.signature(method)
+
+            def protect(method, signature, name):
+                @wraps(method)
+                async def guarded(self, *args, **kwargs):
+                    from gateway.message_audience import OutputClass
+                    from gateway.message_failure import (
+                        prepare_outbound_text, destination_output_allowed, DeliveryPolicyDenied,
+                        DeliveryNotConfirmed, active_delivery_attempt, delivery_attempt,
+                    )
+
+                    scoped = active_delivery_attempt()
+                    if name in slack_direct_methods and self.platform != Platform.SLACK and not scoped:
+                        return await method(self, *args, **kwargs)
+
+                    bound = signature.bind(self, *args, **kwargs)
+                    metadata = bound.arguments.get("metadata") or {}
+                    binding = getattr(self, "_bind_delivery_metadata", None)
+                    if callable(binding):
+                        try:
+                            metadata = binding(bound.arguments.get("chat_id"), metadata)
+                        except DeliveryPolicyDenied:
+                            if name == "send_multiple_images":
+                                return None
+                            return SendResult(success=False, error="audience_policy_suppressed", raw_response={"suppressed": True})
+                        if "metadata" in signature.parameters:
+                            bound.arguments["metadata"] = metadata
+                    kind = metadata.get("_hermes_output_class", OutputClass.FINAL)
+                    if name in {"send_exec_approval", "send_slash_confirm"} and kind is OutputClass.FINAL:
+                        kind = OutputClass.OPERATIONAL
+                    chat_id = bound.arguments.get("chat_id")
+                    private_only = getattr(self, "_public_delivery_forbidden", None)
+                    if name not in {"send", "send_private_notice"} and callable(private_only) and private_only(chat_id, metadata):
+                        if name == "send_multiple_images":
+                            return None  # Preserve the installed batch return contract.
+                        return SendResult(success=False, error="private_delivery_failed",
+                                          retryable=False, error_kind="private_delivery_failed")
+                    if (not isinstance(kind, OutputClass)
+                            or not destination_output_allowed(self, chat_id, kind, metadata)
+                            or (name in {"send_exec_approval", "send_slash_confirm"}
+                                and not destination_output_allowed(self, chat_id, OutputClass.OPERATIONAL, metadata))):
+                        if name == "send_multiple_images":
+                            return None  # Existing batch contract has no delivery result.
+                        return SendResult(success=False, error="audience_policy_suppressed",
+                                          raw_response={"suppressed": True})
+                    for field in ("content", "caption", "command", "description", "title", "message"):
+                        if field in bound.arguments and bound.arguments[field] is not None:
+                            bound.arguments[field] = prepare_outbound_text(bound.arguments[field], kind)
+                    if name == "send_multiple_images" and "images" in bound.arguments:
+                        bound.arguments["images"] = [
+                            (url, prepare_outbound_text(caption, kind))
+                            for url, caption in bound.arguments["images"]
+                        ]
+                    if "metadata" in bound.arguments and "_hermes_output_class" in metadata:
+                        bound.arguments["metadata"] = {
+                            key: value for key, value in metadata.items() if key != "_hermes_output_class"
+                        }
+                    if not scoped:
+                        return await method(*bound.args, **bound.kwargs)
+                    # A transport retry must retain the exact destination and
+                    # may not continue after an unconfirmed prior call.
+                    try:
+                        if name in {"send_exec_approval", "send_slash_confirm"}:
+                            raise DeliveryPolicyDenied("control_not_authorized")
+                        operations = ("media",) if name in slack_direct_methods else ("text",)
+                        with delivery_attempt(self.config, self.platform, chat_id,
+                                              adapter=self, metadata=metadata,
+                                              output_class=kind, operations=operations) as attempt:
+                            if "metadata" not in signature.parameters:
+                                raise DeliveryPolicyDenied("scoped_route_not_supported")
+                            bound.arguments["metadata"] = {
+                                key: value for key, value in attempt.metadata.items()
+                                if key != "_hermes_output_class"
+                            }
+                            result = await method(*bound.args, **bound.kwargs)
+                            attempt.finish(result)
+                            if name != "send_multiple_images":
+                                from gateway.message_failure import is_terminal_delivery_failure
+                                def value(key):
+                                    return result.get(key) if isinstance(result, dict) else getattr(result, key, None)
+                                if (not is_terminal_delivery_failure(result)
+                                        and not (value("success") is True and value("delivered") is not False
+                                                 and not value("error") and not value("error_kind"))):
+                                    return SendResult(success=False, error="delivery_not_confirmed",
+                                                      retryable=False, error_kind="delivery_unknown")
+                            return result
+                    except DeliveryPolicyDenied:
+                        if name == "send_multiple_images":
+                            return None
+                        return SendResult(success=False, error="delivery_not_authorized",
+                                          retryable=False, error_kind="policy_denied")
+                    except DeliveryNotConfirmed:
+                        if name == "send_multiple_images":
+                            return None
+                        return SendResult(success=False, error="delivery_not_confirmed",
+                                          retryable=False, error_kind="delivery_unknown")
+                guarded._audience_guarded = True
+                return guarded
+
+            setattr(cls, name, protect(method, signature, name))
+
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
@@ -4265,6 +4377,7 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
+        from gateway.message_failure import is_terminal_delivery_failure
         result = await self.send(
             chat_id=chat_id,
             content=content,
@@ -4272,7 +4385,7 @@ class BasePlatformAdapter(ABC):
             metadata=metadata,
         )
 
-        if result.success:
+        if result.success or is_terminal_delivery_failure(result):
             return result
 
         error_str = result.error or ""
@@ -4305,6 +4418,8 @@ class BasePlatformAdapter(ABC):
                     reply_to=reply_to,
                     metadata=metadata,
                 )
+                if is_terminal_delivery_failure(result):
+                    return result
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
@@ -4769,6 +4884,29 @@ class BasePlatformAdapter(ABC):
         """
         if not self._message_handler:
             return
+
+        from gateway.message_audience import ParticipationDecision
+        from gateway.message_failure import authorized_delivery
+        decision = getattr(event, "_audience_decision", None)
+        if isinstance(decision, ParticipationDecision) and not decision.allow_model:
+            return
+        if event.internal:
+            consent_adapter = self
+            selector = getattr(getattr(self, "gateway_runner", None), "_adapter_for_source", None)
+            if callable(selector):
+                consent_adapter = selector(event.source)
+                if consent_adapter is None or consent_adapter.platform != self.platform:
+                    logger.debug("Synthetic delivery suppressed: selected profile adapter unavailable")
+                    return
+            workspace = getattr(event.source, "scope_id", None) or (
+                getattr(consent_adapter, "_channel_team", {}) or {}
+            ).get(event.source.chat_id)
+            if not workspace:
+                workspace = (consent_adapter.config.extra or {}).get("workspace_id") or (consent_adapter.config.extra or {}).get("scope_id")
+            if not authorized_delivery(consent_adapter.config, self.platform, workspace, event.source.chat_id,
+                    producer="gateway.synthetic", thread_id=getattr(event.source, "thread_id", None)):
+                logger.debug("Synthetic delivery suppressed: no scoped authorization")
+                return
 
         coerce_plaintext_gateway_command(event)
 
@@ -5455,18 +5593,13 @@ class BasePlatformAdapter(ABC):
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            # Send the error to the user so they aren't left with radio silence
+            # Acknowledge failure without exposing exception details to the channel.
             try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
+                from gateway.message_failure import SAFE_FAILURE_TEXT
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                 await self.send(
                     chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
+                    content=SAFE_FAILURE_TEXT,
                     metadata=_thread_metadata,
                 )
             except Exception as notify_err:
