@@ -24,6 +24,9 @@ from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
 
+# Match the existing reviewed failure wording; runtime diagnostics stay in logs.
+SAFE_FAILURE_TEXT = "Sorry, I couldn't complete that request. Please try again."
+
 # Audio file extensions Hermes recognizes for native audio delivery.
 # Kept in sync with tools/send_message_tool.py and cron/scheduler.py via
 # should_send_media_as_audio() below.
@@ -4275,6 +4278,11 @@ class BasePlatformAdapter(ABC):
         if result.success:
             return result
 
+        # Slack destination/permission rejections cannot be repaired by
+        # changing formatting. Keep other platforms and unknown failures intact.
+        if self.platform == Platform.SLACK and result.error_kind in {"not_found", "forbidden"}:
+            return result
+
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
@@ -4325,6 +4333,11 @@ class BasePlatformAdapter(ABC):
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
+
+        # A transient attempt may have transitioned to a definitive Slack
+        # destination rejection. Do not turn it into another transport call.
+        if self.platform == Platform.SLACK and result.error_kind in {"not_found", "forbidden"}:
+            return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
@@ -5205,16 +5218,19 @@ class BasePlatformAdapter(ABC):
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,
+                                compute_source_fingerprint,
                                 ledger_enabled,
                                 mark_attempting,
                                 record_obligation,
                             )
 
                             if ledger_enabled():
+                                _origin_fingerprint = compute_source_fingerprint(event.source)
                                 _obligation_id = compute_obligation_id(
                                     session_key,
                                     str(getattr(event, "message_id", "") or ""),
                                     text_content,
+                                    origin_fingerprint=_origin_fingerprint,
                                 )
                                 record_obligation(
                                     obligation_id=_obligation_id,
@@ -5226,6 +5242,7 @@ class BasePlatformAdapter(ABC):
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
+                                    origin_fingerprint=_origin_fingerprint,
                                 )
                                 mark_attempting(_obligation_id)
                         except Exception:
@@ -5455,18 +5472,12 @@ class BasePlatformAdapter(ABC):
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            # Send the error to the user so they aren't left with radio silence
+            # Acknowledge failure without projecting exception details into chat.
             try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                 await self.send(
                     chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
+                    content=SAFE_FAILURE_TEXT,
                     metadata=_thread_metadata,
                 )
             except Exception as notify_err:

@@ -94,18 +94,22 @@
   const FALLBACK_COLUMN_LABEL = {
     triage: "Triage",
     todo: "Todo",
+    scheduled: "Scheduled",
     ready: "Ready",
-    running: "In Progress",
+    running: "Running",
     blocked: "Blocked",
+    review: "Review",
     done: "Done",
     archived: "Archived",
   };
   const FALLBACK_COLUMN_HELP = {
     triage: "Raw ideas — a specifier will flesh out the spec",
     todo: "Waiting on dependencies or unassigned",
+    scheduled: "Scheduled to start at a future time",
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
+    review: "Work finished — awaiting review before done",
     done: "Completed",
     archived: "Archived",
   };
@@ -2570,6 +2574,7 @@
     const { t } = useI18n();
     const [dragOver, setDragOver] = useState(false);
     const [showCreate, setShowCreate] = useState(false);
+    const [expanded, setExpanded] = useState(false);
     const colRef = useRef(null);
 
     // Listen for our synthetic touch-drop events from attachTouchDrag().
@@ -2623,13 +2628,23 @@
     const colHelp = getColumnHelp(t, props.column.name);
     const colLabel = getColumnLabel(t, props.column.name);
 
+    // Empty columns collapse to a slim vertical strip so the populated
+    // columns get the viewport. Strips stay expanded while a drag is in
+    // flight (they are drop targets) and expand on click.
+    const collapsed = props.column.tasks.length === 0
+      && !expanded
+      && !props.draggingTaskId;
+
     return h("div", {
       ref: colRef,
       "data-kanban-column": props.column.name,
       className: cn(
         "hermes-kanban-column",
         dragOver ? "hermes-kanban-column--drop" : "",
+        collapsed ? "hermes-kanban-column--collapsed" : "",
       ),
+      title: collapsed ? tx(t, "expandColumn", "Expand this column") : undefined,
+      onClick: collapsed ? function () { setExpanded(true); } : undefined,
       onDragOver: handleDragOver,
       onDragLeave: handleDragLeave,
       onDrop: handleDrop,
@@ -2659,7 +2674,7 @@
           onClick: function () { setShowCreate(function (v) { return !v; }); },
         }, showCreate ? "×" : "+"),
       ),
-      h("div", { className: "hermes-kanban-column-sub" },
+      collapsed ? null : h("div", { className: "hermes-kanban-column-sub" },
         colHelp || ""),
       showCreate ? h(InlineCreate, {
         columnName: props.column.name,
@@ -2671,7 +2686,7 @@
         },
         onCancel: function () { setShowCreate(false); },
       }) : null,
-      h("div", { className: "hermes-kanban-column-body" },
+      collapsed ? null : h("div", { className: "hermes-kanban-column-body" },
         props.column.tasks.length === 0
           ? h("div", { className: "hermes-kanban-empty" }, tx(t, "noTasks", "— no tasks —"))
           : lanes
@@ -3138,6 +3153,30 @@
   // Task drawer
   // -------------------------------------------------------------------------
 
+  // Contain render failures in the detail pane: a bad task payload used to
+  // escape to the dashboard's tab-level boundary and take the whole board
+  // down with it. Now the drawer shows a local error and the board stays up.
+  class TaskDetailErrorBoundary extends React.Component {
+    constructor(props) {
+      super(props);
+      this.state = { error: null };
+    }
+    static getDerivedStateFromError(error) {
+      return { error };
+    }
+    render() {
+      if (this.state.error) {
+        return h("div", { className: "p-4 text-sm" },
+          h("div", { className: "text-destructive font-medium mb-1" },
+            "This task failed to render."),
+          h("div", { className: "text-muted-foreground text-xs", style: { wordBreak: "break-all" } },
+            String((this.state.error && this.state.error.message) || this.state.error)),
+        );
+      }
+      return this.props.children;
+    }
+  }
+
   function TaskDrawer(props) {
     const { t } = useI18n();
     const [data, setData] = useState(null);
@@ -3384,7 +3423,7 @@
         loading ? h("div", { className: "p-4 text-sm text-muted-foreground" },
           tx(t, "loadingDetail", "Loading…")) :
         err ? h("div", { className: "p-4 text-sm text-destructive" }, err) :
-        data ? h(TaskDetail, {
+        data ? h(TaskDetailErrorBoundary, null, h(TaskDetail, {
           data, editing, setEditing,
           renderMarkdown: props.renderMarkdown,
           allTasks: props.allTasks,
@@ -3409,7 +3448,7 @@
             props.onClose();
             if (props.onOpenTask) props.onOpenTask(taskId);
           },
-        }) : null,
+        })) : null,
         data ? h("div", { className: "hermes-kanban-drawer-comment-foot" },
           h("div", {
             className: "hermes-kanban-comment-hint text-xs text-muted-foreground",
@@ -3747,9 +3786,10 @@
                   }),
                 )
               : null,
-            e.payload && !isDiag
+            e.payload && !isDiag && ["{}", "null", '""'].indexOf(
+                typeof e.payload === "string" ? e.payload.trim() : JSON.stringify(e.payload)) === -1
               ? h("code", { className: "hermes-kanban-event-payload" },
-                  JSON.stringify(e.payload))
+                  typeof e.payload === "string" ? e.payload : JSON.stringify(e.payload))
               : null,
           );
         }),
