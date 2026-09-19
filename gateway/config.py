@@ -621,6 +621,10 @@ class GatewayConfig:
     # gateway behaves exactly as before — single HERMES_HOME, no profile stamping.
     multiplex_profiles: bool = False
 
+    # Native cloud caller: explicit profile opt-in, no authority in config.
+    caller_host_enabled: bool = False
+    caller_host_provider: str = ""
+
     # Unauthorized DM policy
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
 
@@ -737,6 +741,8 @@ class GatewayConfig:
             "per_conversation_serial": self.per_conversation_serial,
             "max_concurrent_conversations": self.max_concurrent_conversations,
             "multiplex_profiles": self.multiplex_profiles,
+            "caller_host_enabled": self.caller_host_enabled,
+            "caller_host_provider": self.caller_host_provider,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
@@ -839,6 +845,8 @@ class GatewayConfig:
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
+            caller_host_enabled=data.get("caller_host_enabled", nested_gateway.get("caller_host_enabled", False)) is True,
+            caller_host_provider=data.get("caller_host_provider", nested_gateway.get("caller_host_provider", "")),
             max_concurrent_sessions=max_concurrent_sessions,
             per_conversation_serial=_coerce_bool(per_conversation_serial_raw, False),
             max_concurrent_conversations=max_concurrent_conversations,
@@ -955,6 +963,10 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["multiplex_profiles"] = yaml_cfg["multiplex_profiles"]
 
             gateway_section = yaml_cfg.get("gateway")
+            if isinstance(gateway_section, dict):
+                for key in ("caller_host_enabled", "caller_host_provider"):
+                    if key in gateway_section:
+                        gw_data[key] = gateway_section[key]
             if isinstance(gateway_section, dict) and "max_concurrent_sessions" in gateway_section:
                 gw_data["max_concurrent_sessions"] = gateway_section["max_concurrent_sessions"]
 

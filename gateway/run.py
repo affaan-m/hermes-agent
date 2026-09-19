@@ -2737,11 +2737,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
 
-    def __init__(self, config: Optional[GatewayConfig] = None, *, context_tool_factory=None):
+    def __init__(self, config: Optional[GatewayConfig] = None, *, context_tool_factory=None, caller_host_services=None):
         global _gateway_runner_ref
-        # Trusted host injection only; no profile/environment activation.
+        # Legacy explicit injection remains supported; profile activation is opt-in.
         self._context_tool_factory = context_tool_factory
         self.config = config or load_gateway_config()
+        if getattr(self.config, "caller_host_enabled", False) is True:
+            from gateway.caller_activation import configure_context_tool
+            self._context_tool_factory = configure_context_tool(
+                self.config, host_services=caller_host_services,
+                legacy_factory=context_tool_factory,
+            )
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
