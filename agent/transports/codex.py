@@ -476,9 +476,13 @@ class ResponsesApiTransport(ProviderTransport):
         """
         if response is None:
             return False
+        # Terminal failures may retain partial output. Route them through the
+        # same retry/fallback classification as failures with empty output.
+        status = str(getattr(response, "status", "") or "").strip().lower()
+        if status in {"failed", "cancelled"}:
+            return False
         output = getattr(response, "output", None)
         if not isinstance(output, list) or not output:
-            status = str(getattr(response, "status", "") or "").strip().lower()
             incomplete_details = getattr(response, "incomplete_details", None)
             if isinstance(incomplete_details, dict):
                 reason = str(incomplete_details.get("reason") or "").strip().lower()

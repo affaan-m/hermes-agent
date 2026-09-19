@@ -1317,6 +1317,10 @@ def _normalize_codex_response(
                 function=SimpleNamespace(name=fn_name, arguments=arguments),
             ))
         elif item_type == "custom_tool_call":
+            # Like function_call, custom input is executable only after the
+            # item finishes. Partial streamed input must not produce effects.
+            if item_status in {"queued", "in_progress", "incomplete"}:
+                continue
             fn_name = getattr(item, "name", "") or ""
             arguments = getattr(item, "input", "{}")
             if not isinstance(arguments, str):
@@ -1436,7 +1440,9 @@ def _normalize_codex_response(
         finish_reason = "incomplete"
     elif saw_streaming_or_item_incomplete:
         finish_reason = "incomplete"
-    elif (has_incomplete_items or saw_commentary_phase) and not saw_final_answer_phase:
+    # A final-answer phase describes content, not response completion. Keep
+    # the provider's incomplete status even when that item itself completed.
+    elif has_incomplete_items or (saw_commentary_phase and not saw_final_answer_phase):
         finish_reason = "incomplete"
     elif (reasoning_items_raw or reasoning_parts or saw_reasoning_item) and not final_text:
         # Response contains only reasoning (encrypted thinking state and/or
