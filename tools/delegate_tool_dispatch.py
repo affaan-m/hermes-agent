@@ -393,9 +393,21 @@ def _dispatch_background(batch: _Batch) -> str:
 
     parent_agent = batch.parent_agent
     session_key, origin_ui_session_id = _resolve_async_session_key(parent_agent, batch.origin_ui_session_id)
+    # Capture routing metadata from the parent agent when the session_key
+    # is a task id (bg_*) rather than a parseable gateway session key.
+    # Without this, _parse_session_key fails on restart and the completion
+    # event is dropped as 'Synthetic event source unresolvable'.
+    routing_platform = routing_chat_id = routing_chat_type = routing_thread_id = ""
+    if session_key and session_key.startswith("bg_"):
+        routing_platform = str(getattr(parent_agent, "platform", "") or "")
+        routing_chat_id = str(getattr(parent_agent, "_chat_id", "") or "")
+        routing_chat_type = str(getattr(parent_agent, "_chat_type", "") or "")
+        routing_thread_id = str(getattr(parent_agent, "_thread_id", "") or "")
     routing = dict(
         session_key=session_key, origin_ui_session_id=origin_ui_session_id, origin_session_id=wake_sid,
         parent_session_id=getattr(parent_agent, "session_id", None), max_async_children=_get_max_async_children(),
+        routing_platform=routing_platform, routing_chat_id=routing_chat_id,
+        routing_chat_type=routing_chat_type, routing_thread_id=routing_thread_id,
     )
 
     units = _units_of(batch)
