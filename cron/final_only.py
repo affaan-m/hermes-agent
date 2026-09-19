@@ -50,7 +50,7 @@ def is_log_job(job: Mapping[str, Any]) -> bool:
     if yaml is None or not path.is_file():
         return False
     try:
-        data = yaml.safe_load(path.read_text()) or {}
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         if data.get("scope") != "internal_ops_only":
             return False
         slack = data.get("channels", {}).get("slack", {}).get("logs", {}).get("channel_id")

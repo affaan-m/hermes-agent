@@ -2737,8 +2737,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
 
-    def __init__(self, config: Optional[GatewayConfig] = None):
+    def __init__(self, config: Optional[GatewayConfig] = None, *, context_tool_factory=None):
         global _gateway_runner_ref
+        # Trusted host injection only; no profile/environment activation.
+        self._context_tool_factory = context_tool_factory
         self.config = config or load_gateway_config()
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
@@ -18268,7 +18270,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                from gateway.inventory_context import foreground_worker
+                with foreground_worker():
+                    from contextlib import nullcontext
+                    _context_tool_scope = nullcontext()
+                    _context_tool_factory = getattr(self, "_context_tool_factory", None)
+                    if _context_tool_factory is not None:
+                        from gateway.context_tool import bind_context_tool
+                        from tools.registry import registry as _context_tool_registry
+                        from tools.mcp_tool import _agent_tools_lock
+                        _context_tool_scope = bind_context_tool(
+                            agent, factory=_context_tool_factory,
+                            registry=_context_tool_registry, snapshot_lock=_agent_tools_lock,
+                        )
+                    with _context_tool_scope:
+                        result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
