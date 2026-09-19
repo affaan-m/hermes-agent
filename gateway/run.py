@@ -920,6 +920,26 @@ def _event_addressed_bot(event: Any, source: Any) -> bool:
     return getattr(source, "chat_type", "") == "dm"
 
 
+def _never_silent_ack_enabled(user_config: Optional[dict]) -> bool:
+    """Whether a directly-addressed turn may never end in total silence.
+
+    ``gateway.never_silent_ack: false`` in config.yaml opts out and restores
+    the legacy behavior where the agent's NO_REPLY/[SILENT] marker suppresses
+    all outbound text even when the user directly addressed the bot.
+    """
+    try:
+        gateway_cfg = (user_config or {}).get("gateway") or {}
+        raw = gateway_cfg.get("never_silent_ack", True)
+    except Exception:
+        return True
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(raw)
+
+
+_NEVER_SILENT_ACK_TEXT = "✓ Received."
+
+
 def _internal_channel_ids(user_config: Optional[dict]) -> set:
     """Channels that are INTERNAL surfaces (home, approvals, jobs, desk-log,
     telegram ops).  Everything else is treated as counterparty-facing for
@@ -1064,6 +1084,27 @@ def _operator_unaddressed_in_quiet(event: Any, source: Any, user_config: Optiona
     if _event_addressed_bot(event, source):
         return False
     return _is_operator_source(source)
+
+
+def _never_silent_ack_response(event: Any, source: Any, user_config: Optional[dict]) -> str:
+    """Resolve the outbound text for an intentional-silence turn.
+
+    The NO_REPLY/[SILENT] marker governs passive free-response ingestion: it
+    suppresses all outbound text there (returns ``""``).  A turn the user
+    directly addressed — DM, @mention, or reply in a bot thread — must never
+    end in total silence, so the marker is replaced with a minimal visible
+    ack instead.  Synthetic internal events (background notifications) keep
+    the suppression path either way.
+    """
+    if (
+        not getattr(event, "internal", False)
+        and _never_silent_ack_enabled(user_config)
+        and _event_addressed_bot(event, source)
+    ):
+        return _NEVER_SILENT_ACK_TEXT
+    return ""
+
+
 def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
     """True when gateway.message_timestamps.enabled is opted in.
 
@@ -13773,11 +13814,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # user/assistant alternation; only the outbound chat delivery is
             # suppressed.
             if _intentional_silence:
-                logger.info(
-                    "Suppressing intentional silence marker for session %s",
-                    session_entry.session_id,
+                # Never-silent ack (gateway behavior): a turn the user
+                # directly addressed (DM, @mention, reply in a bot thread)
+                # must always leave a visible trace in the chat.  The
+                # NO_REPLY/[SILENT] marker governs passive free-response
+                # ingestion only; for direct addresses it is replaced with a
+                # minimal ack instead of leaving the user on read.
+                response = _never_silent_ack_response(
+                    event, source, _load_gateway_config(),
                 )
-                response = ""
+                if response:
+                    logger.info(
+                        "Never-silent ack: replacing intentional silence with "
+                        "a visible ack for session %s",
+                        session_entry.session_id,
+                    )
+                else:
+                    logger.info(
+                        "Suppressing intentional silence marker for session %s",
+                        session_entry.session_id,
+                    )
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
