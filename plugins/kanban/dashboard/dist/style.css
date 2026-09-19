@@ -67,6 +67,19 @@
   gap: 0.75rem;
   align-items: start;
   overflow-x: auto;
+  padding-bottom: 0.5rem;
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) transparent;
+}
+.hermes-kanban-columns::-webkit-scrollbar {
+  height: 8px;
+}
+.hermes-kanban-columns::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 4px;
+}
+.hermes-kanban-columns::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .hermes-kanban-columns--scrollable {
@@ -79,7 +92,9 @@
 }
 
 .hermes-kanban-column {
-  flex: 0 0 280px;
+  flex: 1 1 0;
+  min-width: 208px;
+  max-width: 340px;
   display: flex;
   flex-direction: column;
   background: color-mix(in srgb, var(--color-card) 85%, transparent);
@@ -94,6 +109,34 @@
 .hermes-kanban-column--drop {
   border-color: var(--color-ring);
   background: color-mix(in srgb, var(--color-ring) 8%, var(--color-card));
+}
+
+/* Empty columns collapse to a slim vertical strip (see index.js). */
+.hermes-kanban-column--collapsed {
+  flex: 0 0 46px;
+  min-width: 46px;
+  max-width: 46px;
+  align-items: center;
+  cursor: pointer;
+}
+.hermes-kanban-column--collapsed:hover {
+  border-color: var(--color-ring);
+}
+.hermes-kanban-column--collapsed .hermes-kanban-column-header {
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.5rem 0;
+  width: 100%;
+}
+.hermes-kanban-column--collapsed .hermes-kanban-column-label {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+.hermes-kanban-column--collapsed .hermes-kanban-col-check,
+.hermes-kanban-column--collapsed .hermes-kanban-column-add {
+  display: none;
 }
 
 .hermes-kanban-column-header {
@@ -175,7 +218,6 @@
 .hermes-kanban-dot-ready    { background: #d4b348; }  /* amber */
 .hermes-kanban-dot-running  { background: #3fb97d; }  /* green */
 .hermes-kanban-dot-blocked  { background: var(--color-destructive, #d14a4a); }
-.hermes-kanban-dot-review   { background: #48b0c4; }  /* cyan — awaiting review */
 .hermes-kanban-dot-done     { background: #4a8cd1; }  /* blue */
 .hermes-kanban-dot-archived { background: var(--color-border); }
 
@@ -246,10 +288,10 @@
 }
 
 .hermes-kanban-card-content {
-  padding: 0.5rem 0.6rem !important;
+  padding: 0.4rem 0.55rem !important;
   display: flex;
   flex-direction: column;
-  gap: 0.3rem;
+  gap: 0.25rem;
 }
 
 .hermes-kanban-card-row {
@@ -272,6 +314,10 @@
   line-height: 1.3;
   color: var(--color-foreground);
   word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .hermes-kanban-card-meta {
@@ -339,7 +385,7 @@
      100vh on browsers without dvh support. */
   height: 100dvh;
   max-height: 100dvh;
-  background: var(--color-card);
+  background: var(--color-card, #171717);
   border-left: 1px solid var(--color-border);
   display: flex;
   flex-direction: column;
@@ -1554,7 +1600,7 @@
 /* ---- Trash drop zone ------------------------------------------------- */
 
 .hermes-kanban-trash {
-  display: flex;
+  display: none;
   flex-direction: column;
   align-items: center;
   justify-content: center;
@@ -1573,6 +1619,7 @@
 }
 
 .hermes-kanban-trash--active {
+  display: flex;
   opacity: 1;
   pointer-events: auto;
 }
