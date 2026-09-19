@@ -40,6 +40,11 @@ def _stub_graphiti_core() -> None:
     kuzu.KuzuDriver = type("KuzuDriver", (), {})
     llm = types.ModuleType("graphiti_core.llm_client")
     llm.RateLimitError = RateLimitError
+    # The real package re-exports all three from the root (the service imports
+    # them as `from graphiti_core.llm_client import LLMConfig, OpenAIClient,
+    # RateLimitError`); the stub mirrors that surface.
+    llm.LLMConfig = type("LLMConfig", (), {})
+    llm.OpenAIClient = type("OpenAIClient", (), {})
     oc = types.ModuleType("graphiti_core.llm_client.openai_client")
     oc.OpenAIClient = type("OpenAIClient", (), {})
     cfg = types.ModuleType("graphiti_core.llm_client.config")
