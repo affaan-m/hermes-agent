@@ -1289,6 +1289,45 @@ def _operator_unaddressed_in_quiet(event: Any, source: Any, user_config: Optiona
     return _is_operator_source(source)
 
 
+
+def _never_silent_ack_enabled(user_config: Optional[dict]) -> bool:
+    """Whether a directly-addressed turn may never end in total silence.
+
+    ``gateway.never_silent_ack: false`` in config.yaml opts out and restores
+    the legacy behavior where the agent's NO_REPLY/[SILENT] marker suppresses
+    all outbound text even when the user directly addressed the bot.
+    """
+    try:
+        gateway_cfg = (user_config or {}).get("gateway") or {}
+        raw = gateway_cfg.get("never_silent_ack", True)
+    except Exception:
+        return True
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(raw)
+
+
+_NEVER_SILENT_ACK_TEXT = "✓ Received."
+
+
+def _never_silent_ack_response(event: Any, source: Any, user_config: Optional[dict]) -> str:
+    """Resolve the outbound text for an intentional-silence turn.
+
+    The NO_REPLY/[SILENT] marker governs passive free-response ingestion: it
+    suppresses all outbound text there (returns ``""``).  A turn the user
+    directly addressed — DM, @mention, or reply in a bot thread — must never
+    end in total silence, so the marker is replaced with a minimal visible
+    ack instead.  Synthetic internal events (background notifications) keep
+    the suppression path either way.
+    """
+    if (
+        not getattr(event, "internal", False)
+        and _never_silent_ack_enabled(user_config)
+        and _event_addressed_bot(event, source)
+    ):
+        return _NEVER_SILENT_ACK_TEXT
+    return ""
+
 def _csv_or_list_to_set(raw: Any) -> set[str]:
     """Normalize a config list or comma-separated scalar into a string set."""
     if raw is None:

@@ -1765,10 +1765,30 @@ class GatewayTurnMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
+        from gateway.run import _load_gateway_config
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
-            logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
-            response = ""
+            # Never-silent ack (gateway behavior): a turn the user
+            # directly addressed (DM, @mention, reply in a bot thread)
+            # must always leave a visible trace in the chat.  The
+            # NO_REPLY/[SILENT] marker governs passive free-response
+            # ingestion only; for direct addresses it is replaced with a
+            # minimal ack instead of leaving the user on read.
+            from gateway.run import _never_silent_ack_response
+            response = _never_silent_ack_response(
+                event, source, _load_gateway_config(),
+            )
+            if response:
+                logger.info(
+                    "Never-silent ack: replacing intentional silence with "
+                    "a visible ack for session %s",
+                    session_entry.session_id,
+                )
+            else:
+                logger.info(
+                    "Suppressing intentional silence marker for session %s",
+                    session_entry.session_id,
+                )
 
         adapter = self._adapter_for_source(source)
         # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.
