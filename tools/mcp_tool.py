@@ -4724,6 +4724,13 @@ def refresh_agent_mcp_tools(
         if snapshot_generation < published_gen:
             # A newer snapshot already won; our set is stale — drop it.
             return set()
+        # The default path never imports or enables the optional cloud tool.
+        # Its trusted foreground owner uses this same publication lock.
+        context_tool = sys.modules.get("gateway.context_tool")
+        if context_tool is not None:
+            new_defs, new_names = context_tool.project_context_tool(
+                agent, new_defs, new_names, registry=registry
+            )
         current = {
             t["function"]["name"]
             for t in (getattr(agent, "tools", None) or [])
