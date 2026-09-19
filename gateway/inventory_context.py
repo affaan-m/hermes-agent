@@ -21,6 +21,42 @@ _LOCK = threading.RLock()
 _INTAKES = weakref.WeakKeyDictionary()
 _CURRENT = ContextVar("inventory_admitted_request", default=None)
 _DELIVERY = ContextVar("inventory_intake_delivery", default=None)
+_CONTEXT_ATTESTATIONS = weakref.WeakKeyDictionary()
+
+
+class _ContextAttestation:
+    __slots__ = ("__weakref__",)
+
+
+def capture_inventory_context_attestation():
+    """Opaque original-message attestation for the current foreground read."""
+    with _LOCK:
+        request = capture_inventory_request()
+        if request is None:
+            return None
+        handle = _ContextAttestation()
+        # Request dataclass equality ignores its lease; never use it as a key.
+        # A retained attestation must not retain the native request payload.
+        _CONTEXT_ATTESTATIONS[handle] = weakref.ref(request)
+        return handle if resolve_inventory_context_attestation(handle) is not None else None
+
+
+def resolve_inventory_context_attestation(handle):
+    """Revalidate exact registry membership and original owner before release."""
+    with _LOCK:
+        if type(handle) is not _ContextAttestation:
+            return None
+        reference = _CONTEXT_ATTESTATIONS.get(handle)
+        request = reference() if reference is not None else None
+        if request is None or capture_inventory_request() is not request or not request.validate():
+            return None
+        delivery = request.delivery_identity
+        if delivery is None:
+            return None
+        value = {"identity": request.identity, "delivery_identity": delivery,
+                 "message_id": request._lease.intake.snapshot[2],
+                 "bot_user_id": request._lease.intake.bot_user_id}
+        return value if request.validate() else None
 
 
 class _Receipt:
