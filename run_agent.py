@@ -1008,6 +1008,9 @@ class AIAgent:
     def _buffer_vprint(self, message: str) -> None:
         """Buffer a vprint(force=True) retry/fallback line."""
         try:
+            # Print renderers bypass logging formatters. Keep retry details,
+            # but redact credentials before this diagnostic reaches a sink.
+            message = redact_sensitive_text(message, force=True, redact_url_credentials=True)
             buf = getattr(self, "_retry_status_buffer", None)
             if buf is None:
                 buf = []
