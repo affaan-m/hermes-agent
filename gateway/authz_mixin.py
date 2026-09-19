@@ -345,6 +345,12 @@ class GatewayAuthorizationMixin:
             chat_allowlist_env = {
                 Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
+                # Slack counterpart of the Telegram chat-scoped allowlist:
+                # SLACK_GROUP_ALLOWED_CHATS authorizes any member posting in a
+                # designated channel (supplier-desk channels like
+                # pluto-itomarkets), so counterparties can talk to the desk
+                # without being named in SLACK_ALLOWED_USERS.
+                Platform.SLACK: "SLACK_GROUP_ALLOWED_CHATS",
             }.get(source.platform, "")
             if chat_allowlist_env:
                 raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
