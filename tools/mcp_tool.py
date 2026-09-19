@@ -726,4 +726,211 @@ def __getattr__(name):  # PEP 562 — chained onto the module's own __getattr__
     from hermes_cli.plugin_compat import warn_once
     warn_once(__name__, name, *target)
     return getattr(importlib.import_module(target[0]), target[1])
+# --- 0.19-layout compatibility (P1.2 backport suites) ---
+# The full pre-split implementations of refresh_agent_mcp_tools and
+# _reinject_post_build_tools live here (not only in tools/mcp_tool_agent.py)
+# because the backport suites load this module's AST directly; both bodies use
+# only model_tools / tools.registry from sys.modules, matching the 0.19 layout.
+# The context-tool publication hook inside refresh_agent_mcp_tools is the P1.2
+# contract (trusted foreground owner only).
+
+def refresh_agent_mcp_tools(
+    agent,
+    *,
+    enabled_override=None,
+    disabled_override=None,
+    quiet_mode: bool = True,
+) -> set:
+    """Re-derive an already-built agent's tool snapshot from the live registry.
+
+    The agent snapshots ``agent.tools`` once at build time and never re-reads
+    the registry (see ``run_agent`` / ``agent_init``).  When MCP servers connect
+    *after* that snapshot — a slow HTTP/OAuth server that misses the bounded
+    startup wait, or a ``/reload-mcp`` — their tools are invisible until the
+    snapshot is rebuilt.  This is the single shared rebuild used by every such
+    caller (the TUI ``reload.mcp`` RPC, the gateway reload, the late-binding
+    refresh thread, and the per-turn between-turns refresh) so they can't drift
+    apart again.
+
+    The rebuild respects the agent's own ``enabled_toolsets`` /
+    ``disabled_toolsets`` (the same filtering it was built with) and diffs by
+    tool **name** (not count — a count compare misses an equal-size add/remove
+    swap).
+
+    Crucially it is **additive-preserving**: ``get_tool_definitions`` returns
+    only the registry-derived tools, but ``agent_init`` appends two further
+    families directly onto ``agent.tools`` *after* that — external
+    memory-provider tools (mem0/honcho/…) and context-engine tools
+    (``lcm_*``).  A naive ``agent.tools = get_tool_definitions(...)`` would
+    silently DELETE those.  So after rebuilding the registry set we re-run the
+    same post-build injectors ``agent_init`` used, reconstructing the full
+    surface.  The new ``(tools, valid_tool_names)`` pair is published together
+    under ``_agent_tools_lock`` so a concurrent reader never sees a
+    cross-attribute half-swap.
+
+    Returns the set of newly-added tool names (empty when nothing changed), so
+    callers can decide whether to notify the user / re-emit session info.  The
+    caller owns the prompt-cache contract: this helper does NOT check turn state,
+    because each caller has a different policy (``/reload-mcp`` rebuilds after
+    explicit user consent; the late-binding and between-turns paths only rebuild
+    at a turn boundary, before that turn's ``tools=`` prefix is assembled).
+    """
+    from model_tools import get_tool_definitions
+    from tools.registry import registry
+
+    # Explicit reloads (/reload-mcp) pass freshly-resolved toolsets so a server
+    # the user just ENABLED in config is picked up; the agent's stored selection
+    # is then updated to match. The automatic paths (between-turns, late-binding)
+    # pass nothing and reuse the agent's build-time selection unchanged.
+    if enabled_override is not None or disabled_override is not None:
+        enabled = enabled_override if enabled_override is not None else getattr(agent, "enabled_toolsets", None)
+        disabled = disabled_override if disabled_override is not None else getattr(agent, "disabled_toolsets", None)
+        agent.enabled_toolsets = enabled
+        agent.disabled_toolsets = disabled
+    else:
+        enabled = getattr(agent, "enabled_toolsets", None)
+        disabled = getattr(agent, "disabled_toolsets", None)
+
+    # Capture the registry generation this rebuild is derived from BEFORE the
+    # (potentially slow) get_tool_definitions call. Used at publish time to
+    # reject a stale write: if two callers race (e.g. the late-refresh daemon
+    # and the between-turns prologue around turn 1), a slower caller that
+    # computed an OLDER set must not clobber a newer set another caller already
+    # published. ``registry._generation`` bumps on every (de)register.
+    snapshot_generation = registry._generation
+
+    # Registry-derived tools (built-ins + MCP), filtered to the agent's toolsets.
+    # Computed OUTSIDE the lock (get_tool_definitions can be slow); the diff and
+    # publish below happen together in ONE critical section so two concurrent
+    # callers can't torn-publish or compute overlapping ``added`` sets.
+    new_defs = list(
+        get_tool_definitions(
+            enabled_toolsets=enabled,
+            disabled_toolsets=disabled,
+            quiet_mode=quiet_mode,
+        )
+        or []
+    )
+    new_names = {t["function"]["name"] for t in new_defs}
+
+    # Re-append the post-build injected families that get_tool_definitions does
+    # NOT reproduce, so a refresh never strips them (memory-provider + context-
+    # engine tools). Staged entirely on LOCALS — the live ``agent.tools`` /
+    # ``valid_tool_names`` / ``_context_engine_tool_names`` are never touched
+    # until the single atomic publish below, so a concurrent reader
+    # (``build_api_kwargs``) can't see a partial rebuild or a cross-attribute
+    # half-swap. ``staged_engine_names`` are the context-engine routing names
+    # this rebuild actually appended (matching agent_init's dedup-aware add).
+    staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+
+    # Single atomic read-diff-publish so the returned ``added`` is consistent
+    # with what was actually published, even under concurrent callers, and a
+    # stale (older-generation) rebuild can't overwrite a newer published one.
+    with _agent_tools_lock:
+        # Defensive: the published generation should be an int, but tolerate an
+        # agent that never set it (or set a non-int, e.g. a test mock) rather
+        # than throwing TypeError on the comparison and silently failing the
+        # whole refresh.
+        published_gen_raw = getattr(agent, "_tool_snapshot_generation", -1)
+        published_gen = published_gen_raw if isinstance(published_gen_raw, int) else -1
+        if snapshot_generation < published_gen:
+            # A newer snapshot already won; our set is stale — drop it.
+            return set()
+        # The default path never imports or enables the optional cloud tool.
+        # Its trusted foreground owner uses this same publication lock.
+        context_tool = sys.modules.get("gateway.context_tool")
+        if context_tool is not None:
+            new_defs, new_names = context_tool.project_context_tool(
+                agent, new_defs, new_names, registry=registry
+            )
+        current = {
+            t["function"]["name"]
+            for t in (getattr(agent, "tools", None) or [])
+        }
+        if new_names == current:
+            # No change → leave the live snapshot untouched (no churn), but
+            # record the generation so an in-flight older caller can't clobber.
+            agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
+            return set()
+        agent.tools = new_defs
+        agent.valid_tool_names = new_names
+        # Publish context-engine routing names atomically with the snapshot.
+        engine_names = getattr(agent, "_context_engine_tool_names", None)
+        if isinstance(engine_names, set):
+            engine_names.clear()
+            engine_names.update(staged_engine_names)
+        agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
+        return new_names - current
+
+
+def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
+    """Append memory-provider and context-engine tools onto staged locals.
+
+    Mirrors the post-``get_tool_definitions`` injection in ``agent_init`` so a
+    snapshot rebuild reconstructs the FULL tool surface, not just the
+    registry-derived subset. Operates ONLY on the caller's staged ``tools_list``
+    / ``name_set`` (never the live agent attributes) so the rebuild stays atomic.
+    Idempotent (skips names already present) and fail-soft.
+
+    Returns the set of context-engine routing names actually appended by THIS
+    rebuild — matching ``agent_init``'s dedup behavior (a name already provided
+    by a registry/plugin tool is NOT claimed for context-engine routing). The
+    caller publishes this into ``agent._context_engine_tool_names`` atomically
+    with the snapshot.
+    """
+    def _add(schema: dict) -> bool:
+        name = schema.get("name", "")
+        if not name or name in name_set:
+            return False
+        tools_list.append({"type": "function", "function": schema})
+        name_set.add(name)
+        return True
+
+    # Memory-provider tools (mem0/honcho/byterover/supermemory/…).
+    try:
+        memory_manager = getattr(agent, "_memory_manager", None)
+        get_mem_schemas = getattr(memory_manager, "get_all_tool_schemas", None) if memory_manager else None
+        if callable(get_mem_schemas):
+            # Honor the same enablement gate inject_memory_provider_tools uses.
+            from agent.memory_manager import memory_provider_tools_enabled
+            if "memory" in name_set or memory_provider_tools_enabled(getattr(agent, "enabled_toolsets", None)):
+                for schema in get_mem_schemas():
+                    if isinstance(schema, dict):
+                        _add(schema)
+    except Exception:
+        logger.debug("Memory-provider tool re-injection skipped", exc_info=True)
+
+    # Context-engine tools (lcm_grep/lcm_describe/…) — the `context_engine`
+    # toolset is intentionally empty, so these only exist via this append.
+    # Honor the same enabled_toolsets gate agent_init uses (#5544): without it a
+    # restricted-toolset platform (e.g. platform_toolsets: telegram: []) would
+    # re-leak lcm_* tools the build deliberately excluded, and pay the local-
+    # model latency penalty.
+    staged_engine_names: set = set()
+    try:
+        enabled = getattr(agent, "enabled_toolsets", None)
+        context_engine_allowed = enabled is None or "context_engine" in enabled
+        compressor = getattr(agent, "context_compressor", None)
+        get_schemas = getattr(compressor, "get_tool_schemas", None) if compressor else None
+        if context_engine_allowed and callable(get_schemas):
+            for schema in get_schemas():
+                if not isinstance(schema, dict):
+                    continue
+                name = schema.get("name", "")
+                # Only claim the routing name when WE appended the schema, so a
+                # name already owned by a registry/plugin tool keeps its own
+                # dispatch (matches agent_init.py's `continue`-before-claim).
+                if _add(schema) and name:
+                    staged_engine_names.add(name)
+    except Exception:
+        logger.debug("Context-engine tool re-injection skipped", exc_info=True)
+
+    return staged_engine_names
+
+def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
+    """Check if an MCP tool belongs to a server that supports parallel tool calls."""
+    from tools.mcp_tool_discovery import is_mcp_tool_parallel_safe as _impl
+    return _impl(tool_name)
+
+
 # ---- END PLUGIN-COMPAT ----
