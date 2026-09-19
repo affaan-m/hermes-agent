@@ -11,9 +11,12 @@ from dataclasses import dataclass, field
 import threading
 import time
 import weakref
+import re
 
 ABI_VERSION = "inventory_request_v1"
+ROUTE_ABI_VERSION = "inventory_delivery_route_v1"
 _TTL_SECONDS = 300.0
+_MAX_POSTED_MESSAGES = 128
 _LOCK = threading.RLock()
 _INTAKES = weakref.WeakKeyDictionary()
 _CURRENT = ContextVar("inventory_admitted_request", default=None)
@@ -22,6 +25,14 @@ _DELIVERY = ContextVar("inventory_intake_delivery", default=None)
 
 class _Receipt:
     __slots__ = ("__weakref__",)
+
+
+class InventoryDeliveryDenied(ValueError):
+    """A pinned destination denial is terminal, never a formatting retry."""
+
+
+class InventoryDeliveryUnconfirmed(InventoryDeliveryDenied):
+    """An attempted SDK post has no trustworthy acknowledgment; never retry."""
 
 
 @dataclass
@@ -33,7 +44,12 @@ class _Intake:
     bot_user_id: str
     snapshot: tuple
     expires: float
+    routing: tuple
+    session_thread: object
+    delivery_thread: object
     consumed: bool = False
+    post_attempts: int = 0
+    posted_messages: set = field(default_factory=set)
 
 
 @dataclass
@@ -52,6 +68,14 @@ class _Lease:
 class InventoryRequest:
     identity: tuple
     _lease: object = field(repr=False, compare=False)
+
+    @property
+    def delivery_identity(self):
+        """Attest actual output destination without redefining request ABI v1."""
+        with _LOCK:
+            if not self.validate():
+                return None
+            return (*self.identity[:5], self._lease.intake.delivery_thread)
 
     def validate(self):
         """Check immediately before reading and again before releasing output."""
@@ -96,13 +120,44 @@ def _record(receipt):
     return _INTAKES.get(receipt)
 
 
+def _routing(adapter):
+    extra = getattr(getattr(adapter, "config", None), "extra", None)
+    if not isinstance(extra, dict) or extra.get("reply_broadcast", False) is not False:
+        return None
+    threaded = extra.get("reply_in_thread", True)
+    if type(threaded) is not bool:
+        return None
+    dm = extra.get("dm_top_level_threads_as_sessions")
+    if dm is not None and type(dm) not in (str, bool, int):
+        return None
+    # Match SlackAdapter._dm_top_level_threads_as_sessions, including default.
+    dm_sessions = True if dm is None else str(dm).strip().lower() in {"1", "true", "yes", "on"}
+    return (threaded, dm_sessions)
+
+
+def _threads(raw, snapshot, routing):
+    message = snapshot[2]
+    raw_thread = raw.get("thread_ts")
+    if raw_thread and _string(raw_thread) is None:
+        return None
+    genuine = raw_thread if raw_thread and raw_thread != message else None
+    threaded, dm_sessions = routing
+    if snapshot[5] == "im":
+        session = raw_thread or (message if dm_sessions else None)
+    else:
+        session = genuine or (message if threaded else None)
+    delivery = genuine or (message if threaded else None)
+    return session, delivery
+
+
 def _intake_valid(intake):
     extra = getattr(getattr(intake.adapter, "config", None), "extra", None) if intake is not None else None
     return bool(
         intake is not None and time.monotonic() < intake.expires
         and isinstance(extra, dict)
         and extra.get("reply_broadcast", False) is False
-        and extra.get("reply_in_thread", True) is True
+        and _routing(intake.adapter) == intake.routing
+        and _threads(intake.raw, intake.snapshot, intake.routing) == (intake.session_thread, intake.delivery_thread)
         and _snapshot(intake.raw) == intake.snapshot
         and getattr(intake.adapter, "_team_clients", {}).get(intake.workspace) is intake.client
         and getattr(intake.adapter, "_team_bot_user_ids", {}).get(intake.workspace) == intake.bot_user_id
@@ -121,10 +176,14 @@ def issue_intake(adapter, event, *, workspace, client, bot_user_id):
     if (getattr(adapter, "_team_clients", {}).get(workspace) is not client
             or getattr(adapter, "_team_bot_user_ids", {}).get(workspace) != bot_user_id):
         return None
+    routing = _routing(adapter)
+    threads = _threads(event, snapshot, routing) if routing is not None else None
+    if threads is None:
+        return None
     receipt = _Receipt()
     with _LOCK:
         candidate = _Intake(adapter, event, workspace, client, bot_user_id,
-                            snapshot, time.monotonic() + _TTL_SECONDS)
+                            snapshot, time.monotonic() + _TTL_SECONDS, routing, *threads)
         if not _intake_valid(candidate):
             return None
         _INTAKES[receipt] = candidate
@@ -157,7 +216,7 @@ def _normalized_matches(lease):
         getattr(getattr(source, "platform", None), "value", None) == "slack"
         and getattr(source, "user_id", None) == user
         and getattr(source, "chat_id", None) == channel
-        and getattr(source, "thread_id", None) == thread
+        and getattr(source, "thread_id", None) == intake.session_thread
         and getattr(source, "scope_id", intake.workspace) == intake.workspace
         and getattr(event, "message_id", None) == message
         and getattr(intake.adapter, "_channel_team", {}).get(channel) == intake.workspace
@@ -257,4 +316,93 @@ def delivery_client(adapter, chat_id, *, team_id=None):
                 and chat_id == intake.snapshot[1]
                 and (team_id in (None, "") or team_id == intake.workspace)):
             return intake.client
-    raise ValueError("Inventory intake delivery is unavailable")
+    raise InventoryDeliveryDenied("Inventory intake delivery is unavailable")
+
+
+def validate_delivery_thread(adapter, thread_id):
+    """Validate the resolved SDK route; normalize only this intake's own key."""
+    receipt = _DELIVERY.get()
+    if receipt is None:
+        return thread_id
+    with _LOCK:
+        intake = _record(receipt)
+        if not _intake_valid(intake) or intake.adapter is not adapter:
+            raise InventoryDeliveryDenied("Inventory intake delivery is unavailable")
+        if thread_id == intake.delivery_thread:
+            return thread_id
+        # Flat DM follow-on sends can carry the known synthetic session key
+        # without reply_to. It is not authority to open a different thread.
+        if (intake.delivery_thread is None and intake.session_thread == intake.snapshot[2]
+                and thread_id == intake.session_thread):
+            return None
+    raise InventoryDeliveryDenied("Inventory intake delivery is unavailable")
+
+
+def validate_delivery_metadata(adapter, reply_to, metadata):
+    """Check supplied keys before the adapter can discard a synthetic key."""
+    if _DELIVERY.get() is None:
+        return
+    with _LOCK:
+        intake = _record(_DELIVERY.get())
+        if not _intake_valid(intake) or intake.adapter is not adapter:
+            raise InventoryDeliveryDenied("Inventory intake delivery is unavailable")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise InventoryDeliveryDenied("Inventory intake delivery is unavailable")
+        md = metadata or {}
+        values = [md[key] for key in ("thread_id", "thread_ts") if md.get(key) is not None]
+        if (any(_string(value) is None for value in values)
+                or len(set(values)) > 1
+                or any(value not in (intake.session_thread, intake.delivery_thread) for value in values)
+                or (reply_to is not None and reply_to not in (intake.snapshot[2], intake.snapshot[3]))):
+            raise InventoryDeliveryDenied("Inventory intake delivery is unavailable")
+
+
+def reserve_delivery(adapter, chat_id, thread_id, *, team_id=None):
+    """Bound post attempts atomically; never refund unknown SDK outcomes."""
+    if _DELIVERY.get() is None:
+        return
+    with _LOCK:
+        delivery_client(adapter, chat_id, team_id=team_id)
+        validate_delivery_thread(adapter, thread_id)
+        intake = _record(_DELIVERY.get())
+        if intake.post_attempts >= _MAX_POSTED_MESSAGES:
+            raise InventoryDeliveryDenied("Inventory intake delivery is unavailable")
+        intake.post_attempts += 1
+
+
+def record_delivery(adapter, chat_id, message_id, thread_id, *, team_id=None):
+    """Record only an acknowledged public post; unknown results grant no edit."""
+    if _DELIVERY.get() is None:
+        return
+    with _LOCK:
+        delivery_client(adapter, chat_id, team_id=team_id)
+        actual = validate_delivery_thread(adapter, thread_id)
+        intake = _record(_DELIVERY.get())
+        if type(message_id) is not str or re.fullmatch(r"[0-9]{1,16}\.[0-9]{1,9}", message_id) is None:
+            return False
+        if len(intake.posted_messages) >= _MAX_POSTED_MESSAGES:
+            raise InventoryDeliveryDenied("Inventory intake delivery is unavailable")
+        if (message_id, actual) in intake.posted_messages:
+            raise InventoryDeliveryUnconfirmed("Slack response acknowledgment is unavailable")
+        intake.posted_messages.add((message_id, actual))
+        return True
+
+
+def validate_edit(adapter, chat_id, message_id, *, team_id=None):
+    if _DELIVERY.get() is None:
+        return
+    with _LOCK:
+        delivery_client(adapter, chat_id, team_id=team_id)
+        intake = _record(_DELIVERY.get())
+        if (message_id, intake.delivery_thread) not in intake.posted_messages:
+            raise InventoryDeliveryDenied("Inventory intake delivery is unavailable")
+
+
+def validate_private_recipient(adapter, user_id):
+    if _DELIVERY.get() is None:
+        return
+    with _LOCK:
+        intake = _record(_DELIVERY.get())
+        if _intake_valid(intake) and intake.adapter is adapter and user_id == intake.snapshot[0]:
+            return
+    raise InventoryDeliveryDenied("Inventory intake delivery is unavailable")
