@@ -13,13 +13,14 @@ best-effort: ledger failures must never block a send; callers wrap every call in
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing
 from hermes_constants import get_hermes_home
@@ -167,12 +168,16 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             owner_pid INTEGER,
             owner_started_at INTEGER,
             last_error TEXT,
-            adapter_profile TEXT
+            adapter_profile TEXT,
+            origin_fingerprint TEXT
         )"""
     )
     if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
         add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
-
+    # Additive migration: legacy rows deliberately retain NULL provenance.
+    # Concurrent initializers may race; accept only a verified added column.
+    if "origin_fingerprint" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+        add_column_if_missing(conn, "delivery_obligations", "origin_fingerprint", "origin_fingerprint TEXT")
 
 def _transaction():
     from hermes_cli.sqlite_util import transaction
@@ -226,14 +231,36 @@ def _owner_alive(pid: Any, started_at: Any) -> bool:
         return True
 
 
-def compute_obligation_id(session_key: str, message_ref: str, content: str) -> str:
+def compute_source_fingerprint(source: Any) -> str:
+    """Bind the producer's original routing and authorization identity.
+
+    Labels and message content confer no authority. Versioning keeps unknown
+    future formats held instead of implicitly reinterpreting them.
+    """
+    fields = ("chat_id", "thread_id", "scope_id", "profile", "user_id",
+              "user_id_alt", "chat_type", "is_bot", "delivered_via_upstream_relay")
+    identity = {key: getattr(source, key, None) for key in fields}
+    platform = getattr(source, "platform", None)
+    identity["platform"] = getattr(platform, "value", platform)
+    payload = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return "v1:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_obligation_id(session_key: str, message_ref: str, content: str,
+                          origin_fingerprint: Optional[str] = None) -> str:
     """Stable id: same turn + same content re-records idempotently, while distinct threads/topics on one
-    chat never collide (session_key carries platform/chat/thread; ``message_ref`` = inbound message id)."""
-    return hashlib.sha256(f"{session_key}|{message_ref}|{content}".encode("utf-8", "replace")).hexdigest()[:24]
+    chat never collide (session_key carries platform/chat/thread; ``message_ref`` = inbound message id).
+    ``origin_fingerprint`` optionally binds the producer's routing identity so a replayed or forged
+    origin never reuses an obligation owed to someone else."""
+    payload = f"{session_key}|{message_ref}|{content}"
+    if origin_fingerprint is not None:
+        payload += "|" + origin_fingerprint
+    return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()[:24]
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+                      origin_fingerprint: Optional[str] = None) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
@@ -241,12 +268,12 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, adapter_profile, origin_fingerprint)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
+             content, now, now, pid, started,
+             str(adapter_profile).strip() if adapter_profile else "default", origin_fingerprint))
     _prune()
-
 
 def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
@@ -280,6 +307,25 @@ def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
             (time.time(), error[:500] if error else None, obligation_id, pid, started))
     return bool(cursor.rowcount)
 
+def release_unattempted_claim(row: Dict[str, Any]) -> bool:
+    """Restore a claim if policy changed before dispatch, without spending a retry.
+
+    Compare the exact claim stamp so a concurrent delivery/update is never
+    overwritten. This is not used after a transport call may have begun.
+    """
+    claim = row["_claim"]
+    with _DB_LOCK, _transaction() as conn:
+        changed = conn.execute(
+            """UPDATE delivery_obligations
+               SET owner_pid=?, owner_started_at=?, attempts=attempts-1, updated_at=?
+               WHERE obligation_id=? AND owner_pid=? AND owner_started_at IS ?
+                 AND attempts=? AND updated_at=? AND state=? AND origin_fingerprint IS ?""",
+            (claim["previous_pid"], claim["previous_started"], claim["previous_updated_at"],
+             row["obligation_id"], claim["pid"], claim["started"], row["attempts"],
+             claim["claimed_at"], claim["previous_state"], row.get("origin_fingerprint")),
+        )
+        return changed.rowcount == 1
+
 
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:
     with _DB_LOCK, _transaction() as conn:
@@ -292,22 +338,28 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
 
 def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
                  needs_marker: bool, runtime: bool = False, flood: bool = False,
-                 last_error: Optional[str] = None) -> Dict[str, Any]:
+                 last_error: Optional[str] = None, origin_fingerprint: Optional[str] = None,
+                 claim: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Claimed-row dict handed back for redelivery. A marked row names its own cause: ``flood`` (a reply
     the rate limit refused, possibly after accepting part of it) gets FLOOD_MARKER at boot or at runtime, a
     ``runtime`` reconnect replay gets RECONNECTED_MARKER, and a boot-recovered crash keeps the runner's
     restart marker default. ``last_error`` is the row's pre-claim error, carried so a runtime claim that is
-    released unsent goes back to ``failed`` with the same error and keeps its retry eligibility."""
+    released unsent goes back to ``failed`` with the same error and keeps its retry eligibility.
+    ``origin_fingerprint`` carries the producer's routing identity and ``claim`` the exact claim stamp
+    so an unattempted claim can be restored without spending a retry."""
     marker = FLOOD_MARKER if flood else (RECONNECTED_MARKER if runtime else None)
     return {"obligation_id": oid, "session_key": session_key, "platform": platform, "chat_id": chat_id,
             "thread_id": thread_id, "content": content, "needs_marker": needs_marker,
             **({"marker": marker} if needs_marker and marker else {}), "profile": profile,
             **({"runtime_recovery": True} if runtime else {}),
-            **({"last_error": last_error} if last_error else {}), "attempts": attempts + 1}
+            **({"last_error": last_error} if last_error else {}), "attempts": attempts + 1,
+            "origin_fingerprint": origin_fingerprint,
+            **({"_claim": claim} if claim else {})}
 
 
 def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Optional[set] = None,
-                      deliverable_targets: Optional[set] = None) -> List[Dict[str, Any]]:
+                      deliverable_targets: Optional[set] = None,
+                      admit: Optional[Callable[[Dict[str, Any]], bool]] = None) -> List[Dict[str, Any]]:
     """Claim undelivered rows owned by dead processes; return them for redelivery.
 
     Claiming atomically re-stamps the owner to THIS process and increments ``attempts`` (the UPDATE is
@@ -331,14 +383,30 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at
+                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at,
+                      origin_fingerprint
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
-             owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
+             owner_pid, owner_started_at, adapter_profile, last_error, updated_at,
+             origin_fingerprint) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
+            # Admission precedes every mutation, including expiry. A held
+            # reply remains available for explicit operator reconciliation.
+            if admit is not None:
+                destination = {
+                    "session_key": session_key, "platform": platform,
+                    "chat_id": chat_id, "thread_id": thread_id,
+                    "origin_fingerprint": origin_fingerprint,
+                }
+                try:
+                    if admit(destination) is not True:
+                        continue
+                except Exception:
+                    logger.debug("delivery recovery admission failed", exc_info=True)
+                    continue
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
                 conn.execute(
                     """UPDATE delivery_obligations
@@ -362,6 +430,7 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                         "obligation_id": oid, "session_key": session_key, "platform": platform,
                         "chat_id": chat_id, "thread_id": thread_id, "content": content,
                         "profile": adapter_profile or "default", "attempts": attempts,
+                        "origin_fingerprint": origin_fingerprint,
                         "adopted": True, "not_before": flood_not_before(updated_at, last_error)})
                 continue
             # A claimed flood row is resent as a fresh attempt: clear the stale refusal so an interrupted
@@ -380,7 +449,12 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 # the marker.
                 claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts,
                                             adapter_profile or "default", needs_marker=state != "pending",
-                                            flood=flood_row))
+                                            flood=flood_row, origin_fingerprint=origin_fingerprint,
+                                            claim={
+                                                "pid": pid, "started": started, "claimed_at": now,
+                                                "previous_pid": owner_pid, "previous_started": owner_started_at,
+                                                "previous_updated_at": updated_at, "previous_state": state,
+                                            }))
     return claimed
 
 

@@ -3813,7 +3813,7 @@ class BasePlatformAdapter(ABC):
             return None
         try:
             from gateway.delivery_ledger import (
-                compute_obligation_id, ledger_enabled, mark_attempting, record_obligation)
+                compute_obligation_id, compute_source_fingerprint, ledger_enabled, mark_attempting, record_obligation)
             if not await asyncio.to_thread(ledger_enabled):
                 return None
             source = event.source
@@ -3822,14 +3822,17 @@ class BasePlatformAdapter(ABC):
             _ledger_id = getattr(event, "ledger_message_id", None)
             if _ledger_id is None:
                 _ledger_id = getattr(event, "message_id", "")
+            _origin_fingerprint = compute_source_fingerprint(source)
             obligation_id = compute_obligation_id(
-                session_key, str(_ledger_id or ""), text_content)
+                session_key, str(_ledger_id or ""), text_content,
+                origin_fingerprint=_origin_fingerprint)
             await asyncio.to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                origin_fingerprint=_origin_fingerprint)
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:

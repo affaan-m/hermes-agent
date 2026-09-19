@@ -257,6 +257,91 @@ class GatewayStartupMixin:
             sendable.append(row)
         return sendable
 
+    def _ito_auto_resume_allowed(self, source) -> bool:
+        """Ito desk gate for startup auto-resume (silent-restart contract).
+
+        A restart must never post a synthesized "session restored" turn where
+        a counterparty can read it. Auto-resume is allowed only for:
+
+        * the platform's configured home channel (Itô Ops, #all-ito-markets,
+          the WhatsApp / email home addresses), or
+        * a DM whose owner is on the platform's operator allowlist
+          (``<PLATFORM>_ALLOWED_USERS``, numeric / Slack ids only).
+
+        Every other origin (counterparty groups, Slack Connect channels,
+        DMs from anyone else) stays ``resume_pending`` and continues only when
+        a human writes in that chat again.
+        """
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        platform = getattr(source, "platform", None)
+        try:
+            home = self.config.get_home_channel(platform) if platform is not None else None
+        except Exception:  # noqa: BLE001 — never let the gate crash startup
+            home = None
+        home_id = str(getattr(home, "chat_id", "") or "").strip()
+        if chat_id and home_id and chat_id == home_id:
+            return True
+        chat_type = str(getattr(source, "chat_type", "dm") or "dm")
+        if chat_type != "dm":
+            return False
+        user_id = str(getattr(source, "user_id", "") or "").strip()
+        if not user_id:
+            return False
+        platform_value = str(getattr(platform, "value", platform) or "").strip()
+        if not platform_value:
+            return False
+        env_name = f"{platform_value.upper().replace('-', '_')}_ALLOWED_USERS"
+        allowed = {
+            part.strip()
+            for part in os.getenv(env_name, "").split(",")
+            if part.strip()
+        }
+        return user_id in allowed
+
+    def _ito_recovery_routes(self):
+        """Snapshot trusted recovery origins before entering the ledger lock.
+
+        Reuse the current intake authorization, silent-resume policy and
+        profile routing. A ledger row alone is not permission to speak.
+        Missing or changed session identity remains held for reconciliation.
+        """
+        from copy import copy
+        from gateway.delivery_ledger import compute_source_fingerprint
+        routes = {}
+        with self.session_store._lock:
+            self.session_store._ensure_loaded_locked()
+            sources = [
+                (key, entry.session_key, bool(entry.suspended),
+                 copy(entry.origin) if entry.origin else None)
+                for key, entry in self.session_store._entries.items()
+            ]
+        for key, stored_key, suspended, source in sources:
+            try:
+                if suspended or source is None or key != stored_key:
+                    continue
+                if self._session_key_for_source(source) != key:
+                    continue
+                if not self._ito_auto_resume_allowed(source) or not self._is_user_authorized_for_source(source):
+                    continue
+                adapter = self._adapter_for_source(source)
+                if adapter is None:
+                    continue
+                metadata = {"thread_id": source.thread_id} if source.thread_id else {}
+                if source.platform == Platform.SLACK:
+                    # Slack's send helper otherwise falls back to a default
+                    # client when the saved workspace is absent or unknown.
+                    if not source.scope_id or source.scope_id not in getattr(adapter, "_team_clients", {}):
+                        continue
+                    metadata["team_id"] = source.scope_id
+                routes[key] = (
+                    (source.platform.value, str(source.chat_id), str(source.thread_id or ""),
+                     compute_source_fingerprint(source)),
+                    adapter, metadata or None,
+                )
+            except Exception:
+                logger.debug("delivery recovery origin unavailable", exc_info=True)
+        return routes
+
     async def _claim_pending_obligations(self) -> list:
         """Claim recoverable delivery-ledger rows and clear their ``resume_pending`` flags (pure DB
         work, no sends). Must run INLINE BEFORE ``_schedule_resume_pending_sessions`` and the
@@ -284,10 +369,21 @@ class GatewayStartupMixin:
                 _deliverable_targets.update((_pval(p), None) for p in self.adapters)
             for _profile, _adapters in _profile_adapters.items():
                 _deliverable_targets.update((_pval(p), _profile) for p in _adapters)
+            # Only claim authorized routes with their configured adapter;
+            # each claim spends one of the row's three redelivery attempts.
+            routes = self._ito_recovery_routes()
+
+            def admitted(row):
+                route = routes.get(row.get("session_key"))
+                return route is not None and route[0] == (
+                    row.get("platform"), row.get("chat_id"), str(row.get("thread_id") or ""),
+                    row.get("origin_fingerprint"),
+                )
             claimed = await asyncio.to_thread(
                 sweep_recoverable, None,
                 deliverable_platforms={platform for platform, _ in _deliverable_targets},
                 deliverable_targets=_deliverable_targets,
+                admit=admitted,
             )
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
@@ -372,24 +468,42 @@ class GatewayStartupMixin:
         reopening the turn-replay window. Returns the redelivered count."""
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
-        try:
-            from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed
-        except Exception:
-            logger.debug("delivery ledger import failed", exc_info=True)
-            return 0
         redelivered = 0
         for row in claimed:
             if row.get("adopted"):
                 # Adopted at boot inside its flood wait: its resume flag is cleared with the others, and
                 # the timer armed below sends it once the platform's deadline has passed.
                 continue
-            adapter = await self._obligation_adapter(row)
+            # Claiming runs in a worker thread. Recheck the live origin and
+            # authorization after that await, immediately before dispatch
+            # (startup sweep rows carry their exact claim stamp).
+            if row.get("_claim") is not None:
+                try:
+                    routes = self._ito_recovery_routes()
+                except Exception:
+                    routes = {}
+                route = routes.get(row.get("session_key"))
+                admitted_now = route is not None and route[0] == (
+                    row.get("platform"), row.get("chat_id"), str(row.get("thread_id") or ""),
+                    row.get("origin_fingerprint"),
+                )
+                if not admitted_now:
+                    try:
+                        from gateway.delivery_ledger import release_unattempted_claim
+                        await asyncio.to_thread(release_unattempted_claim, row)
+                    except Exception:
+                        logger.debug("delivery recovery claim release failed", exc_info=True)
+                    continue
+                _, adapter, route_metadata = route
+            else:
+                route_metadata = None
+                adapter = await self._obligation_adapter(row)
             if adapter is None:
                 continue
             content = row["content"]
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
-            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+            metadata = route_metadata or ({"thread_id": row["thread_id"]} if row.get("thread_id") else None)
             try:
                 result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
             except Exception as send_err:

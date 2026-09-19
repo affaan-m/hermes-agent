@@ -1910,8 +1910,13 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _get_client(self, chat_id: str, team_id: Optional[str] = None) -> Any:
         """Return the workspace-specific WebClient for a channel."""
-        if team_id and team_id in self._team_clients:
-            return self._team_clients[team_id]
+        if team_id:
+            client = self._team_clients.get(team_id)
+            if client is None:
+                # An explicit workspace must never fall back to another bot,
+                # including after reconnects between chunks of one response.
+                raise RuntimeError("Slack workspace is unavailable")
+            return client
         team_id = self._channel_team.get(chat_id)
         if team_id and team_id in self._team_clients:
             return self._team_clients[team_id]
