@@ -1069,6 +1069,32 @@ With `guest_mode: true`, a message from a non-allowlisted group is processed **o
 
 DMs and allowlisted groups behave exactly as before.
 
+## DM Intake: notices and runtime allowlist (`dm_policy: allowlist`)
+
+With `dm_policy: allowlist`, a DM from a user outside `TELEGRAM_ALLOWED_USERS` is dropped before any turn runs. By default the sender gets nothing and only a log line records the attempt. The DM intake path adds operator visibility and a runtime admission command:
+
+- **Operator notice.** The first blocked DM from a given sender each day (UTC) posts one notice to a configured ops chat and topic with the sender's user id, username and the first 200 characters of the message. The sender is never answered. Repeat DMs the same day post nothing.
+- **`/allow_dm <user_id>`.** An allowlisted operator (a user in `TELEGRAM_ALLOWED_USERS` or already in the runtime allowlist) can admit a new DM sender without a restart or a config edit. The id is appended to the runtime allowlist file and merged into the running process, so the sender's next DM is authorized. The command from anyone else is ignored, even inside an allowed group.
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        dm_policy: allowlist
+        # Where blocked-DM notices go. Optional; falls back to the platform
+        # home_channel (chat_id and thread_id) when omitted.
+        dm_intake_notice:
+          chat_id: "-1001234567890"
+          topic_id: "8072"
+        # Optional file path overrides (defaults shown):
+        # dm_intake_allowlist_file: "~/.hermes/telegram_dm_allowlist.json"
+        # dm_intake_notice_file: "~/.hermes/telegram_dm_intake_notices.json"
+```
+
+The runtime allowlist is a JSON list of user id strings (`["123456789"]`). The adapter reads it at startup and after every `/allow_dm`, and unions it into `TELEGRAM_ALLOWED_USERS` for the live process, so admissions survive gateway restarts without touching config.yaml or the profile env. The notice file stores the per-day dedupe state (`{"<user_id>": "<ISO date>"}`); delete it to reset the daily notices.
+
+
 ## Slash Command Access Control
 
 By default, every allowed user can run every slash command. To split your allowlist into **admins** (full slash command access) and **regular users** (only commands you explicitly enable), add `allow_admin_from` and `user_allowed_commands` to the platform's `extra` block:

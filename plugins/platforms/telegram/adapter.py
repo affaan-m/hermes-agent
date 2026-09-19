@@ -832,6 +832,15 @@ class TelegramAdapter(BasePlatformAdapter):
         # API call (e.g. a set_my_commands stall for certain tokens) cannot
         # blow the gateway's connect timeout (#46298).
         self._post_connect_task: Optional[asyncio.Task] = None
+        # DM intake for the allowlist dm_policy: a runtime allowlist file
+        # (extra.dm_intake_allowlist_file, default <hermes_home>/
+        # telegram_dm_allowlist.json) holds user ids admitted via the
+        # operator-only /allow_dm command. Merge it into the process env once
+        # at startup so every downstream auth check (adapter prefilter and
+        # gateway runner, both of which read TELEGRAM_ALLOWED_USERS fresh)
+        # sees the union without a config edit or restart.
+        self._dm_intake_notices: Optional[Dict[str, str]] = None
+        self._merge_runtime_dm_allowlist_into_env()
 
     def _mark_connected(self) -> None:
         self._drop_delayed_deliveries = False
@@ -1060,6 +1069,260 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or user_id in allowed_ids
+
+    # ------------------------------------------------------------------
+    # DM intake (dm_policy=allowlist): operator notice + /allow_dm command
+    # ------------------------------------------------------------------
+
+    def _dm_intake_path(self, kind: str) -> "_Path":
+        """Resolve the runtime DM-intake file path.
+
+        ``kind`` is ``"allowlist"`` (user ids admitted by /allow_dm) or
+        ``"notice"`` (per-day operator-notice dedupe state).  Both default
+        into the active Hermes home and can be redirected via
+        ``extra.dm_intake_allowlist_file`` / ``extra.dm_intake_notice_file``.
+        """
+        extra = getattr(getattr(self, "config", None), "extra", None) or {}
+        override = extra.get(f"dm_intake_{kind}_file")
+        if override:
+            return _Path(str(override)).expanduser()
+        try:
+            from hermes_constants import get_hermes_home
+
+            base = get_hermes_home()
+        except Exception:
+            base = _Path(os.environ.get("HERMES_HOME", _Path.home() / ".hermes"))
+        name = (
+            "telegram_dm_allowlist.json"
+            if kind == "allowlist"
+            else "telegram_dm_intake_notices.json"
+        )
+        return _Path(base) / name
+
+    def _runtime_dm_allowlist(self) -> Set[str]:
+        """Read the runtime DM allowlist file (ids appended by /allow_dm)."""
+        try:
+            data = json.loads(self._dm_intake_path("allowlist").read_text())
+        except Exception:
+            return set()
+        if not isinstance(data, list):
+            return set()
+        return {str(v).strip() for v in data if str(v).strip()}
+
+    def _merge_runtime_dm_allowlist_into_env(self) -> None:
+        """Union the runtime allowlist into TELEGRAM_ALLOWED_USERS.
+
+        Every auth consumer (this adapter's prefilter fallback and the
+        gateway runner's _is_user_authorized) reads the env var fresh per
+        call, so merging here and after each /allow_dm admits runtime-added
+        users through the whole chain with no restart and no config edit.
+        """
+        runtime = self._runtime_dm_allowlist()
+        if not runtime:
+            return
+        existing = {
+            uid.strip()
+            for uid in os.getenv("TELEGRAM_ALLOWED_USERS", "").split(",")
+            if uid.strip()
+        }
+        merged = existing | runtime
+        if merged != existing:
+            os.environ["TELEGRAM_ALLOWED_USERS"] = ",".join(sorted(merged))
+
+    def _dm_intake_notice_state(self) -> Dict[str, str]:
+        """Per-day notice dedupe state {user_id: ISO date}, lazily loaded."""
+        state = getattr(self, "_dm_intake_notices", None)
+        if state is None:
+            try:
+                data = json.loads(self._dm_intake_path("notice").read_text())
+            except Exception:
+                data = {}
+            state = data if isinstance(data, dict) else {}
+            self._dm_intake_notices = state
+        return state
+
+    def _save_dm_intake_notice_state(self) -> None:
+        state = getattr(self, "_dm_intake_notices", None) or {}
+        path = self._dm_intake_path("notice")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+            tmp.replace(path)
+        except Exception:
+            logger.warning("[Telegram] Failed to persist DM intake notice state", exc_info=True)
+
+    def _dm_intake_notice_target(self) -> tuple[Optional[str], Optional[str]]:
+        """Resolve the (chat_id, topic_id) for blocked-DM operator notices.
+
+        Prefers ``extra.dm_intake_notice: {chat_id, topic_id}``; falls back
+        to the platform home channel (chat_id and thread_id when set).
+        """
+        config = getattr(self, "config", None)
+        extra = getattr(config, "extra", None) or {}
+        notice = extra.get("dm_intake_notice")
+        if isinstance(notice, dict) and notice.get("chat_id"):
+            topic = notice.get("topic_id")
+            return str(notice["chat_id"]), (str(topic) if topic else None)
+        home = getattr(config, "home_channel", None)
+        if home is not None and getattr(home, "chat_id", None):
+            thread = getattr(home, "thread_id", None)
+            return str(home.chat_id), (str(thread) if thread else None)
+        return None, None
+
+    async def _notify_blocked_dm(self, message: Message) -> None:
+        """Post one operator notice per sender per day for a blocked DM.
+
+        Fires only when the intake auth prefilter rejected a direct message
+        (chat_type dm): the sender is never answered, but operators get the
+        sender id, username and the first 200 characters so they can run
+        /allow_dm <user_id> if the sender should be admitted.  Group and
+        channel rejections stay log-only, exactly as before.
+        """
+        try:
+            source = self._source_from_message_for_auth(message)
+        except Exception:
+            return
+        if source.chat_type != "dm" or not source.user_id:
+            return
+        chat_id, topic_id = self._dm_intake_notice_target()
+        if not chat_id:
+            return
+        today = datetime.now(timezone.utc).date().isoformat()
+        state = self._dm_intake_notice_state()
+        if state.get(source.user_id) == today:
+            return
+        bot = getattr(self, "_bot", None)
+        if bot is None:
+            return
+        preview = (getattr(message, "text", None) or getattr(message, "caption", None) or "")[:200]
+        notice_text = (
+            "DM intake: a non-allowlisted user messaged the bot and was not answered.\n"
+            f"user_id: {source.user_id}\n"
+            f"username: {source.user_name or '-'}\n"
+            f"text: {preview or '-'}\n"
+            f"Admit with /allow_dm {source.user_id}"
+        )
+        kwargs: Dict[str, Any] = {"chat_id": chat_id, "text": notice_text}
+        if topic_id:
+            try:
+                kwargs["message_thread_id"] = int(topic_id)
+            except (TypeError, ValueError):
+                pass
+        try:
+            await bot.send_message(**kwargs)
+        except Exception:
+            logger.warning(
+                "[Telegram] Failed to post DM intake notice for user %s",
+                source.user_id,
+                exc_info=True,
+            )
+            return
+        state[source.user_id] = today
+        self._save_dm_intake_notice_state()
+        logger.info(
+            "[Telegram] Posted DM intake notice for user %s to chat %s",
+            source.user_id,
+            chat_id,
+        )
+
+    def _is_dm_operator(self, user_id: Optional[str]) -> bool:
+        """Return whether user_id may run operator-only DM admin commands.
+
+        Operators are the union of TELEGRAM_ALLOWED_USERS and the runtime
+        allowlist file.  This is a stricter check than the message prefilter:
+        a random member of an allowed group passes the prefilter (the chat is
+        authorized) but must NOT be able to edit the DM allowlist.
+        """
+        if not user_id:
+            return False
+        env_ids = {
+            uid.strip()
+            for uid in os.getenv("TELEGRAM_ALLOWED_USERS", "").split(",")
+            if uid.strip()
+        }
+        allowed = env_ids | self._runtime_dm_allowlist()
+        return "*" in allowed or user_id in allowed
+
+    @staticmethod
+    def _is_allow_dm_command(text: Optional[str]) -> bool:
+        """Match /allow_dm and the group-disambiguation form /allow_dm@bot."""
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        head = stripped.split(None, 1)[0].split("@", 1)[0]
+        return head == "/allow_dm"
+
+    def _append_dm_allowlist(self, user_id: str) -> bool:
+        """Append user_id to the runtime allowlist file. Returns True if new."""
+        path = self._dm_intake_path("allowlist")
+        current = sorted(self._runtime_dm_allowlist())
+        if user_id in current:
+            return False
+        current.append(user_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(current, indent=2) + "\n")
+        tmp.replace(path)
+        return True
+
+    async def _handle_allow_dm_command(self, message: Message) -> None:
+        """Operator-only /allow_dm <user_id>: admit a DM sender at runtime.
+
+        Non-operators are ignored silently (the notice path has already
+        logged them).  The id is appended to the runtime allowlist file the
+        adapter reads and merged into TELEGRAM_ALLOWED_USERS, so the new
+        sender's next DM passes both the adapter prefilter and the gateway
+        runner auth without a restart.
+        """
+        source = self._source_from_message_for_auth(message)
+        sender = source.user_id
+        bot = getattr(self, "_bot", None)
+        chat = getattr(message, "chat", None)
+
+        async def _reply(text: str) -> None:
+            if bot is None or chat is None:
+                return
+            kwargs: Dict[str, Any] = {
+                "chat_id": chat.id,
+                "text": text,
+                "reply_to_message_id": getattr(message, "message_id", None),
+            }
+            thread_id = self._effective_message_thread_id(message)
+            if thread_id:
+                try:
+                    kwargs["message_thread_id"] = int(thread_id)
+                except (TypeError, ValueError):
+                    pass
+            try:
+                await bot.send_message(**kwargs)
+            except Exception:
+                logger.warning("[Telegram] Failed to answer /allow_dm", exc_info=True)
+
+        if not self._is_dm_operator(sender):
+            logger.warning(
+                "[Telegram] Ignored /allow_dm from non-operator user %s in chat %s",
+                sender,
+                getattr(chat, "id", None),
+            )
+            return
+        parts = (getattr(message, "text", None) or "").split()
+        target = parts[1].strip() if len(parts) >= 2 else ""
+        if not target.isdigit():
+            await _reply("Usage: /allow_dm <numeric user_id>")
+            return
+        added = self._append_dm_allowlist(target)
+        self._merge_runtime_dm_allowlist_into_env()
+        logger.info(
+            "[Telegram] /allow_dm by operator %s: %s user %s",
+            sender,
+            "added" if added else "already present",
+            target,
+        )
+        if added:
+            await _reply(f"DM allowlist: added {target}. Their next DM will be answered.")
+        else:
+            await _reply(f"DM allowlist: {target} is already admitted.")
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -8129,6 +8392,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "from_user", None), "id", None),
                 getattr(getattr(msg, "chat", None), "id", None),
             )
+            await self._notify_blocked_dm(msg)
             return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
@@ -8155,6 +8419,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "from_user", None), "id", None),
                 getattr(getattr(msg, "chat", None), "id", None),
             )
+            await self._notify_blocked_dm(msg)
+            return
+        if self._is_allow_dm_command(msg.text):
+            await self._handle_allow_dm_command(msg)
             return
         await self._ensure_forum_commands(msg)
 
@@ -8175,6 +8443,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "from_user", None), "id", None),
                 getattr(getattr(msg, "chat", None), "id", None),
             )
+            await self._notify_blocked_dm(msg)
             return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
@@ -8379,6 +8648,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(update.message, "from_user", None), "id", None),
                 getattr(getattr(update.message, "chat", None), "id", None),
             )
+            await self._notify_blocked_dm(update.message)
             return
         if not self._should_process_message(update.message):
             if self._should_observe_unmentioned_group_message(update.message):
