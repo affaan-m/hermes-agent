@@ -25,6 +25,9 @@ from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _sh
 logger = logging.getLogger(__name__)
 
 
+# Match the existing reviewed failure wording; runtime diagnostics stay in logs.
+SAFE_FAILURE_TEXT = "Sorry, I couldn't complete that request. Please try again."
+
 def _consume_detached_handler_exception(task: "asyncio.Task") -> None:
     """Done-callback for a detached fatal-error handler task (carrier cancelled in
     ``_notify_fatal_error``): retrieve its exception so asyncio never logs "never retrieved"."""
@@ -3975,12 +3978,11 @@ class BasePlatformAdapter(ABC):
         a failing notice is logged, never raised). Returns the thread metadata used."""
         _thread_metadata = None
         try:
-            error_detail = str(e)[:300] if str(e) else "no details available"
             _thread_metadata = _thread_metadata_for_event(event)
+            # Acknowledge failure without projecting exception details into chat.
             await self.send(
                 chat_id=event.source.chat_id,
-                content=(f"Sorry, I encountered an error ({type(e).__name__}).\n{error_detail}\n"
-                "Try again or use /reset to start a fresh session."), metadata=_thread_metadata)
+                content=SAFE_FAILURE_TEXT, metadata=_thread_metadata)
         except Exception as notify_err:
             logger.error(
                 "[%s] Failed to send error notification to user: %s", self.name, notify_err, exc_info=True)
