@@ -1471,6 +1471,12 @@ class SlackAdapter(BasePlatformAdapter):
             if client is None:
                 # An explicit workspace must never fall back to another bot,
                 # including after reconnects between chunks of one response.
+                # Slack Connect: a message from an external workspace carries
+                # that workspace's team id; with a single installed workspace
+                # the only correct bot is ours (MAIN fix 2026-09-17).
+                if len(self._team_clients) == 1:
+                    logger.warning("[Slack] team %s has no client; single-workspace fallback for chat %s", team_id, chat_id)
+                    return next(iter(self._team_clients.values()))
                 raise RuntimeError("Slack workspace is unavailable")
             return client
         team_id = self._channel_team.get(chat_id)
