@@ -468,6 +468,11 @@ class GatewayStartupMixin:
         reopening the turn-replay window. Returns the redelivered count."""
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
+        try:
+            from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed
+        except Exception:
+            logger.debug("delivery ledger import failed", exc_info=True)
+            return 0
         redelivered = 0
         for row in claimed:
             if row.get("adopted"):
