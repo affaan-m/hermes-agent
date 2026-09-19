@@ -1,0 +1,28 @@
+{
+  "purpose": "Byte-exact reviewed fixture inputs for tests/test_host_adapters.py and tests/test_slack_context_audience.py. Verified at test load; any mismatch fails the test run. Production wiring imports the installed ito-desk package, never these copies.",
+  "origins": {
+    "worker_repo": "ito-desk infra/aws context exchange (PR #92 line; pins from the 2026-09-14 host-adapters INTERFACE-001 receipt)",
+    "fixture_tests": "ito-desk worker test fixtures (pin 2e25186d for test_context_launch.py per INTERFACE-001; test_context_bootstrap.py fa3a4115 and context_worker_fixtures.py 1a0a23bb recorded from the same reviewed packet)",
+    "queue": "ito-desk queue/ito_queue canonical package; pins from the 2026-09-14 INTERFACE-001 canonical_frozen_inputs receipt, matching ito-desk main byte-for-byte"
+  },
+  "files": {
+    "infra/aws/exchange/protocol.py": "69f1deccdb5a5ae81fac462c5648f504bd5b2dfb407a04679a4e73a01aa932bb",
+    "infra/aws/exchange/artifacts.py": "308647694b4488a976efd7076177d997e844ae2bc809a06f3b5ba22368bbe537",
+    "infra/aws/runner/context_launch.py": "5a976a6e2a7a01bf8565ce428c1094bdeb304542b0f06bc3e33cf9d315a656db",
+    "infra/aws/runner/context_bootstrap.py": "2910e1155f6dd47db0860fb4f1ab65c9156216170ae48bbe65032e2199c23d8f",
+    "infra/aws/runner/context_exchange_v1.py": "40258e8624301a21499832ddf42f67b59ee272cb3207cf84a869a0e77ac6d2e0",
+    "infra/aws/runner/context_results.py": "3b382094a5b507f98c4645e064b4f50f2ac61d756f38a2f9c7fd629031944509",
+    "tests/test_context_launch.py": "2e25186d1e72013899839d5f1ed1eea519c6681357d4b24bcd3c56eaaaf20845",
+    "tests/test_context_bootstrap.py": "fa3a411569a94c909e99e6fdcc9c8a93120416b118dfc3e2a1724e2a32416787",
+    "tests/context_worker_fixtures.py": "1a0a23bbb802c8c605a9f42a393cd0792a86b202f1dfb259099c3171ee603953",
+    "queue/ito_queue/__init__.py": "dd7f24132c30901dd36a5d598cd5a0b08384185a14d39e2a2d827a447f78039a",
+    "queue/ito_queue/acceptance.py": "0192d5466a93ccd334e9d10a4a5830c1b4db24f0147f41cf05eb897ca54b994e",
+    "queue/ito_queue/aws_artifacts.py": "623983aefd36c911948a0ca806cf1d1998c04154aa9559f489e288ecb21d8f0b",
+    "queue/ito_queue/aws_receipts.py": "2da5a312fe809c16f9c5322e095adaf1c2bebe794327dc532482776429512fef",
+    "queue/ito_queue/cli.py": "bab9efbe45650b8ca1a4699422c167ecb2898c4914204a4ad02d31f4b4ad1f37",
+    "queue/ito_queue/intake.py": "08990f73467b573dabeae40efec04bb87ca923d97def61f7b67aaa842846fc30",
+    "queue/ito_queue/render.py": "12b8f86036c74c2c13160dad204992532aec23c9a2a62234dc3e2241b09bb201",
+    "queue/ito_queue/schema.py": "d024a8a63804c55566362158d3d2b3103a7fcd342b3b1ba9f8d8f48bf5bfc720",
+    "queue/ito_queue/store.py": "db8883152d7bad2d67bbd0a21c6041fe7d13e3a224f4142c0c3ce75c5a60df2f"
+  }
+}
