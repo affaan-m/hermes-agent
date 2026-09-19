@@ -491,6 +491,8 @@ def finalize_turn(
     _budget_used = agent.iteration_budget.used if agent.iteration_budget else 0
     _budget_max = agent.iteration_budget.max_total if agent.iteration_budget else 0
 
+    from agent import latency_trace as _latency_trace
+    _latency_trace.mark("turn.ended", agent=agent, api_calls=api_call_count)
     _diag_msg = (
         "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
         "tool_turns=%d last_msg_role=%s response_len=%d session=%s"

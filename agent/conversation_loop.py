@@ -49,6 +49,7 @@ from agent.turn_context import (
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
+from agent import latency_trace as _latency_trace
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -3171,17 +3172,27 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                def _first_delta_marked():
+                    _latency_trace.mark("api.first_text_delta", agent=agent)
+                    return _stop_spinner()
+
                 def _perform_api_call(next_api_kwargs):
+                    _latency_trace.mark(
+                        "api.request_start", agent=agent,
+                        messages=len(next_api_kwargs.get("messages") or next_api_kwargs.get("input") or []),
+                        tools=len(next_api_kwargs.get("tools") or []),
+                        streaming=bool(_use_streaming),
+                    )
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
-                        )
+                        )                    
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
+                            next_api_kwargs, on_first_delta=_first_delta_marked
                         )
                     from agent import relay_llm
 
@@ -4259,6 +4270,7 @@ def run_conversation(
                     _cache_pct = ""
                     if canonical_usage.cache_read_tokens and prompt_tokens:
                         _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
+                    _latency_trace.mark("api.response_complete", agent=agent, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
                     logger.info(
                         "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
                         agent.session_api_calls, agent.model, agent.provider or "unknown",
