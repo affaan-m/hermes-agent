@@ -37,6 +37,7 @@ class CaptureAdapter(BasePlatformAdapter):
         super().__init__(PlatformConfig(enabled=True, token="***"), Platform.SLACK)
         self.sent = []
         self.typing = []
+        self.fail_chat_ids = set()
 
     async def connect(self) -> bool:
         return True
@@ -45,6 +46,8 @@ class CaptureAdapter(BasePlatformAdapter):
         return None
 
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        if chat_id in self.fail_chat_ids:
+            raise RuntimeError(f"simulated send failure to {chat_id}")
         self.sent.append({"chat_id": chat_id, "content": content, "metadata": metadata})
         return SendResult(success=True, message_id=f"sent-{len(self.sent)}")
 
@@ -216,6 +219,83 @@ async def test_operator_unaddressed_quiet_channel_reroutes_first_response_home(
     # The queued follow-up itself still ran.
     assert result["final_response"] == "done-2"
     assert len(StubAgent.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_home_send_drops_in_channel_copy(monkeypatch, tmp_path, caplog):
+    """Fail closed: when the predicate is true and the home-channel send
+    raises, nothing may go to the quiet channel; a warning names the
+    session key."""
+    import logging
+
+    gateway_run = _install_stubs(monkeypatch, tmp_path)
+    monkeypatch.setenv("SLACK_ALLOWED_USERS", OPERATOR_ID)
+
+    adapter = CaptureAdapter()
+    adapter.fail_chat_ids.add(HOME_CHAT)
+    runner = _make_runner(adapter)
+
+    source = _source(OPERATOR_ID)
+    event = _event("operator first", source)
+    adapter._pending_messages[SESSION_KEY] = _event("operator followup", _source(OPERATOR_ID))
+
+    with caplog.at_level(logging.WARNING):
+        result = await runner._run_agent(
+            message="operator first",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="sess-stream-leak-failclosed",
+            session_key=SESSION_KEY,
+            event=event,
+        )
+
+    quiet_sends = [s for s in adapter.sent if s["chat_id"] == QUIET_CHAT]
+    assert quiet_sends == [], f"leaked into quiet channel: {quiet_sends}"
+    assert [s for s in adapter.sent if s["chat_id"] == HOME_CHAT] == []
+    assert any(
+        "Home-channel reroute failed" in r.getMessage() and SESSION_KEY in r.getMessage()
+        for r in caplog.records
+    )
+    # The queued follow-up itself still ran.
+    assert result["final_response"] == "done-2"
+    assert len(StubAgent.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_missing_home_channel_drops_in_channel_copy(monkeypatch, tmp_path, caplog):
+    """Fail closed: with no home channel configured, the reroute drops the
+    response instead of delivering it into the quiet channel."""
+    import logging
+
+    gateway_run = _install_stubs(monkeypatch, tmp_path)
+    monkeypatch.setenv("SLACK_ALLOWED_USERS", OPERATOR_ID)
+
+    adapter = CaptureAdapter()
+    runner = _make_runner(adapter)
+    runner.config.get_home_channel = lambda platform: None
+
+    source = _source(OPERATOR_ID)
+    event = _event("operator first", source)
+    adapter._pending_messages[SESSION_KEY] = _event("operator followup", _source(OPERATOR_ID))
+
+    with caplog.at_level(logging.WARNING):
+        result = await runner._run_agent(
+            message="operator first",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="sess-stream-leak-nohome",
+            session_key=SESSION_KEY,
+            event=event,
+        )
+
+    assert adapter.sent == [], f"nothing may be sent, got: {adapter.sent}"
+    assert any(
+        "No home channel configured" in r.getMessage() and SESSION_KEY in r.getMessage()
+        for r in caplog.records
+    )
+    assert result["final_response"] == "done-2"
 
 
 @pytest.mark.asyncio

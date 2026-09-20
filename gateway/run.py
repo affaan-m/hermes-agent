@@ -22322,10 +22322,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # (counterparty-facing) channel leaks the first
                         # response into that channel when a follow-up arrives
                         # mid-turn; deliver it to the platform home channel
-                        # instead and drop the in-channel copy, exactly as the
-                        # completed-turn path does.  Fail-open: any lookup or
-                        # send problem falls back to in-channel delivery.
-                        _rerouted_home = False
+                        # instead.  Fail CLOSED: once the predicate is true the
+                        # in-channel copy is always dropped; a failed home
+                        # lookup or send logs a warning and delivers nothing
+                        # rather than leaking into the quiet channel.
                         try:
                             _quiet_reroute = _operator_unaddressed_in_quiet(
                                 event, source, _load_gateway_config(),
@@ -22345,13 +22345,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         "Routed operator bookkeeping answer from %s to home channel %s",
                                         source.chat_id, _home.chat_id,
                                     )
-                                    _rerouted_home = True
                                 except Exception as _home_err:
                                     logger.warning(
-                                        "Home-channel reroute failed for %s: %s; falling back to in-channel delivery",
-                                        source.chat_id, _home_err,
+                                        "Home-channel reroute failed for session %s (%s: %s); dropping operator bookkeeping response instead of delivering in-channel",
+                                        session_key or "?", source.chat_id, _home_err,
                                     )
-                        if not _rerouted_home:
+                            else:
+                                logger.warning(
+                                    "No home channel configured for session %s; dropping operator bookkeeping response for quiet channel %s",
+                                    session_key or "?", source.chat_id,
+                                )
+                        else:
                             try:
                                 logger.info(
                                     "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
