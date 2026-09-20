@@ -49,6 +49,9 @@ class TurnContext:
     process_baseline: frozenset[str] = field(default_factory=frozenset)
     _interrupt_depth: int = 0
     event_message_id: Optional[str] = None
+    # The inbound MessageEvent for this turn (None for synthetic/internal turns); the
+    # queued-lane operator reroute predicate needs it.
+    event: Any = None
     # Raw inbound platform id (not the event_message_id reply anchor); stamped on the user turn.
     inbound_message_id: Optional[str] = None
     moa_config: Optional[dict] = None

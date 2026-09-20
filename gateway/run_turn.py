@@ -2085,6 +2085,7 @@ class GatewayTurnMixin:
                 suppress_streaming=_operator_unaddressed_in_quiet(
                     event, source, _load_gateway_config(),
                 ),
+                event=event,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -3557,24 +3558,63 @@ class GatewayTurnMixin:
                 session_key or "?",
             )
         elif first_response:
-            logger.info(
-                "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
-                if _already_streamed else
-                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
-                session_key or "?",
-            )
+            # Operator bookkeeping reroute: the same predicate the completed-turn
+            # path applies.  Without it, an operator's unaddressed message in a
+            # quiet (counterparty-facing) channel leaks the queued-lane first
+            # response into that channel when a follow-up arrives mid-turn;
+            # deliver it to the platform home channel instead.  Fail CLOSED:
+            # once the predicate is true the in-channel copy is always dropped;
+            # a failed home lookup or send logs a warning and delivers nothing
+            # rather than leaking into the quiet channel.
             try:
-                await self._deliver_queued_first_response(
-                    first_response, source=turn_ctx.source, adapter=adapter,
-                    metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
-                    text_already_delivered=_already_streamed,
-                    deliver_media=not _delivery_result.get("failed"), stream_consumer=_sc,
-                    # The text send records a delivery-ledger obligation under this key, keyed on
-                    # the raw inbound id (the anchor above is only the reply target).
-                    session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                from gateway.run import _load_gateway_config, _operator_unaddressed_in_quiet
+                _quiet_reroute = _operator_unaddressed_in_quiet(
+                    turn_ctx.event, turn_ctx.source, _load_gateway_config(),
                 )
-            except Exception as e:
-                logger.warning("Failed to send first response before queued message: %s", e)
+            except Exception:
+                _quiet_reroute = False
+            if _quiet_reroute:
+                _home = self.config.get_home_channel(turn_ctx.source.platform) if self.config else None
+                _home_adapter = self._adapter_for_source(turn_ctx.source)
+                if _home and _home.chat_id and _home_adapter:
+                    try:
+                        await _home_adapter.send(
+                            _home.chat_id,
+                            f"<#{turn_ctx.source.chat_id}> operator bookkeeping:\n{first_response}",
+                        )
+                        logger.info(
+                            "Routed operator bookkeeping answer from %s to home channel %s",
+                            turn_ctx.source.chat_id, _home.chat_id,
+                        )
+                    except Exception as _home_err:
+                        logger.warning(
+                            "Home-channel reroute failed for session %s (%s: %s); dropping operator bookkeeping response instead of delivering in-channel",
+                            session_key or "?", turn_ctx.source.chat_id, _home_err,
+                        )
+                else:
+                    logger.warning(
+                        "No home channel configured for session %s; dropping operator bookkeeping response for quiet channel %s",
+                        session_key or "?", turn_ctx.source.chat_id,
+                    )
+            else:
+                logger.info(
+                    "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
+                    if _already_streamed else
+                    "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
+                    session_key or "?",
+                )
+                try:
+                    await self._deliver_queued_first_response(
+                        first_response, source=turn_ctx.source, adapter=adapter,
+                        metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
+                        text_already_delivered=_already_streamed,
+                        deliver_media=not _delivery_result.get("failed"), stream_consumer=_sc,
+                        # The text send records a delivery-ledger obligation under this key, keyed on
+                        # the raw inbound id (the anchor above is only the reply target).
+                        session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to send first response before queued message: %s", e)
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
         if callable(_bg_cb):
@@ -3701,6 +3741,7 @@ class GatewayTurnMixin:
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
+                suppress_streaming=getattr(turn_ctx, "suppress_streaming", False), event=pending_event,
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -4014,6 +4055,7 @@ class GatewayTurnMixin:
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
+        suppress_streaming: bool = False, event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4039,6 +4081,7 @@ class GatewayTurnMixin:
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
+            suppress_streaming=suppress_streaming, event=event,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,

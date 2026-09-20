@@ -934,7 +934,10 @@ class TurnRunner:
         want_stream_deltas = (
             scfg.enabled and scfg.transport != "off" if plat_streaming is None else bool(plat_streaming)
         )
-        want_interim_messages = ctx.interim_assistant_messages_enabled
+        # suppress_streaming (operator unaddressed in a quiet channel) must hold
+        # back interim previews too: the predicate promises nothing streams into
+        # the counterparty-facing channel.
+        want_interim_messages = ctx.interim_assistant_messages_enabled and not getattr(ctx, "suppress_streaming", False)
         if want_stream_deltas or want_interim_messages:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
