@@ -1061,6 +1061,15 @@ class SlackAdapter(BasePlatformAdapter):
         self._mentioned_threads: set[str] = set()
         # (team_id, channel_id, thread_ts) → Assistant thread metadata; lifecycle
         # events may precede message events and carry session-scoping identity.
+        # DM re-resolution: Slack Connect churn can recreate a DM, leaving the
+        # old D-id permanently channel_not_found. Inbound traffic teaches the
+        # DM's immutable user id(s) (_dm_channel_users); a rejected send is
+        # re-resolved once through conversations.open and the dead→fresh
+        # mapping cached for the process lifetime (_dm_reresolved).
+        self._dm_channel_users: Dict[str, set] = {}
+        self._DM_CHANNEL_USERS_MAX = 512
+        self._dm_reresolved: Dict[str, str] = {}
+        self._DM_RERESOLVED_MAX = 256
         self._assistant_threads: Dict[Tuple[str, str, str], Dict[str, str]] = {}
         # Agent-view context per (team, user) — never global, so one person's split-view
         # context can't leak into another's prompt. Bridges lifecycle/message event ordering.
@@ -2131,6 +2140,65 @@ class SlackAdapter(BasePlatformAdapter):
             identifier(thread_ts, r"[0-9]{1,16}\.[0-9]{1,9}"), caller,
         )
 
+    def _note_dm_channel_user(self, channel_id: str, user_id: str) -> None:
+        """Remember a human user id seen on a DM channel (inbound traffic).
+        This is the only source of user ids for one-shot re-resolution when
+        Slack recreates the DM and the cached D-id dies."""
+        channel_id = str(channel_id or "")
+        user_id = str(user_id or "")
+        if not channel_id.startswith("D") or not user_id:
+            return
+        if user_id == self._bot_user_id or user_id in self._team_bot_user_ids.values():
+            return
+        members = self._dm_channel_users.setdefault(channel_id, set())
+        members.add(user_id)
+        if len(self._dm_channel_users) > self._DM_CHANNEL_USERS_MAX:
+            self._dm_channel_users.pop(next(iter(self._dm_channel_users)))
+
+    async def _reresolve_dm_channel(self, exc: Exception, chat_id: str, client: Any) -> Optional[str]:
+        """One-shot fresh D-channel for a dead DM id via conversations.open.
+
+        Returns the fresh channel id so the caller can retry the post once,
+        or None to keep today's classified failure (fail closed). Only
+        channel_not_found on a D-prefixed channel with known user id(s) is
+        eligible; C- and G-channels are never touched, and a non-DM target
+        is never substituted.
+        """
+        from slack_sdk.errors import SlackApiError
+        if not isinstance(exc, SlackApiError):
+            return None
+        old_id = str(chat_id or "")
+        if not old_id.startswith("D"):
+            return None
+        try:
+            if exc.response.get("error") != "channel_not_found":
+                return None
+        except Exception:
+            return None
+        cached = self._dm_reresolved.get(old_id)
+        if cached:
+            return cached
+        user_ids = sorted(self._dm_channel_users.get(old_id) or ())
+        if not user_ids:
+            return None
+        try:
+            resp = await client.conversations_open(users=",".join(user_ids))
+        except Exception:
+            return None
+        try:
+            new_id = str((resp.get("channel") or {}).get("id") or "")
+        except Exception:
+            return None
+        if not new_id.startswith("D"):
+            return None
+        if new_id != old_id:
+            self._dm_reresolved[old_id] = new_id
+            if len(self._dm_reresolved) > self._DM_RERESOLVED_MAX:
+                self._dm_reresolved.pop(next(iter(self._dm_reresolved)))
+        logger.info("re-resolved DM %s -> %s", old_id, new_id)
+        return new_id
+
+
     def _slack_destination_failure(self, exc, route):
         """Classify exact SDK rejection codes, with no provider text in results."""
         from gateway.inventory_context import InventoryDeliveryDenied, InventoryDeliveryUnconfirmed
@@ -2332,6 +2400,9 @@ class SlackAdapter(BasePlatformAdapter):
         if blocked:
             return blocked
         chat_id = await self._dm_target(chat_id, metadata)
+        # A DM re-resolved earlier this process delivers straight to the
+        # fresh channel; the dead D-id is never posted to again.
+        chat_id = self._dm_reresolved.get(chat_id, chat_id)
         thread_ts = None
         _destination_route = None
         try:
@@ -2421,8 +2492,24 @@ class SlackAdapter(BasePlatformAdapter):
             from gateway.inventory_context import reserve_delivery
             reserve_delivery(self, chat_id, thread_ts, team_id=team_id)
             client_fn = lambda: _selected_client  # noqa: E731
-            last_result = await self._call_with_block_fallback(
-                client_fn, "chat_postMessage", kwargs, "send")
+            try:
+                last_result = await self._call_with_block_fallback(
+                    client_fn, "chat_postMessage", kwargs, "send")
+            except Exception as _post_err:
+                # A dead D-id (Slack recreated the DM): re-resolve once
+                # through conversations.open from the known user id(s)
+                # and retry the post once against the fresh channel.
+                # Anything else keeps today's classified failure.
+                _fresh = await self._reresolve_dm_channel(
+                    _post_err, chat_id, _selected_client,
+                )
+                if _fresh is None:
+                    raise
+                chat_id = _fresh
+                kwargs["channel"] = _fresh
+                reserve_delivery(self, chat_id, thread_ts, team_id=team_id)
+                last_result = await self._call_with_block_fallback(
+                    client_fn, "chat_postMessage", kwargs, "send")
             # Only acknowledged public posts belong to this intake for edits.
             # Unknown/ambiguous results and ephemeral IDs grant no ownership.
             from gateway.inventory_context import (
@@ -4885,6 +4972,11 @@ class SlackAdapter(BasePlatformAdapter):
         if is_dm and thread_ts and msg_type != MessageType.COMMAND:
             await self._set_assistant_thread_title(
                 channel_id, thread_ts, original_text or text, team_id=team_id)
+        # Teach the DM re-resolver this channel's human user id(s); a stale
+        # D-id can then be re-opened from immutable ids instead of guessed.
+        if is_dm:
+            self._note_dm_channel_user(channel_id, user_id)
+
         source = self.build_source(
             chat_id=channel_id,
             chat_name=channel_name,
