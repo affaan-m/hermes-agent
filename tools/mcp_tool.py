@@ -928,9 +928,28 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     return staged_engine_names
 
 def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
-    """Check if an MCP tool belongs to a server that supports parallel tool calls."""
-    from tools.mcp_tool_discovery import is_mcp_tool_parallel_safe as _impl
-    return _impl(tool_name)
+    """Check if an MCP tool belongs to a server that supports parallel tool calls.
 
+    MCP tool names follow the pattern ``mcp__{server}__{tool}``, but that
+    string shape is ambiguous when server names contain underscores. Use the
+    exact server provenance captured at registration time rather than prefix
+    matching, then check whether that server's config includes
+    ``supports_parallel_tool_calls: true``.
+
+    Returns False for non-MCP tools or tools from servers without the flag.
+    Kept on this module (0.19 layout): the split sibling
+    tools/mcp_tool_discovery.py reads the same state through _core."""
+    if not tool_name.startswith(MCP_TOOL_NAME_PREFIX):
+        return False
+    with _lock:
+        server_name = _mcp_tool_server_names.get(tool_name)
+        return bool(server_name and server_name in _parallel_safe_servers)
+
+
+# The 0.19-layout refresh implementation embedded above shares the snapshot
+# lock with the 0.21.x owner module.
+from tools.mcp_tool_agent import _agent_tools_lock  # noqa: E402,F401
+
+from tools.mcp_tool_schema import MCP_TOOL_NAME_PREFIX  # noqa: E402,F401
 
 # ---- END PLUGIN-COMPAT ----

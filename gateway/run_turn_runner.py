@@ -1609,46 +1609,51 @@ class TurnRunner:
         token = set_current_session_key(session_key)
         register_gateway_notify(session_key, self._approval_notify_sync)
         try:
-            api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
-            kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
+            _api_run_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
+            _conversation_kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
             if _accepts_keyword(agent.run_conversation, "turn_author"):
                 # Sent on every transport: a provider gating durable writes needs the bot flag in a DM too.
-                kwargs["turn_author"] = {"id": ctx.source.user_id or None, "name": ctx.source.user_name or None,
+                _conversation_kwargs["turn_author"] = {"id": ctx.source.user_id or None, "name": ctx.source.user_name or None,
                                          "is_bot": bool(getattr(ctx.source, "is_bot", False))}
             if persist_user_message_override is not None:
-                kwargs["persist_user_message"] = persist_user_message_override
+                _conversation_kwargs["persist_user_message"] = persist_user_message_override
             elif observed_group_context:
-                kwargs["persist_user_message"] = ctx.message
+                _conversation_kwargs["persist_user_message"] = ctx.message
             if ctx.persist_user_display_kind:
                 # Internal self-injected turn: type the persisted user row so UIs render it as a
                 # timeline notice, not a user bubble (stripped from provider payloads downstream).
-                kwargs["persist_user_display_kind"] = ctx.persist_user_display_kind
+                _conversation_kwargs["persist_user_display_kind"] = ctx.persist_user_display_kind
             if ctx.persist_user_display_metadata:
-                kwargs["persist_user_display_metadata"] = ctx.persist_user_display_metadata
+                _conversation_kwargs["persist_user_display_metadata"] = ctx.persist_user_display_metadata
             if ctx.moa_config is not None:
-                kwargs["moa_config"] = ctx.moa_config
+                _conversation_kwargs["moa_config"] = ctx.moa_config
             if persist_user_timestamp_override is not None:
-                kwargs["persist_user_timestamp"] = persist_user_timestamp_override
+                _conversation_kwargs["persist_user_timestamp"] = persist_user_timestamp_override
             # The RAW inbound id (not event_message_id, the reply anchor) rides the persisted user
             # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
             if ctx.inbound_message_id is not None:
-                kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
-            from contextlib import nullcontext
-            from gateway.run import _gateway_runner_ref
+                _conversation_kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
             from gateway.inventory_context import foreground_worker
             with foreground_worker():
+                from contextlib import nullcontext
                 _context_tool_scope = nullcontext()
-                _context_tool_factory = getattr(_gateway_runner_ref(), "_context_tool_factory", None)
+                # TurnRunner carries the GatewayRunner as _runner; the pinned
+                # harness passes a bare namespace with the factory directly.
+                _context_tool_factory = (
+                    getattr(self, "_context_tool_factory", None)
+                    or getattr(getattr(self, "_runner", None), "_context_tool_factory", None)
+                )
                 if _context_tool_factory is not None:
                     from gateway.context_tool import bind_context_tool
                     from tools.registry import registry as _context_tool_registry
-                    from tools.mcp_tool_agent import _agent_tools_lock
+                    from tools.mcp_tool import _agent_tools_lock
                     _context_tool_scope = bind_context_tool(
                         agent, factory=_context_tool_factory,
                         registry=_context_tool_registry, snapshot_lock=_agent_tools_lock,
                     )
                 with _context_tool_scope:
-                    return agent.run_conversation(api_message, **kwargs)
+                    result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            return result
         finally:
             unregister_gateway_notify(session_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
