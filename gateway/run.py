@@ -3227,6 +3227,31 @@ def _reconnect_backoff(attempt: int) -> int:
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
 
 
+def background_session_vars(source: Any, task_id: str, event_message_id: Optional[str] = None) -> dict:
+    """Session variables for a /background task, derived from its origin source.
+
+    Pure so it can be tested without a gateway: platform, chat, thread and user
+    come from the source that received the /background command; the task id is
+    the session id. Missing fields become empty strings, never None.
+    """
+    platform = getattr(source, "platform", "")
+    platform = getattr(platform, "value", platform) or ""
+    def _s(name: str) -> str:
+        value = getattr(source, name, None)
+        return str(value) if value not in (None, "") else ""
+    return {
+        "platform": str(platform),
+        "chat_id": _s("chat_id"),
+        "chat_name": _s("chat_name"),
+        "thread_id": _s("thread_id"),
+        "user_id": _s("user_id"),
+        "user_name": _s("user_name"),
+        "session_id": str(task_id or ""),
+        "message_id": str(event_message_id) if event_message_id else "",
+        "profile": _s("profile"),
+    }
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -15209,7 +15234,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 finally:
                     self._cleanup_agent_resources(agent)
 
-            result = await self._run_in_executor_with_context(run_sync)
+            _bg_env_tokens = self._set_background_session_env(source, task_id, event_message_id)
+            try:
+                result = await self._run_in_executor_with_context(run_sync)
+            finally:
+                self._clear_session_env(_bg_env_tokens)
 
             response = result.get("final_response", "") if result else ""
             if not response and result and result.get("error"):
@@ -16748,6 +16777,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
         return delivered
+
+    def _set_background_session_env(self, source: "SessionSource", task_id: str,
+                                    event_message_id: Optional[str] = None) -> list:
+        """Bind a /background task to the session context of the chat that started it.
+
+        A foreground turn runs inside ``_set_session_env(context)``; a background
+        task ran with no session variables at all, so plugin hooks saw an empty
+        chat id and could only fail closed (the desk channel guard withheld two
+        operator answers on 2026-09-22 for that reason). Same platform, chat,
+        thread and user as the origin, the task id as the session id. Returns
+        the reset tokens for ``_clear_session_env``.
+        """
+        from gateway.session_context import set_session_vars
+
+        return set_session_vars(**background_session_vars(source, task_id, event_message_id))
 
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.
