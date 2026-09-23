@@ -5430,7 +5430,7 @@ class BasePlatformAdapter(ABC):
                         _note_result = await self._final_delivery_adapter(event.source).send(
                             event.source.chat_id,
                             f"⚠️ Couldn't deliver {len(_failed_attachments)} "
-                            "attachment(s); the team has been notified.",
+                            "attachment(s).",
                             metadata=_final_thread_metadata,
                         )
                         if not getattr(_note_result, "success", False):

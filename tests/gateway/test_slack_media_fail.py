@@ -252,7 +252,7 @@ async def test_failed_attachment_never_drops_text_and_is_reported(tmp_path, capl
     notes = [c for c in contents if "Couldn't deliver" in c]
     assert len(notes) == 1, contents
     assert "1 attachment(s)" in notes[0]
-    assert "the team has been notified" in notes[0]
+    assert notes[0].rstrip().endswith("attachment(s).")  # no promise of an action nobody takes
     # The note also lands in external channels past the desk channel guard:
     # no file name or path may leak the counterparty identity.
     assert "STRIKE-ORDER.pdf" not in notes[0]
