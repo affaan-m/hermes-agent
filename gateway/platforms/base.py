@@ -5254,6 +5254,15 @@ class BasePlatformAdapter(ABC):
                         reply_to=_reply_anchor,
                         metadata=_final_thread_metadata,
                     )
+                    if not getattr(result, "success", False):
+                        # 2026-09-22: a refused text post logged nothing; the
+                        # turn's output vanished until an operator noticed.
+                        logger.warning(
+                            "[%s] Final response text delivery to %s failed: %s",
+                            delivery_adapter.name,
+                            event.source.chat_id,
+                            getattr(result, "error", None) or "unknown",
+                        )
                     _record_delivery(result)
                     if _obligation_id is not None:
                         try:
@@ -5290,6 +5299,10 @@ class BasePlatformAdapter(ABC):
 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
+                # Attachments that could not be delivered, reported to the
+                # user after the text so a failed upload never takes the
+                # reply down with it (2026-09-22, artifact PDFs refused).
+                _failed_attachments: list = []
 
                 # Send extracted images as native attachments
                 if images:
@@ -5372,10 +5385,10 @@ class BasePlatformAdapter(ABC):
 
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
+                            _failed_attachments.append(Path(media_path).name)
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
-
-                # Send auto-detected local non-image files as native attachments
+                        _failed_attachments.append(Path(media_path).name)
                 for file_path in _non_image_local:
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
@@ -5395,6 +5408,42 @@ class BasePlatformAdapter(ABC):
                             )
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+                        _failed_attachments.append(Path(file_path).name)
+
+                if _failed_attachments:
+                    # Text first, then the report: the reply must never be
+                    # dropped because an attachment failed. The chat note
+                    # carries only the count: a name like STRIKE-DFS-...pdf
+                    # identifies the counterparty, and this note also lands
+                    # in external channels past the desk channel guard.
+                    _names = ", ".join(_failed_attachments[:5])
+                    _more = (
+                        f" and {len(_failed_attachments) - 5} more"
+                        if len(_failed_attachments) > 5 else ""
+                    )
+                    logger.warning(
+                        "[%s] %d attachment(s) failed to deliver to %s: %s",
+                        self.name, len(_failed_attachments),
+                        event.source.chat_id, f"{_names}{_more}",
+                    )
+                    try:
+                        _note_result = await self._final_delivery_adapter(event.source).send(
+                            event.source.chat_id,
+                            f"⚠️ Couldn't deliver {len(_failed_attachments)} "
+                            "attachment(s).",
+                            metadata=_final_thread_metadata,
+                        )
+                        if not getattr(_note_result, "success", False):
+                            logger.warning(
+                                "[%s] attachment-failure notice to %s failed: %s",
+                                self.name, event.source.chat_id,
+                                getattr(_note_result, "error", None) or "unknown",
+                            )
+                    except Exception as _note_err:
+                        logger.warning(
+                            "[%s] attachment-failure notice to %s failed: %s",
+                            self.name, event.source.chat_id, _note_err,
+                        )
 
                 # A3 (#29346): if a non-empty response produced nothing
                 # deliverable, fail loudly rather than dropping it in silence.

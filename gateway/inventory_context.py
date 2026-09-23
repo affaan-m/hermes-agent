@@ -354,6 +354,34 @@ def delivery_client(adapter, chat_id, *, team_id=None):
             return intake.client
     raise InventoryDeliveryDenied("Inventory intake delivery is unavailable")
 
+def delivery_denial_reason(adapter, chat_id, *, team_id=None):
+    """Short reason a pinned intake denies this destination, for log lines.
+
+    None when there is no pinned intake or the destination would pass. The
+    vocabulary is fixed and carries no user text, tokens or provider
+    payloads. Motivation (2026-09-22): a desk turn ran 356.7 s against the
+    300 s lease and the refusal logged only the canned denial text, so the
+    expired lease was invisible until MAIN reconstructed it by hand.
+    """
+    receipt = _DELIVERY.get()
+    if receipt is None:
+        return None
+    with _LOCK:
+        intake = _record(receipt)
+        if not _intake_valid(intake):
+            if intake is not None and time.monotonic() >= intake.expires:
+                return "intake lease expired"
+            return "intake no longer valid"
+        if intake.adapter is not adapter:
+            return "intake adapter mismatch"
+        if chat_id != intake.snapshot[1]:
+            return "intake channel mismatch"
+        if team_id not in (None, "") and team_id != intake.workspace:
+            return "intake workspace mismatch"
+        if intake.post_attempts >= _MAX_POSTED_MESSAGES:
+            return "intake post budget exhausted"
+    return None
+
 
 def validate_delivery_thread(adapter, thread_id):
     """Validate the resolved SDK route; normalize only this intake's own key."""
