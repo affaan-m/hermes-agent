@@ -1468,6 +1468,19 @@ class SlackAdapter(BasePlatformAdapter):
             return self._slack_destination_failure(exc, None)
         return None
 
+    def _log_pinned_media_denial(self, what: str, media_path: str, chat_id: str, metadata=None) -> None:
+        """Why a pinned intake refused this attachment, with the path.
+        2026-09-22: two artifact uploads were refused after the intake lease
+        expired mid-turn and the log carried only the canned denial text."""
+        from gateway.inventory_context import delivery_denial_reason
+        reason = delivery_denial_reason(
+            self, chat_id, team_id=self._metadata_team_id(metadata)
+        ) or "pinned intake route invalid"
+        logger.warning(
+            "[%s] Refused %s %s to %s: %s",
+            self.name, what, media_path, chat_id, reason,
+        )
+
     def _slack_destination_route(self, client, chat_id, thread_ts, requested_team):
         """Snapshot observed identifiers before awaiting the actual SDK client."""
         def identifier(value, pattern):
@@ -2229,6 +2242,9 @@ class SlackAdapter(BasePlatformAdapter):
         """
         _pinned_denial = self._inventory_route_denial(chat_id, None, metadata)
         if _pinned_denial is not None:
+            self._log_pinned_media_denial(
+                "image batch", ", ".join(str(p) for p, _ in (images or [])[:5]), chat_id, metadata
+            )
             return _pinned_denial
         if not self._app:
             return
@@ -2803,6 +2819,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Send an audio file to Slack."""
         _pinned_denial = self._inventory_route_denial(chat_id, reply_to, metadata)
         if _pinned_denial is not None:
+            self._log_pinned_media_denial("audio upload", audio_path, chat_id, metadata)
             return _pinned_denial
         try:
             return await self._upload_file(
@@ -2835,6 +2852,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Send a video file to Slack."""
         _pinned_denial = self._inventory_route_denial(chat_id, reply_to, metadata)
         if _pinned_denial is not None:
+            self._log_pinned_media_denial("video upload", video_path, chat_id, metadata)
             return _pinned_denial
         if not self._app:
             return SendResult(success=False, error="Not connected")
@@ -2906,6 +2924,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Send a document/file attachment to Slack."""
         _pinned_denial = self._inventory_route_denial(chat_id, reply_to, metadata)
         if _pinned_denial is not None:
+            self._log_pinned_media_denial("document upload", file_path, chat_id, metadata)
             return _pinned_denial
         if not self._app:
             return SendResult(success=False, error="Not connected")
