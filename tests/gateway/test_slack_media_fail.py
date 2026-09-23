@@ -252,10 +252,18 @@ async def test_failed_attachment_never_drops_text_and_is_reported(tmp_path, capl
     notes = [c for c in contents if "Couldn't deliver" in c]
     assert len(notes) == 1, contents
     assert "1 attachment(s)" in notes[0]
-    assert "STRIKE-ORDER.pdf" in notes[0]
-    assert adapter.documents == [str(attachment)]
+    assert "the team has been notified" in notes[0]
+    # The note also lands in external channels past the desk channel guard:
+    # no file name or path may leak the counterparty identity.
+    assert "STRIKE-ORDER.pdf" not in notes[0]
+    assert str(attachment) not in notes[0]
     messages = [r.getMessage() for r in caplog.records]
     assert any("Failed to send media (.pdf)" in m for m in messages)
+    named = [
+        r for r in caplog.records
+        if "STRIKE-ORDER.pdf" in r.getMessage() and "attachment(s) failed to deliver" in r.getMessage()
+    ]
+    assert named and all(r.levelno == logging.WARNING for r in named), messages
 
 
 @pytest.mark.asyncio

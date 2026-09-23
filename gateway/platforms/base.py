@@ -5412,17 +5412,25 @@ class BasePlatformAdapter(ABC):
 
                 if _failed_attachments:
                     # Text first, then the report: the reply must never be
-                    # dropped because an attachment failed.
+                    # dropped because an attachment failed. The chat note
+                    # carries only the count: a name like STRIKE-DFS-...pdf
+                    # identifies the counterparty, and this note also lands
+                    # in external channels past the desk channel guard.
                     _names = ", ".join(_failed_attachments[:5])
                     _more = (
                         f" and {len(_failed_attachments) - 5} more"
                         if len(_failed_attachments) > 5 else ""
                     )
+                    logger.warning(
+                        "[%s] %d attachment(s) failed to deliver to %s: %s",
+                        self.name, len(_failed_attachments),
+                        event.source.chat_id, f"{_names}{_more}",
+                    )
                     try:
                         _note_result = await self._final_delivery_adapter(event.source).send(
                             event.source.chat_id,
                             f"⚠️ Couldn't deliver {len(_failed_attachments)} "
-                            f"attachment(s): {_names}{_more}.",
+                            "attachment(s); the team has been notified.",
                             metadata=_final_thread_metadata,
                         )
                         if not getattr(_note_result, "success", False):
